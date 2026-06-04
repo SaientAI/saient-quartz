@@ -1,0 +1,22 @@
+[package]
+name = "tinyq4"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+cuda = []
+
+[dependencies]
+memmap2 = "0.9"
+anyhow = "1"
+rayon = "1"
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio-stream = "0.1"
+futures-util = "0.3"
+rand = { version = "0.8", features = ["small_rng"] }
+
+[profile.release]
+opt-level = 3

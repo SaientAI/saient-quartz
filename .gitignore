@@ -1,0 +1,6 @@
+/target
+.venv/
+__pycache__/
+*.pyc
+*.gguf
+*.q4k
