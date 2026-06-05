@@ -811,6 +811,120 @@ __global__ void gemv_q5_k_v4(const uint8_t* __restrict__ data,
 // ── IQ grid codebooks (uploaded once from the Rust tables) ───────────────────
 __device__ uint32_t g_iq3s_grid[512];
 __device__ uint64_t g_iq2s_grid[1024];
+__device__ uint64_t g_iq2xxs_grid[256];
+__device__ uint64_t g_iq2xs_grid[512];
+__device__ uint8_t  g_ksigns[128];
+
+// Q2_K fused GEMV — one warp per row. block = 84B: scales(16) qs(64) d(f16,2) dmin(f16,2).
+// weight = d*scale*(2-bit q) - dmin*min.
+__global__ void gemv_q2_k(const uint8_t* __restrict__ data,
+                          const float* __restrict__ x, float* __restrict__ y,
+                          int in_dim, int out_dim)
+{
+    const int row  = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (row >= out_dim) return;
+    const int bpr = in_dim >> 8;
+    const uint8_t* rd = data + (size_t)row * bpr * 84;
+    float acc = 0.f;
+    for (int b = lane; b < bpr; b += 32) {
+        const uint8_t* blk = rd + b * 84;
+        const uint8_t* scales = blk;
+        const uint8_t* qs = blk + 16;
+        uint16_t db, dmb; memcpy(&db, blk + 80, 2); memcpy(&dmb, blk + 82, 2);
+        const float d = f16_to_f32_dev(db), dmin = f16_to_f32_dev(dmb);
+        const float* xi = x + b * 256;
+        int is = 0, k = 0;
+        for (int n = 0; n < 256; n += 128) {
+            const uint8_t* q = qs + (n / 128) * 32;
+            for (int j = 0; j < 4; j++) {
+                const int shift = 2 * j;
+                uint8_t sc = scales[is++];
+                float dl = d * (sc & 0xf), ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; l++) acc += (dl * (float)((q[l]    >> shift) & 3) - ml) * xi[k++];
+                sc = scales[is++];
+                dl = d * (sc & 0xf); ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; l++) acc += (dl * (float)((q[l+16] >> shift) & 3) - ml) * xi[k++];
+            }
+        }
+    }
+    warp_reduce(acc);
+    if (lane == 0) y[row] = acc;
+}
+
+// IQ2_XXS fused GEMV — block = 66B: d(f16,2) qs(64 = u16[32]). 4 grid idx + packed signs/scale per group.
+__global__ void gemv_iq2_xxs(const uint8_t* __restrict__ data,
+                             const float* __restrict__ x, float* __restrict__ y,
+                             int in_dim, int out_dim)
+{
+    const int row  = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (row >= out_dim) return;
+    const int bpr = in_dim >> 8;
+    const uint8_t* rd = data + (size_t)row * bpr * 66;
+    float acc = 0.f;
+    for (int b = lane; b < bpr; b += 32) {
+        const uint8_t* blk = rd + b * 66;
+        uint16_t dbits; memcpy(&dbits, blk, 2);
+        const float d = f16_to_f32_dev(dbits);
+        const uint8_t* qs = blk + 2;
+        const float* xi = x + b * 256;
+        int k = 0;
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            const int bo = 8 * ib32;
+            uint32_t a1; memcpy(&a1, qs + bo + 4, 4);
+            const float db = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
+            for (int l = 0; l < 4; l++) {
+                const uint64_t g = g_iq2xxs_grid[qs[bo + l]];
+                const uint8_t signs = g_ksigns[(a1 >> (7 * l)) & 127];
+                for (int j = 0; j < 8; j++) {
+                    int8_t gv = (int8_t)((g >> (8*j)) & 0xFF);
+                    acc += db * (float)gv * ((signs & (1 << j)) ? -1.f : 1.f) * xi[k++];
+                }
+            }
+        }
+    }
+    warp_reduce(acc);
+    if (lane == 0) y[row] = acc;
+}
+
+// IQ2_XS fused GEMV — block = 74B: d(f16,2) qs(64 = u16[32]) scales(8). q = 9-bit grid idx | 7-bit sign idx.
+__global__ void gemv_iq2_xs(const uint8_t* __restrict__ data,
+                            const float* __restrict__ x, float* __restrict__ y,
+                            int in_dim, int out_dim)
+{
+    const int row  = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (row >= out_dim) return;
+    const int bpr = in_dim >> 8;
+    const uint8_t* rd = data + (size_t)row * bpr * 74;
+    float acc = 0.f;
+    for (int b = lane; b < bpr; b += 32) {
+        const uint8_t* blk = rd + b * 74;
+        uint16_t dbits; memcpy(&dbits, blk, 2);
+        const float d = f16_to_f32_dev(dbits);
+        const uint8_t* qs = blk + 2;
+        const uint8_t* sc = blk + 66;
+        const float* xi = x + b * 256;
+        int k = 0;
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            const float db0 = d * (0.5f + (float)(sc[ib32] & 0xf)) * 0.25f;
+            const float db1 = d * (0.5f + (float)(sc[ib32] >> 4))  * 0.25f;
+            for (int l = 0; l < 4; l++) {
+                uint16_t q; memcpy(&q, qs + 2*(4*ib32 + l), 2);
+                const uint64_t g = g_iq2xs_grid[q & 511];
+                const uint8_t signs = g_ksigns[q >> 9];
+                const float db = (l < 2) ? db0 : db1;
+                for (int j = 0; j < 8; j++) {
+                    int8_t gv = (int8_t)((g >> (8*j)) & 0xFF);
+                    acc += db * (float)gv * ((signs & (1 << j)) ? -1.f : 1.f) * xi[k++];
+                }
+            }
+        }
+    }
+    warp_reduce(acc);
+    if (lane == 0) y[row] = acc;
+}
 
 // IQ2_S fused GEMV — one warp per row; direct port of dequant_iq2_s.
 // block = 82B: d(f16,2) qs(64: 32 idx + 32 signs) qh(8) scales(8).
@@ -916,6 +1030,15 @@ void cuda_set_iq3s_grid(const uint32_t* host) {
 void cuda_set_iq2s_grid(const uint64_t* host) {
     cudaMemcpyToSymbol(g_iq2s_grid, host, 1024 * sizeof(uint64_t));
 }
+void cuda_set_iq2xxs_grid(const uint64_t* host) {
+    cudaMemcpyToSymbol(g_iq2xxs_grid, host, 256 * sizeof(uint64_t));
+}
+void cuda_set_iq2xs_grid(const uint64_t* host) {
+    cudaMemcpyToSymbol(g_iq2xs_grid, host, 512 * sizeof(uint64_t));
+}
+void cuda_set_ksigns(const uint8_t* host) {
+    cudaMemcpyToSymbol(g_ksigns, host, 128);
+}
 
 void cuda_gemv(uint32_t ggml_type,
                const uint8_t* d_data,
@@ -934,11 +1057,14 @@ void cuda_gemv(uint32_t ggml_type,
         }
         case  6: { dim3 grid((out_dim+1)/2), block(64); gemv_q5_0_v4<<<grid,block>>>(d_data,d_x,d_y,in_dim,out_dim); break; }
         case  8: { dim3 g(out_dim), b(32); gemv_q8_0 <<<g,b>>>(d_data,d_x,d_y,in_dim); break; }
+        case 10: { dim3 g(out_dim), b(32); gemv_q2_k<<<g,b>>>(d_data,d_x,d_y,in_dim,out_dim); break; }
         case 12: { dim3 grid((out_dim+1)/2), block(64); gemv_q4_k_v4<<<grid,block>>>(d_data,d_x,d_y,in_dim,out_dim); break; }
         case 13: { dim3 grid((out_dim+1)/2), block(64); gemv_q5_k_v4<<<grid,block>>>(d_data,d_x,d_y,in_dim,out_dim); break; }
         case 14: { dim3 grid((out_dim+1)/2), block(64); gemv_q6_k_v4<<<grid,block>>>(d_data,d_x,d_y,in_dim,out_dim); break; }
         case 21: { dim3 g(out_dim), b(32); gemv_iq3_s<<<g,b>>>(d_data,d_x,d_y,in_dim,out_dim); break; }
         case 22: { dim3 g(out_dim), b(32); gemv_iq2_s<<<g,b>>>(d_data,d_x,d_y,in_dim,out_dim); break; }
+        case 16: { dim3 g(out_dim), b(32); gemv_iq2_xxs<<<g,b>>>(d_data,d_x,d_y,in_dim,out_dim); break; }
+        case 17: { dim3 g(out_dim), b(32); gemv_iq2_xs<<<g,b>>>(d_data,d_x,d_y,in_dim,out_dim); break; }
         case 20: { dim3 g(out_dim), b(32); gemv_iq4nl<<<g,b>>>(d_data,d_x,d_y,in_dim); break; }
         case 30: { dim3 g(out_dim), b(32); gemv_bf16 <<<g,b>>>(d_data,d_x,d_y,in_dim); break; }
         default: {

@@ -458,6 +458,32 @@ fn dequant_iq2_s(data: &[u8], n_elems: usize) -> Vec<f32> {
 }
 
 // ── Q5_K — standard 5-bit K-quant (256/block, 176 bytes) ───────────────────────
+fn dequant_q2_k(data: &[u8], n_elems: usize) -> Vec<f32> {
+    let nb = n_elems / 256; const BS: usize = 84;
+    let mut out = Vec::with_capacity(n_elems);
+    for ib in 0..nb {
+        let blk = &data[ib*BS..ib*BS+BS];
+        let scales = &blk[0..16];
+        let qs = &blk[16..80];
+        let d    = f16_to_f32(u16::from_le_bytes([blk[80], blk[81]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([blk[82], blk[83]]));
+        let mut is = 0usize;
+        for n in (0..256).step_by(128) {
+            let q = &qs[(n/128)*32..(n/128)*32 + 32];
+            for j in 0..4 {
+                let shift = 2 * j;
+                let sc = scales[is]; is += 1;
+                let (dl, ml) = (d * (sc & 0xf) as f32, dmin * (sc >> 4) as f32);
+                for l in 0..16 { out.push(dl * (((q[l] >> shift) & 3) as f32) - ml); }
+                let sc = scales[is]; is += 1;
+                let (dl, ml) = (d * (sc & 0xf) as f32, dmin * (sc >> 4) as f32);
+                for l in 0..16 { out.push(dl * (((q[l+16] >> shift) & 3) as f32) - ml); }
+            }
+        }
+    }
+    out
+}
+
 fn dequant_q5_k(data: &[u8], n_elems: usize) -> Vec<f32> {
     let nb = n_elems / 256; const BS: usize = 176;
     let mut out = Vec::with_capacity(n_elems);
@@ -525,6 +551,7 @@ pub fn dequant(data: &[u8], ggml_type: u32, n_elems: usize) -> Vec<f32> {
         6  => dequant_q5_0(data, n_elems),
         7  => dequant_q5_1(data, n_elems),
         8  => dequant_q8_0(data, n_elems),
+        10 => dequant_q2_k(data, n_elems),
         12 => dequant_q4_k(data, n_elems),
         13 => dequant_q5_k(data, n_elems),
         14 => dequant_q6_k(data, n_elems),

@@ -176,6 +176,7 @@ pub fn ggml_type_size(ggml_type: u32, n_elems: usize) -> usize {
         6  => (n_elems / 32)  * 22,          // Q5_0: 32 per block, 2+4+16 bytes
         7  => (n_elems / 32)  * 24,          // Q5_1: 32 per block, 2+2+4+16 bytes
         8  => (n_elems / 32)  * 34,          // Q8_0: 32 per block, 2+32 bytes
+        10 => (n_elems / 256) * 84,          // Q2_K: 256 per block, 16+64+2+2 bytes
         12 => (n_elems / 256) * 144,         // Q4_K: 256 per block, 4+12+128 bytes
         13 => (n_elems / 256) * 176,         // Q5_K: 256 per block
         14 => (n_elems / 256) * 210,         // Q6_K: 256 per block

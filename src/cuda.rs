@@ -8,6 +8,9 @@ unsafe extern "C" {
                      d_y: *mut f32, in_dim: i32, out_dim: i32);
     fn cuda_set_iq3s_grid(host: *const u32);
     fn cuda_set_iq2s_grid(host: *const u64);
+    fn cuda_set_iq2xxs_grid(host: *const u64);
+    fn cuda_set_iq2xs_grid(host: *const u64);
+    fn cuda_set_ksigns(host: *const u8);
     fn cuda_alloc(bytes: usize) -> *mut c_void;
     fn cuda_drop(ptr: *mut c_void);
     fn cuda_h2d(dst: *mut c_void, src: *const c_void, bytes: usize);
@@ -129,6 +132,9 @@ pub fn ensure_iq_grids() {
     ONCE.call_once(|| unsafe {
         cuda_set_iq3s_grid(crate::iq3_tables::IQ3S_GRID.as_ptr());
         cuda_set_iq2s_grid(crate::iq2_tables::IQ2S_GRID.as_ptr());
+        cuda_set_iq2xxs_grid(crate::iq2_tables::IQ2XXS_GRID.as_ptr());
+        cuda_set_iq2xs_grid(crate::iq2_tables::IQ2XS_GRID.as_ptr());
+        cuda_set_ksigns(crate::iq2_tables::KSIGNS_IQ2XS.as_ptr());
     });
 }
 
