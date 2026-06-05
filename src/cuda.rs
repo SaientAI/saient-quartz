@@ -16,7 +16,7 @@ unsafe extern "C" {
     fn cuda_vec_zero(dst: *mut f32, n: i32);
     fn cuda_rms_norm(out: *mut f32, x: *const f32, w: *const f32, n: i32);
     fn cuda_rope_yarn(x: *mut f32, n_heads: i32, head_dim: i32, pos: i32,
-                      theta: f32, yarn_scale: f32, yarn_orig_ctx: i32);
+                      theta: f32, yarn_scale: f32, yarn_orig_ctx: i32, neox: i32);
     fn cuda_kv_append(k_cache: *mut f32, v_cache: *mut f32,
                       k: *const f32, v: *const f32, pos: i32, kv_dim: i32);
     fn cuda_attn_score(scores: *mut f32, q: *const f32, k_cache: *const f32,
@@ -553,12 +553,13 @@ impl GpuForwardState {
                     }
                 }
 
+                let neox = cfg.rope_neox as i32;
                 cuda_rope_yarn(self.d_q.ptr as *mut f32,
                                h as i32, hd as i32, pos as i32,
-                               cfg.rope_theta, cfg.yarn_scale, cfg.yarn_orig_ctx as i32);
+                               cfg.rope_theta, cfg.yarn_scale, cfg.yarn_orig_ctx as i32, neox);
                 cuda_rope_yarn(self.d_k.ptr as *mut f32,
                                kv as i32, hd as i32, pos as i32,
-                               cfg.rope_theta, cfg.yarn_scale, cfg.yarn_orig_ctx as i32);
+                               cfg.rope_theta, cfg.yarn_scale, cfg.yarn_orig_ctx as i32, neox);
 
                 cuda_kv_append(self.d_kv_k[l].ptr as *mut f32,
                                self.d_kv_v[l].ptr as *mut f32,

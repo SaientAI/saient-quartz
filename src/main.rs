@@ -34,6 +34,7 @@ pub(crate) struct Config {
     yarn_orig_ctx:   usize,   // original context length for YARN
     clamped_swiglu:  bool,    // true = gpt-oss clamped OAI SwiGLU experts; false = standard SiLU
     swa_window:      usize,   // sliding-window attention span (0 = full attention everywhere)
+    rope_neox:       bool,    // RoPE convention: true = NEOX rotate-halves (qwen2/gpt-oss/olmoe); false = NORM rotate-pairs (llama/mistral)
 }
 
 impl Config {
@@ -106,9 +107,15 @@ impl Config {
             g.arch_u32_any(&["attention.sliding_window"]).unwrap_or(0) as usize
         } else { 0 };
 
+        // RoPE convention. llama.cpp permutes Q/K during conversion so llama-family GGUFs
+        // expect "NORM" rope (rotate adjacent pairs); qwen2/gpt-oss/olmoe/gemma/phi etc. use
+        // "NEOX" (rotate halves). Applying the wrong one scrambles attention into word-salad.
+        let rope_neox = !matches!(arch,
+            "llama" | "baichuan" | "starcoder" | "minicpm" | "internlm2" | "orion" | "plamo" | "xverse");
+
         Self { vocab_size, embed_dim, n_heads, n_kv_heads, n_layers, ffn_dim,
                rope_theta, head_dim, n_experts, n_experts_used, moe_renorm,
-               yarn_scale, yarn_orig_ctx, clamped_swiglu, swa_window }
+               yarn_scale, yarn_orig_ctx, clamped_swiglu, swa_window, rope_neox }
     }
 
     /// First key position attended by a token at `pos` on layer `layer`.
@@ -368,7 +375,7 @@ pub(crate) fn matmul(x: &[f32], w: &[f32], in_dim: usize, out_dim: usize) -> Vec
 
 // NeoX-style RoPE with optional YARN scaling (GPT-oss uses yarn, scale=32, orig_ctx=4096).
 fn rope_yarn(x: &mut [f32], pos: usize, dim: usize, theta: f32,
-             yarn_scale: f32, yarn_orig_ctx: usize) {
+             yarn_scale: f32, yarn_orig_ctx: usize, neox: bool) {
     use std::f32::consts::PI;
     let half = dim / 2;
     let beta_fast: f32 = 32.0;
@@ -387,10 +394,12 @@ fn rope_yarn(x: &mut [f32], pos: usize, dim: usize, theta: f32,
         };
         let angle = pos as f32 * eff_inv;
         let (sin, cos) = angle.sin_cos();
-        let x0 = x[i];
-        let x1 = x[i + half];
-        x[i]        = x0 * cos - x1 * sin;
-        x[i + half] = x0 * sin + x1 * cos;
+        // NEOX rotates halves (i, i+half); NORM (llama) rotates adjacent pairs (2i, 2i+1).
+        let (i0, i1) = if neox { (i, i + half) } else { (2 * i, 2 * i + 1) };
+        let x0 = x[i0];
+        let x1 = x[i1];
+        x[i0] = x0 * cos - x1 * sin;
+        x[i1] = x0 * sin + x1 * cos;
     }
 }
 
@@ -442,10 +451,10 @@ fn attention(
 
     let (ys, yo) = (cfg.yarn_scale, cfg.yarn_orig_ctx);
     for head in 0..h  {
-        rope_yarn(&mut q[head*hd..(head+1)*hd], pos, hd, cfg.rope_theta, ys, yo);
+        rope_yarn(&mut q[head*hd..(head+1)*hd], pos, hd, cfg.rope_theta, ys, yo, cfg.rope_neox);
     }
     for head in 0..kv {
-        rope_yarn(&mut k[head*hd..(head+1)*hd], pos, hd, cfg.rope_theta, ys, yo);
+        rope_yarn(&mut k[head*hd..(head+1)*hd], pos, hd, cfg.rope_theta, ys, yo, cfg.rope_neox);
     }
 
     kv_cache[layer].0.extend_from_slice(&k);
@@ -737,10 +746,10 @@ fn prefill_batched(
             let pos = base + t;
             let qt = &mut q[t * q_d..(t + 1) * q_d];
             for i in 0..q_d { qt[i] += w.q_bias[l][i]; }
-            for head in 0..h { rope_yarn(&mut qt[head * hd..(head + 1) * hd], pos, hd, cfg.rope_theta, ys, yo); }
+            for head in 0..h { rope_yarn(&mut qt[head * hd..(head + 1) * hd], pos, hd, cfg.rope_theta, ys, yo, cfg.rope_neox); }
             let kt = &mut k[t * kv_d..(t + 1) * kv_d];
             for i in 0..kv_d { kt[i] += w.k_bias[l][i]; }
-            for head in 0..kvh { rope_yarn(&mut kt[head * hd..(head + 1) * hd], pos, hd, cfg.rope_theta, ys, yo); }
+            for head in 0..kvh { rope_yarn(&mut kt[head * hd..(head + 1) * hd], pos, hd, cfg.rope_theta, ys, yo, cfg.rope_neox); }
             let vt = &mut v[t * kv_d..(t + 1) * kv_d];
             for i in 0..kv_d { vt[i] += w.v_bias[l][i]; }
         }
@@ -1187,6 +1196,7 @@ fn main() {
         println!("MoE          : {} experts, top-{}", cfg.n_experts, cfg.n_experts_used);
     }
     println!("YARN         : scale={} orig_ctx={}", cfg.yarn_scale, cfg.yarn_orig_ctx);
+    println!("RoPE         : {}", if cfg.rope_neox { "NEOX (rotate-halves)" } else { "NORM (rotate-pairs)" });
 
     let tokenizer = Tokenizer::from_gguf(&gguf);
     println!("Tokenizer    : {}", if tokenizer.is_some() { "loaded" } else { "not found" });

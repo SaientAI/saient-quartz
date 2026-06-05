@@ -577,7 +577,7 @@ __global__ void rms_norm_f32(float* out, const float* x, const float* w, int n) 
 // RoPE YARN (NeoX style): modifies x[head * head_dim .. + head_dim] in-place.
 // Launch: grid(n_heads), block(head_dim/2)
 __global__ void rope_yarn_f32(float* x, int head_dim, int pos,
-                               float theta, float yarn_scale, int yarn_orig_ctx)
+                               float theta, float yarn_scale, int yarn_orig_ctx, int neox)
 {
     const float PI = 3.14159265358979f;
     int i    = threadIdx.x;        // 0 .. head_dim/2
@@ -596,10 +596,15 @@ __global__ void rope_yarn_f32(float* x, int head_dim, int pos,
     float angle = (float)pos * eff_inv;
     float s, c;
     sincosf(angle, &s, &c);
-    float x0 = xh[i];
-    float x1 = xh[i + half];
-    xh[i]        = x0 * c - x1 * s;
-    xh[i + half] = x0 * s + x1 * c;
+    // NEOX (qwen2/gpt-oss/olmoe): rotate halves (i, i+half).
+    // NORM (llama/mistral): rotate adjacent pairs (2i, 2i+1) — their GGUF Q/K weights are
+    // stored for this convention, so applying NEOX corrupts attention.
+    int i0 = neox ? i        : 2 * i;
+    int i1 = neox ? i + half : 2 * i + 1;
+    float x0 = xh[i0];
+    float x1 = xh[i1];
+    xh[i0] = x0 * c - x1 * s;
+    xh[i1] = x0 * s + x1 * c;
 }
 
 // Append K and V into their KV caches at sequence position pos.
@@ -839,9 +844,9 @@ void cuda_rms_norm(float* out, const float* x, const float* w, int n) {
     rms_norm_f32<<<1, blk, blk * sizeof(float)>>>(out, x, w, n);
 }
 void cuda_rope_yarn(float* x, int n_heads, int head_dim, int pos,
-                    float theta, float yarn_scale, int yarn_orig_ctx)
+                    float theta, float yarn_scale, int yarn_orig_ctx, int neox)
 {
-    rope_yarn_f32<<<n_heads, head_dim/2>>>(x, head_dim, pos, theta, yarn_scale, yarn_orig_ctx);
+    rope_yarn_f32<<<n_heads, head_dim/2>>>(x, head_dim, pos, theta, yarn_scale, yarn_orig_ctx, neox);
 }
 void cuda_kv_append(float* k_cache, float* v_cache, const float* k, const float* v,
                     int pos, int kv_dim)
