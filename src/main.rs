@@ -29,6 +29,7 @@ pub(crate) struct Config {
     n_experts_used:  usize,   // top-k for MoE routing
     yarn_scale:      f32,     // RoPE scaling factor (1.0 = no scaling)
     yarn_orig_ctx:   usize,   // original context length for YARN
+    clamped_swiglu:  bool,    // true = gpt-oss clamped OAI SwiGLU experts; false = standard SiLU
 }
 
 impl Config {
@@ -77,9 +78,13 @@ impl Config {
             .map(|v| v as usize)
             .unwrap_or(0);
 
+        // gpt-oss uses the clamped OAI SwiGLU in its experts; every other MoE arch
+        // (Mixtral, Qwen2/3-MoE, …) uses standard SiLU SwiGLU. Pick the activation per-arch.
+        let clamped_swiglu = g.architecture().unwrap_or("llama").contains("gpt-oss");
+
         Self { vocab_size, embed_dim, n_heads, n_kv_heads, n_layers, ffn_dim,
                rope_theta, head_dim, n_experts, n_experts_used,
-               yarn_scale, yarn_orig_ctx }
+               yarn_scale, yarn_orig_ctx, clamped_swiglu }
     }
 
     fn q_total_dim(&self) -> usize { self.n_heads    * self.head_dim }
@@ -506,7 +511,12 @@ fn moe_ffn(x: &[f32], moe: &MoeLayerInfo, gguf: &GgufFile, cfg: &Config, moe_lay
             u.iter_mut().zip(&moe.up_bias[off..off+fd]).for_each(|(a, b)| *a += b);
         }
 
-        let h: Vec<f32> = g.iter().zip(&u).map(|(&gv, &uv)| swiglu_oai(gv, uv)).collect();
+        // gpt-oss = clamped OAI SwiGLU; other MoE archs (Mixtral, Qwen3-MoE) = standard SiLU.
+        let h: Vec<f32> = if cfg.clamped_swiglu {
+            g.iter().zip(&u).map(|(&gv, &uv)| swiglu_oai(gv, uv)).collect()
+        } else {
+            g.iter().zip(&u).map(|(&gv, &uv)| silu(gv) * uv).collect()
+        };
         let mut out = gpu.gemv_moe_down(moe_layer, eid, &h, &moe.down_info, gguf, fd, d);
 
         if !moe.down_bias.is_empty() {
