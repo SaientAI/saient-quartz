@@ -17,6 +17,7 @@ serde_json = "1"
 tokio-stream = "0.1"
 futures-util = "0.3"
 rand = { version = "0.8", features = ["small_rng"] }
+minijinja = { version = "2", features = ["loop_controls"] }
 
 [profile.release]
 opt-level = 3

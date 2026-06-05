@@ -22,6 +22,14 @@ pub struct Tokenizer {
     pub return_id:    u32,
     pub channel_id:   u32,  // <|channel|> — GPT-oss channel switch
     pub message_id:   u32,  // <|message|> — GPT-oss message start
+    chat_template:    Option<String>,  // embedded Jinja chat template (tokenizer.chat_template)
+    bos_token:        String,          // BOS as text, for {{ bos_token }} in the template
+    eos_token:        String,          // EOS as text, for {{ eos_token }} in the template
+    add_bos:          bool,            // prepend BOS to the encoded prompt (llama/mistral need it)
+    // CONTROL/USER_DEFINED tokens indexed by first byte, each bucket longest-first, so a
+    // rendered template's special markers (<|im_start|>, [INST], </s>, <|start|>…) tokenize
+    // atomically instead of shattering into text pieces.
+    special_first:    HashMap<u8, Vec<(String, u32)>>,
 }
 
 impl Tokenizer {
@@ -84,10 +92,84 @@ impl Tokenizer {
                      else if im_end_id != u32::MAX { im_end_id }
                      else { token_to_id.get("</s>").copied().unwrap_or(bos_id) };
 
+        // Embedded Jinja chat template (the ground-truth prompt format the model was
+        // trained with). Rendering this beats guessing the format from which special
+        // tokens exist — e.g. OLMoE's role markers (<|user|>) are plain text, not vocab
+        // tokens, so the heuristic ladder mis-formats it.
+        let chat_template = gguf.metadata.get("tokenizer.chat_template")
+            .and_then(|v| v.as_str()).map(|s| s.to_string());
+        let id_to_tok = |id: u32| -> String {
+            if id != u32::MAX && (id as usize) < vocab.len() { vocab[id as usize].clone() }
+            else { String::new() }
+        };
+        let bos_token = id_to_tok(bos_id);
+        let eos_token = id_to_tok(eos_id);
+        // Whether to prepend BOS. Defaults: SPM/llama models add BOS, BPE models don't —
+        // unless the GGUF says otherwise (Mistral sets add_bos_token=true explicitly).
+        let add_bos = match gguf.metadata.get("tokenizer.ggml.add_bos_token") {
+            Some(GgufValue::Bool(b)) => *b,
+            _ => spm,
+        };
+
+        // Index special tokens (CONTROL=3, USER_DEFINED=4) by first byte for atomic matching
+        // when tokenizing a rendered chat template. Falls back to the <|...|> convention when
+        // the GGUF has no token_type array.
+        let mut specials: Vec<(String, u32)> = Vec::new();
+        if let Some(GgufValue::Array(types)) = gguf.metadata.get("tokenizer.ggml.token_type") {
+            for (i, tv) in types.iter().enumerate() {
+                let t = tv.as_u32().unwrap_or(0);
+                if (t == 3 || t == 4) && i < vocab.len() && !vocab[i].is_empty() {
+                    specials.push((vocab[i].clone(), i as u32));
+                }
+            }
+        }
+        if specials.is_empty() {
+            for (s, &id) in &token_to_id {
+                if s.starts_with("<|") && s.ends_with("|>") { specials.push((s.clone(), id)); }
+            }
+        }
+        let mut special_first: HashMap<u8, Vec<(String, u32)>> = HashMap::new();
+        for (s, id) in specials {
+            if let Some(&b) = s.as_bytes().first() {
+                special_first.entry(b).or_default().push((s, id));
+            }
+        }
+        for v in special_first.values_mut() {
+            v.sort_by(|a, b| b.0.len().cmp(&a.0.len()));  // longest match first
+        }
+
         Some(Self { vocab, token_to_id, merges, byte_to_u, u_to_byte,
                     spm, max_token_chars,
                     bos_id, eos_id, unk_id, im_start_id, im_end_id, msg_start_id,
-                    end_id, return_id, channel_id, message_id })
+                    end_id, return_id, channel_id, message_id,
+                    chat_template, bos_token, eos_token, add_bos, special_first })
+    }
+
+    // Render the model's embedded Jinja chat template. Returns None if there is no
+    // template or rendering fails (caller falls back to the heuristic ladder).
+    fn render_chat_template(&self, messages: &[(&str, &str)]) -> Option<String> {
+        let tmpl_src = self.chat_template.as_ref()?;
+        use minijinja::Environment;
+        use std::collections::BTreeMap;
+        let mut env = Environment::new();
+        // Some HF templates call raise_exception() on malformed input; with valid input
+        // it is never hit, but the function must exist or rendering errors out.
+        env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
+        });
+        env.add_template("chat", tmpl_src).ok()?;
+        let tmpl = env.get_template("chat").ok()?;
+        let msgs: Vec<BTreeMap<&str, &str>> = messages.iter()
+            .map(|(r, c)| BTreeMap::from([("role", *r), ("content", *c)]))
+            .collect();
+        let ctx = minijinja::context! {
+            messages => msgs,
+            add_generation_prompt => true,
+            bos_token => self.bos_token.as_str(),
+            eos_token => self.eos_token.as_str(),
+        };
+        let out = tmpl.render(ctx).ok()?;
+        if out.trim().is_empty() { None } else { Some(out) }
     }
 
     // ── Encode ────────────────────────────────────────────────────────────────
@@ -154,26 +236,31 @@ impl Tokenizer {
         ids
     }
 
-    // Encode a template string, treating <|...|> as atomic special tokens.
+    // Encode a rendered template string, matching CONTROL/USER_DEFINED tokens (<|im_start|>,
+    // [INST], </s>, <|start|>, …) atomically and BPE/SPM-encoding the text between them.
     pub fn encode_template(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
-        let mut rest = text;
+        let bytes = text.as_bytes();
+        let mut i = 0usize;          // scan cursor (always on a char boundary)
+        let mut text_start = 0usize; // start of the pending plain-text run
 
-        while !rest.is_empty() {
-            if rest.starts_with("<|") {
-                if let Some(end) = rest.find("|>") {
-                    let tok = &rest[..end + 2];
-                    if let Some(&id) = self.token_to_id.get(tok) {
-                        ids.push(id);
-                        rest = &rest[end + 2..];
-                        continue;
-                    }
+        while i < text.len() {
+            let mut hit: Option<(usize, u32)> = None;
+            if let Some(cands) = self.special_first.get(&bytes[i]) {
+                for (s, id) in cands {  // longest first
+                    if text[i..].starts_with(s.as_str()) { hit = Some((s.len(), *id)); break; }
                 }
             }
-            let next = rest[1..].find("<|").map(|p| p + 1).unwrap_or(rest.len());
-            ids.extend(self.encode(&rest[..next]));
-            rest = &rest[next..];
+            if let Some((len, id)) = hit {
+                if text_start < i { ids.extend(self.encode(&text[text_start..i])); }
+                ids.push(id);
+                i += len;
+                text_start = i;
+            } else {
+                i += text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            }
         }
+        if text_start < text.len() { ids.extend(self.encode(&text[text_start..])); }
         ids
     }
 
@@ -190,6 +277,21 @@ impl Tokenizer {
     pub fn encode_messages(&self, messages: &[(&str, &str)]) -> Vec<u32> {
         let has_native = self.token_to_id.contains_key("<|start|>");
         let mut prompt = String::new();
+
+        // Non-gpt-oss models: render the model's own embedded Jinja chat template — the
+        // ground-truth format it was trained with. Beats guessing from special tokens
+        // (e.g. OLMoE's <|user|> markers are plain text, not vocab tokens). gpt-oss keeps
+        // its hand-tuned harmony path below (Reasoning: low + channels).
+        if !has_native && std::env::var_os("TINYQ4_NO_JINJA").is_none() {
+            if let Some(rendered) = self.render_chat_template(messages) {
+                let mut ids = self.encode_template(&rendered);
+                // llama/mistral templates omit the leading <s>; the tokenizer adds it.
+                if self.add_bos && self.bos_id != u32::MAX && ids.first() != Some(&self.bos_id) {
+                    ids.insert(0, self.bos_id);
+                }
+                return ids;
+            }
+        }
 
         if has_native {
             prompt.push_str("<|start|>system<|message|>");
