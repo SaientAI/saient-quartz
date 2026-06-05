@@ -32,6 +32,7 @@ pub(crate) struct Config {
     yarn_scale:      f32,     // RoPE scaling factor (1.0 = no scaling)
     yarn_orig_ctx:   usize,   // original context length for YARN
     clamped_swiglu:  bool,    // true = gpt-oss clamped OAI SwiGLU experts; false = standard SiLU
+    swa_window:      usize,   // sliding-window attention span (0 = full attention everywhere)
 }
 
 impl Config {
@@ -82,11 +83,31 @@ impl Config {
 
         // gpt-oss uses the clamped OAI SwiGLU in its experts; every other MoE arch
         // (Mixtral, Qwen2/3-MoE, …) uses standard SiLU SwiGLU. Pick the activation per-arch.
-        let clamped_swiglu = g.architecture().unwrap_or("llama").contains("gpt-oss");
+        let arch = g.architecture().unwrap_or("llama");
+        let clamped_swiglu = arch.contains("gpt-oss");
+
+        // gpt-oss alternates sliding-window attention (even layers, window 128) with
+        // full attention (odd layers). Without the window, the SWA layers attend past
+        // the window once the sequence exceeds 128 tokens → coherent-then-collapse.
+        // Other arches (Gemma2/3, Mistral) use different SWA patterns; enable only for
+        // gpt-oss for now so we don't mis-window them.
+        let swa_window = if arch.contains("gpt-oss") {
+            g.arch_u32_any(&["attention.sliding_window"]).unwrap_or(0) as usize
+        } else { 0 };
 
         Self { vocab_size, embed_dim, n_heads, n_kv_heads, n_layers, ffn_dim,
                rope_theta, head_dim, n_experts, n_experts_used,
-               yarn_scale, yarn_orig_ctx, clamped_swiglu }
+               yarn_scale, yarn_orig_ctx, clamped_swiglu, swa_window }
+    }
+
+    /// First key position attended by a token at `pos` on layer `layer`.
+    /// gpt-oss SWA layers (even index) see only the most recent `swa_window` keys.
+    fn attn_start(&self, layer: usize, pos: usize) -> usize {
+        if self.swa_window > 0 && layer % 2 == 0 {
+            (pos + 1).saturating_sub(self.swa_window)
+        } else {
+            0
+        }
     }
 
     fn q_total_dim(&self) -> usize { self.n_heads    * self.head_dim }
@@ -428,11 +449,14 @@ fn attention(
     let scale = (hd as f32).sqrt().recip() * mscale2;
     let mut attn_out = vec![0.0f32; q_d];
 
+    // gpt-oss SWA layers attend only to keys [k_start, pos]; full layers use 0.
+    let k_start = cfg.attn_start(layer, pos);
+
     for head in 0..h {
         let kv_head = (head * kv) / h;
         let q_h = &q[head*hd..(head+1)*hd];
 
-        let mut scores: Vec<f32> = (0..seq).map(|t| {
+        let mut scores: Vec<f32> = (k_start..seq).map(|t| {
             let k_t = &kv_cache[layer].0[t * kv_d + kv_head * hd
                                         ..t * kv_d + (kv_head+1) * hd];
             q_h.iter().zip(k_t).map(|(a, b)| a * b).sum::<f32>() * scale
@@ -446,10 +470,10 @@ fn attention(
         scores.iter_mut().for_each(|s| *s /= sum);
 
         let out_h = &mut attn_out[head*hd..(head+1)*hd];
-        for t in 0..seq {
+        for t in k_start..seq {
             let v_t = &kv_cache[layer].1[t * kv_d + kv_head * hd
                                         ..t * kv_d + (kv_head+1) * hd];
-            for i in 0..hd { out_h[i] += scores[t] * v_t[i]; }
+            for i in 0..hd { out_h[i] += scores[t - k_start] * v_t[i]; }
         }
     }
 
@@ -711,12 +735,13 @@ fn prefill_batched(
         for t in 0..n {
             let pos = base + t;
             let seq = pos + 1;
+            let k_start = cfg.attn_start(l, pos);  // SWA window for gpt-oss even layers
             let qt = &q[t * q_d..(t + 1) * q_d];
             for head in 0..h {
                 let kv_head = (head * kvh) / h;
                 let q_h = &qt[head * hd..(head + 1) * hd];
                 let sink = if w.attn_sinks[l].len() > head { w.attn_sinks[l][head] } else { f32::NEG_INFINITY };
-                let mut scores: Vec<f32> = (0..seq).map(|p| {
+                let mut scores: Vec<f32> = (k_start..seq).map(|p| {
                     let k_p = &kv[l].0[p * kv_d + kv_head * hd..p * kv_d + (kv_head + 1) * hd];
                     q_h.iter().zip(k_p).map(|(a, b)| a * b).sum::<f32>() * scale
                 }).collect();
@@ -725,9 +750,9 @@ fn prefill_batched(
                 if sink > f32::NEG_INFINITY { sum += (sink - max).exp(); }
                 scores.iter_mut().for_each(|s| *s /= sum);
                 let out_h = &mut attn_out[t * q_d + head * hd..t * q_d + (head + 1) * hd];
-                for p in 0..seq {
+                for p in k_start..seq {
                     let v_p = &kv[l].1[p * kv_d + kv_head * hd..p * kv_d + (kv_head + 1) * hd];
-                    for i in 0..hd { out_h[i] += scores[p] * v_p[i]; }
+                    for i in 0..hd { out_h[i] += scores[p - k_start] * v_p[i]; }
                 }
             }
         }

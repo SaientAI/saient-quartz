@@ -566,24 +566,35 @@ impl GpuForwardState {
                                self.d_v.ptr as *const f32,
                                pos as i32, kv_d as i32);
 
+                // Sliding-window attention (gpt-oss even layers): attend only to the
+                // most recent `swa_window` keys. Implemented by sliding the K/V cache
+                // base forward by `k_start` positions and shrinking the score length —
+                // the per-head score stride (max_seq) is unchanged, so scores are
+                // written at index 0..seq_a and the softmax/value kernels see the
+                // windowed range. No kernel change needed.
+                let k_start = cfg.attn_start(l, pos);
+                let seq_a   = seq - k_start as i32;
+                let k_cache = (self.d_kv_k[l].ptr as *const f32).add(k_start * kv_d);
+                let v_cache = (self.d_kv_v[l].ptr as *const f32).add(k_start * kv_d);
+
                 // All heads in 3 kernel calls instead of h×3=192
                 cuda_attn_score_all(
                     self.d_scores.ptr as *mut f32,
                     self.d_q.ptr as *const f32,
-                    self.d_kv_k[l].ptr as *const f32,
-                    h as i32, kv as i32, seq,
+                    k_cache,
+                    h as i32, kv as i32, seq_a,
                     hd as i32, kv_d as i32, self.max_seq as i32, attn_scale,
                 );
                 cuda_softmax_sink_all(
                     self.d_scores.ptr as *mut f32,
-                    h as i32, seq, self.max_seq as i32,
+                    h as i32, seq_a, self.max_seq as i32,
                     self.d_attn_sinks[l].ptr as *const f32,
                 );
                 cuda_attn_values_all(
                     self.d_attn_out.ptr as *mut f32,
                     self.d_scores.ptr as *const f32,
-                    self.d_kv_v[l].ptr as *const f32,
-                    h as i32, kv as i32, seq,
+                    v_cache,
+                    h as i32, kv as i32, seq_a,
                     hd as i32, kv_d as i32, self.max_seq as i32,
                 );
 
