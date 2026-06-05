@@ -152,6 +152,10 @@ impl Tokenizer {
         use minijinja::Environment;
         use std::collections::BTreeMap;
         let mut env = Environment::new();
+        // Match HuggingFace apply_chat_template: strip the newline after a block tag and
+        // leading whitespace before one, so role markers don't get spurious blank lines.
+        env.set_trim_blocks(true);
+        env.set_lstrip_blocks(true);
         // Some HF templates call raise_exception() on malformed input; with valid input
         // it is never hit, but the function must exist or rendering errors out.
         env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
@@ -169,6 +173,9 @@ impl Tokenizer {
             eos_token => self.eos_token.as_str(),
         };
         let out = tmpl.render(ctx).ok()?;
+        if std::env::var_os("TINYQ4_DEBUG_PROMPT").is_some() {
+            eprintln!("=== rendered prompt ===\n{}\n=== end ===", out);
+        }
         if out.trim().is_empty() { None } else { Some(out) }
     }
 
