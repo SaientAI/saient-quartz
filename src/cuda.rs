@@ -606,84 +606,88 @@ impl GpuForwardState {
                     let tu = gw.moe_up_type[l];
                     let td = gw.moe_down_type[l];
 
-                    // Collect weight pointers for all active experts
-                    // (unused slots padded with slot-0 ptr; kernel ignores eid >= n_act)
-                    let dummy_g = gw.moe_gate[l].ptr as *const u8;
-                    let dummy_u = gw.moe_up[l].ptr   as *const u8;
-                    let dummy_d = gw.moe_down[l].ptr  as *const u8;
-                    let mut gptrs: [*const u8; 4] = [dummy_g; 4];
-                    let mut uptrs: [*const u8; 4] = [dummy_u; 4];
-                    let mut dptrs: [*const u8; 4] = [dummy_d; 4];
-                    for (ki, &(eid, _)) in top.iter().enumerate() {
-                        gptrs[ki] = (gw.moe_gate[l].ptr as *const u8)
-                            .add(eid * ggml_type_size(tg, n_io));
-                        uptrs[ki] = (gw.moe_up[l].ptr as *const u8)
-                            .add(eid * ggml_type_size(tu, n_io));
-                        dptrs[ki] = (gw.moe_down[l].ptr as *const u8)
-                            .add(eid * ggml_type_size(td, n_down));
-                    }
+                    let xn = self.d_norm_out.ptr as *const f32;
 
-                    let xn  = self.d_norm_out.ptr as *const f32;
-                    let go  = self.d_gate_all.ptr as *mut f32;
-                    let uo  = self.d_up_all.ptr   as *mut f32;
-                    let eo  = self.d_expert_out_all.ptr as *mut f32;
-                    let doo = self.d_down_all.ptr as *mut f32;
-
-                    // Phase 1: batch gate GEMVs — all 4 experts run simultaneously
-                    cuda_gemv_moe4(
-                        tg,
-                        gptrs[0], gptrs[1], gptrs[2], gptrs[3],
-                        xn, xn, xn, xn,
-                        go, go.add(fd), go.add(2*fd), go.add(3*fd),
-                        n_act as i32, d as i32, fd as i32,
-                    );
-
-                    // Phase 2: batch up GEMVs — all 4 experts run simultaneously
-                    cuda_gemv_moe4(
-                        tu,
-                        uptrs[0], uptrs[1], uptrs[2], uptrs[3],
-                        xn, xn, xn, xn,
-                        uo, uo.add(fd), uo.add(2*fd), uo.add(3*fd),
-                        n_act as i32, d as i32, fd as i32,
-                    );
-
-                    // Phase 3: gate/up biases + swiglu per expert (serial, cheap)
-                    for (ki, &(eid, _)) in top.iter().enumerate() {
-                        let ko = ki * fd;
-                        if let Some(gb) = &self.d_moe_gate_bias[l] {
-                            cuda_vec_add(go.add(ko),
-                                         (gb.ptr as *const f32).add(eid * fd), fd as i32);
+                    if n_act == 4 {
+                        // ── Fast path: top-4 (gpt-oss) — 4 experts in one batched kernel launch ──
+                        let dummy_g = gw.moe_gate[l].ptr as *const u8;
+                        let dummy_u = gw.moe_up[l].ptr   as *const u8;
+                        let dummy_d = gw.moe_down[l].ptr  as *const u8;
+                        let mut gptrs: [*const u8; 4] = [dummy_g; 4];
+                        let mut uptrs: [*const u8; 4] = [dummy_u; 4];
+                        let mut dptrs: [*const u8; 4] = [dummy_d; 4];
+                        for (ki, &(eid, _)) in top.iter().enumerate() {
+                            gptrs[ki] = (gw.moe_gate[l].ptr as *const u8).add(eid * ggml_type_size(tg, n_io));
+                            uptrs[ki] = (gw.moe_up[l].ptr   as *const u8).add(eid * ggml_type_size(tu, n_io));
+                            dptrs[ki] = (gw.moe_down[l].ptr as *const u8).add(eid * ggml_type_size(td, n_down));
                         }
-                        if let Some(ub) = &self.d_moe_up_bias[l] {
-                            cuda_vec_add(uo.add(ko),
-                                         (ub.ptr as *const f32).add(eid * fd), fd as i32);
+                        let go  = self.d_gate_all.ptr as *mut f32;
+                        let uo  = self.d_up_all.ptr   as *mut f32;
+                        let eo  = self.d_expert_out_all.ptr as *mut f32;
+                        let doo = self.d_down_all.ptr as *mut f32;
+                        cuda_gemv_moe4(tg, gptrs[0], gptrs[1], gptrs[2], gptrs[3], xn, xn, xn, xn,
+                            go, go.add(fd), go.add(2*fd), go.add(3*fd), n_act as i32, d as i32, fd as i32);
+                        cuda_gemv_moe4(tu, uptrs[0], uptrs[1], uptrs[2], uptrs[3], xn, xn, xn, xn,
+                            uo, uo.add(fd), uo.add(2*fd), uo.add(3*fd), n_act as i32, d as i32, fd as i32);
+                        for (ki, &(eid, _)) in top.iter().enumerate() {
+                            let ko = ki * fd;
+                            if let Some(gb) = &self.d_moe_gate_bias[l] {
+                                cuda_vec_add(go.add(ko), (gb.ptr as *const f32).add(eid * fd), fd as i32);
+                            }
+                            if let Some(ub) = &self.d_moe_up_bias[l] {
+                                cuda_vec_add(uo.add(ko), (ub.ptr as *const f32).add(eid * fd), fd as i32);
+                            }
+                            // gpt-oss = clamped OAI SwiGLU; other MoE archs = standard SiLU SwiGLU.
+                            if cfg.clamped_swiglu {
+                                cuda_swiglu_oai(eo.add(ko), (go as *const f32).add(ko), (uo as *const f32).add(ko), fd as i32);
+                            } else {
+                                cuda_swiglu(eo.add(ko), (go as *const f32).add(ko), (uo as *const f32).add(ko), fd as i32);
+                            }
                         }
-                        cuda_swiglu_oai(eo.add(ko),
-                                        (go as *const f32).add(ko),
-                                        (uo as *const f32).add(ko),
-                                        fd as i32);
-                    }
-
-                    // Phase 4: batch down GEMVs — all 4 experts run simultaneously
-                    cuda_gemv_moe4(
-                        td,
-                        dptrs[0], dptrs[1], dptrs[2], dptrs[3],
-                        (eo as *const f32).add(0*fd), (eo as *const f32).add(1*fd),
-                        (eo as *const f32).add(2*fd), (eo as *const f32).add(3*fd),
-                        doo, doo.add(d), doo.add(2*d), doo.add(3*d),
-                        n_act as i32, fd as i32, d as i32,
-                    );
-
-                    // Phase 5: down biases + weighted accumulate (serial, cheap)
-                    for (ki, &(eid, _)) in top.iter().enumerate() {
-                        let rw = exps[ki] / sum_e;
-                        let ko = ki * d;
-                        if let Some(db) = &self.d_moe_down_bias[l] {
-                            cuda_vec_add(doo.add(ko),
-                                         (db.ptr as *const f32).add(eid * d), d as i32);
+                        cuda_gemv_moe4(td, dptrs[0], dptrs[1], dptrs[2], dptrs[3],
+                            (eo as *const f32).add(0*fd), (eo as *const f32).add(1*fd),
+                            (eo as *const f32).add(2*fd), (eo as *const f32).add(3*fd),
+                            doo, doo.add(d), doo.add(2*d), doo.add(3*d), n_act as i32, fd as i32, d as i32);
+                        for (ki, &(eid, _)) in top.iter().enumerate() {
+                            let rw = exps[ki] / sum_e;
+                            let ko = ki * d;
+                            if let Some(db) = &self.d_moe_down_bias[l] {
+                                cuda_vec_add(doo.add(ko), (db.ptr as *const f32).add(eid * d), d as i32);
+                            }
+                            cuda_vec_scale_add(self.d_expert_acc.ptr as *mut f32, (doo as *const f32).add(ko), rw, d as i32);
                         }
-                        cuda_vec_scale_add(self.d_expert_acc.ptr as *mut f32,
-                                           (doo as *const f32).add(ko), rw, d as i32);
+                    } else {
+                        // ── General path: ANY active-expert count (Mixtral top-2, Qwen3/OLMoE top-8…) ──
+                        // One expert at a time via single-expert GEMVs — correctness over the 4-wide
+                        // throughput trick. Reuses the single-expert scratch buffers (no resize needed).
+                        let g1 = self.d_gate.ptr as *mut f32;
+                        let u1 = self.d_up.ptr as *mut f32;
+                        let e1 = self.d_expert_out.ptr as *mut f32;
+                        let dn = self.d_down_all.ptr as *mut f32; // scratch [d] (d_down_all is 4*d)
+                        for (ki, &(eid, _)) in top.iter().enumerate() {
+                            let rw = exps[ki] / sum_e;
+                            let gp = (gw.moe_gate[l].ptr as *const u8).add(eid * ggml_type_size(tg, n_io));
+                            cuda_gemv(tg, gp, xn, g1, d as i32, fd as i32);
+                            if let Some(gb) = &self.d_moe_gate_bias[l] {
+                                cuda_vec_add(g1, (gb.ptr as *const f32).add(eid * fd), fd as i32);
+                            }
+                            let up = (gw.moe_up[l].ptr as *const u8).add(eid * ggml_type_size(tu, n_io));
+                            cuda_gemv(tu, up, xn, u1, d as i32, fd as i32);
+                            if let Some(ub) = &self.d_moe_up_bias[l] {
+                                cuda_vec_add(u1, (ub.ptr as *const f32).add(eid * fd), fd as i32);
+                            }
+                            if cfg.clamped_swiglu {
+                                cuda_swiglu_oai(e1, g1 as *const f32, u1 as *const f32, fd as i32);
+                            } else {
+                                cuda_swiglu(e1, g1 as *const f32, u1 as *const f32, fd as i32);
+                            }
+                            let dp = (gw.moe_down[l].ptr as *const u8).add(eid * ggml_type_size(td, n_down));
+                            cuda_gemv(td, dp, e1 as *const f32, dn, fd as i32, d as i32);
+                            if let Some(db) = &self.d_moe_down_bias[l] {
+                                cuda_vec_add(dn, (db.ptr as *const f32).add(eid * d), d as i32);
+                            }
+                            cuda_vec_scale_add(self.d_expert_acc.ptr as *mut f32, dn as *const f32, rw, d as i32);
+                        }
                     }
 
                     // FFN residual
