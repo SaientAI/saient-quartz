@@ -6,6 +6,8 @@ use crate::gguf::{GgufFile, TensorInfo, ggml_type_size};
 unsafe extern "C" {
     pub fn cuda_gemv(ggml_type: u32, d_data: *const u8, d_x: *const f32,
                      d_y: *mut f32, in_dim: i32, out_dim: i32);
+    fn cuda_set_iq3s_grid(host: *const u32);
+    fn cuda_set_iq2s_grid(host: *const u64);
     fn cuda_alloc(bytes: usize) -> *mut c_void;
     fn cuda_drop(ptr: *mut c_void);
     fn cuda_h2d(dst: *mut c_void, src: *const c_void, bytes: usize);
@@ -119,6 +121,25 @@ impl GpuScratch {
             out
         }
     }
+}
+
+// Upload the IQ grid codebooks to GPU device symbols exactly once per process.
+pub fn ensure_iq_grids() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        cuda_set_iq3s_grid(crate::iq3_tables::IQ3S_GRID.as_ptr());
+        cuda_set_iq2s_grid(crate::iq2_tables::IQ2S_GRID.as_ptr());
+    });
+}
+
+// Verification helper: run cuda_gemv on a raw quantized tensor (uploads it fresh).
+// Used by `--verify-gemv` to diff each GPU kernel against the CPU dequant reference.
+pub fn verify_gemv_cuda(x: &[f32], data: &[u8], ggml_type: u32,
+                        in_dim: usize, out_dim: usize) -> Vec<f32> {
+    ensure_iq_grids();
+    let buf = GpuBuf::upload(data);
+    let sc  = GpuScratch::new(in_dim, out_dim);
+    sc.gemv(x, &buf, ggml_type, in_dim, out_dim)
 }
 
 // ── GPU weight store ──────────────────────────────────────────────────────────
@@ -331,6 +352,7 @@ unsafe impl Sync for GpuForwardState {}
 
 impl GpuForwardState {
     pub fn new(w: &crate::Weights, cfg: &crate::Config) -> Self {
+        ensure_iq_grids();  // IQ codebooks must be on-device before any IQ gemv
         eprint!("GPU: allocating forward state... ");
         let d    = cfg.embed_dim;
         let q_d  = cfg.q_total_dim();

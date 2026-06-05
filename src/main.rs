@@ -1230,6 +1230,36 @@ fn main() {
         return;
     }
 
+    // ── GEMV verify: diff each GPU kernel vs CPU dequant on real model tensors ────
+    if args.iter().any(|a| a == "--verify-gemv") {
+        #[cfg(feature = "cuda")]
+        {
+            use std::collections::HashSet;
+            let mut seen = HashSet::new();
+            for ti in &gguf.tensors {
+                if ti.dims.len() != 2 || !seen.insert(ti.ggml_type) { continue; }
+                let in_dim = ti.dims[0] as usize;
+                let out_dim = ti.dims[1] as usize;
+                if in_dim % 32 != 0 || in_dim == 0 || out_dim == 0 { continue; }
+                let x: Vec<f32> = (0..in_dim).map(|i| {
+                    let s = ((i as u64).wrapping_mul(2654435761) >> 8) & 0x3FF;
+                    s as f32 / 512.0 - 1.0
+                }).collect();
+                let data = gguf.tensor_data(ti);
+                let cpu = dequant::gemv(&x, data, ti.ggml_type, in_dim, out_dim);
+                let gpu = cuda::verify_gemv_cuda(&x, data, ti.ggml_type, in_dim, out_dim);
+                let maxdiff = cpu.iter().zip(&gpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                let maxmag  = cpu.iter().map(|v| v.abs()).fold(1e-6f32, f32::max);
+                let status = if maxdiff / maxmag < 1e-3 { "OK" } else { "*** MISMATCH ***" };
+                println!("type {:3}  {:40}  in={:6} out={:6}  maxdiff={:.5}  rel={:.5}  {}",
+                    ti.ggml_type, ti.name, in_dim, out_dim, maxdiff, maxdiff / maxmag, status);
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        println!("--verify-gemv requires a CUDA build");
+        return;
+    }
+
     println!("Loading weights...");
     let weights = Weights::load_gguf(gguf.clone(), &cfg);
     #[cfg(feature = "cuda")]
