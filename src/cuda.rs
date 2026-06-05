@@ -303,6 +303,8 @@ pub struct GpuForwardState {
     // Norm weights (uploaded once)
     d_attn_norm:  Vec<GpuBuf>,
     d_ffn_norm:   Vec<GpuBuf>,
+    d_q_norm:     Vec<Option<GpuBuf>>,   // Qwen3/OLMoE QK-norm (None if arch has none)
+    d_k_norm:     Vec<Option<GpuBuf>>,
     d_final_norm: GpuBuf,
     // Attention biases (q/k/v always present; out optional)
     d_q_bias:   Vec<GpuBuf>,
@@ -375,6 +377,13 @@ impl GpuForwardState {
         }
         let d_final_norm = GpuBuf::upload_f32(&w.final_norm);
 
+        let mut d_q_norm = Vec::with_capacity(nl);
+        let mut d_k_norm = Vec::with_capacity(nl);
+        for l in 0..nl {
+            d_q_norm.push(if w.q_norm[l].is_empty() { None } else { Some(GpuBuf::upload_f32(&w.q_norm[l])) });
+            d_k_norm.push(if w.k_norm[l].is_empty() { None } else { Some(GpuBuf::upload_f32(&w.k_norm[l])) });
+        }
+
         let mut d_q_bias   = Vec::with_capacity(nl);
         let mut d_k_bias   = Vec::with_capacity(nl);
         let mut d_v_bias   = Vec::with_capacity(nl);
@@ -428,7 +437,7 @@ impl GpuForwardState {
             d_scores, d_gate, d_up, d_expert_out, d_expert_acc,
             d_gate_all, d_up_all, d_expert_out_all, d_down_all,
             d_kv_k, d_kv_v,
-            d_attn_norm, d_ffn_norm, d_final_norm,
+            d_attn_norm, d_ffn_norm, d_q_norm, d_k_norm, d_final_norm,
             d_q_bias, d_k_bias, d_v_bias, d_out_bias,
             d_moe_gate_bias, d_moe_up_bias, d_moe_down_bias,
             d_attn_sinks,
@@ -515,6 +524,34 @@ impl GpuForwardState {
                              self.d_k_bias[l].ptr as *const f32, kv_d as i32);
                 cuda_vec_add(self.d_v.ptr as *mut f32,
                              self.d_v_bias[l].ptr as *const f32, kv_d as i32);
+
+                // QK-norm (Qwen3 / OLMoE): RMSNorm Q and K BEFORE RoPE. Per-head when the weight
+                // is head_dim-sized (Qwen3); over the full projection when it's q_dim-sized (OLMoE).
+                // In-place is safe (the kernel finishes the reduction before writing).
+                if let Some(qn) = &self.d_q_norm[l] {
+                    if w.q_norm[l].len() == hd {
+                        for hh in 0..h {
+                            cuda_rms_norm((self.d_q.ptr as *mut f32).add(hh * hd),
+                                          (self.d_q.ptr as *const f32).add(hh * hd),
+                                          qn.ptr as *const f32, hd as i32);
+                        }
+                    } else {
+                        cuda_rms_norm(self.d_q.ptr as *mut f32, self.d_q.ptr as *const f32,
+                                      qn.ptr as *const f32, q_d as i32);
+                    }
+                }
+                if let Some(kn) = &self.d_k_norm[l] {
+                    if w.k_norm[l].len() == hd {
+                        for hh in 0..kv {
+                            cuda_rms_norm((self.d_k.ptr as *mut f32).add(hh * hd),
+                                          (self.d_k.ptr as *const f32).add(hh * hd),
+                                          kn.ptr as *const f32, hd as i32);
+                        }
+                    } else {
+                        cuda_rms_norm(self.d_k.ptr as *mut f32, self.d_k.ptr as *const f32,
+                                      kn.ptr as *const f32, kv_d as i32);
+                    }
+                }
 
                 cuda_rope_yarn(self.d_q.ptr as *mut f32,
                                h as i32, hd as i32, pos as i32,

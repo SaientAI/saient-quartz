@@ -122,6 +122,8 @@ pub(crate) struct Weights {
     v_bias:     Vec<Vec<f32>>,
     out_bias:   Vec<Vec<f32>>,
     attn_sinks: Vec<Vec<f32>>,  // [n_layers][n_heads] sink logit per head
+    q_norm:     Vec<Vec<f32>>,  // Qwen3/OLMoE QK-norm weights (empty if arch has none)
+    k_norm:     Vec<Vec<f32>>,
     // Large weights — lazy mmap access, GEMV at inference time
     embed:      TensorInfo,      // token_embd.weight [vocab × embed]
     lm_head:    TensorInfo,      // output.weight     [vocab × embed]
@@ -183,9 +185,14 @@ impl Weights {
         let mut up         = Vec::new();
         let mut down       = Vec::new();
         let mut moe        = Vec::new();
+        let mut q_norm     = Vec::new();
+        let mut k_norm     = Vec::new();
 
         for l in 0..cfg.n_layers {
             attn_norm.push(dq(&format!("blk.{}.attn_norm.weight", l)));
+            // Qwen3/OLMoE QK-norm (per-head head_dim for Qwen3, full q_dim for OLMoE); empty otherwise.
+            q_norm.push(dq_or_empty(&format!("blk.{}.attn_q_norm.weight", l)));
+            k_norm.push(dq_or_empty(&format!("blk.{}.attn_k_norm.weight", l)));
             // Large projections → lazy TensorInfo, GEMV at runtime
             q_proj  .push(ti(&format!("blk.{}.attn_q.weight", l)));
             k_proj  .push(ti(&format!("blk.{}.attn_k.weight", l)));
@@ -235,6 +242,7 @@ impl Weights {
             final_norm: dq("output_norm.weight"),
             attn_norm, q_proj, k_proj, v_proj, out_proj,
             q_bias, k_bias, v_bias, out_bias, attn_sinks,
+            q_norm, k_norm,
             ffn_norm, gate, up, down, moe,
         }
     }
