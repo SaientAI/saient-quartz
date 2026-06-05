@@ -641,9 +641,18 @@ impl GpuForwardState {
                         .map(|(i, &v)| (i, v)).collect();
                     indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
                     let top   = &indexed[..cfg.n_experts_used];
-                    let max_v = top.iter().map(|&(_, v)| v).fold(f32::NEG_INFINITY, f32::max);
-                    let exps: Vec<f32> = top.iter().map(|&(_, v)| (v - max_v).exp()).collect();
-                    let sum_e: f32 = exps.iter().sum();
+                    let (exps, sum_e): (Vec<f32>, f32) = if cfg.moe_renorm {
+                        // softmax over the top-k (Mixtral/Qwen-MoE/gpt-oss): renormalized weights
+                        let max_v = top.iter().map(|&(_, v)| v).fold(f32::NEG_INFINITY, f32::max);
+                        let e: Vec<f32> = top.iter().map(|&(_, v)| (v - max_v).exp()).collect();
+                        let s: f32 = e.iter().sum();
+                        (e, s)
+                    } else {
+                        // softmax over ALL experts, top-k weights NOT renormalized (OLMoE)
+                        let max_all = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let denom: f32 = logits.iter().map(|v| (v - max_all).exp()).sum();
+                        (top.iter().map(|&(_, v)| (v - max_all).exp()).collect(), denom)
+                    };
 
                     cuda_vec_zero(self.d_expert_acc.ptr as *mut f32, d as i32);
 

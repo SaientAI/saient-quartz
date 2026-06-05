@@ -29,6 +29,7 @@ pub(crate) struct Config {
     head_dim:        usize,   // actual Q/K head dim (from attention.key_length)
     n_experts:       usize,   // 0 = dense FFN
     n_experts_used:  usize,   // top-k for MoE routing
+    moe_renorm:      bool,    // true = renormalize top-k router weights (Mixtral/Qwen/gpt-oss); false = softmax over all, no renorm (OLMoE)
     yarn_scale:      f32,     // RoPE scaling factor (1.0 = no scaling)
     yarn_orig_ctx:   usize,   // original context length for YARN
     clamped_swiglu:  bool,    // true = gpt-oss clamped OAI SwiGLU experts; false = standard SiLU
@@ -76,6 +77,16 @@ impl Config {
         let n_experts_used = g.arch_u32_any(&["expert_used_count", "experts_used"])
             .unwrap_or(if n_experts > 0 { 2 } else { 0 } as u32) as usize;
 
+        // Whether to renormalize the top-k router weights. Mixtral/Qwen-MoE/gpt-oss softmax
+        // over the selected experts (renorm); OLMoE softmaxes over ALL experts and does NOT
+        // renormalize the top-k (norm_topk_prob=false). Renormalizing OLMoE over-weights the
+        // FFN and compounds into garbage. Honor the GGUF flag when present, else default by arch.
+        let moe_renorm = match g.metadata.get(&format!("{}.expert_weights_norm",
+                g.architecture().unwrap_or("llama"))) {
+            Some(gguf::GgufValue::Bool(b)) => *b,
+            _ => g.architecture().unwrap_or("llama") != "olmoe",
+        };
+
         let yarn_scale = g.arch_f32_any(&["rope.scaling.factor"]).unwrap_or(1.0);
         let yarn_orig_ctx = g.arch_u32_any(&["rope.scaling.original_context_length"])
             .map(|v| v as usize)
@@ -96,7 +107,7 @@ impl Config {
         } else { 0 };
 
         Self { vocab_size, embed_dim, n_heads, n_kv_heads, n_layers, ffn_dim,
-               rope_theta, head_dim, n_experts, n_experts_used,
+               rope_theta, head_dim, n_experts, n_experts_used, moe_renorm,
                yarn_scale, yarn_orig_ctx, clamped_swiglu, swa_window }
     }
 
@@ -527,9 +538,18 @@ fn moe_ffn(x: &[f32], moe: &MoeLayerInfo, gguf: &GgufFile, cfg: &Config, moe_lay
     indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
     let top_k = &indexed[..k];
 
-    let max_v = top_k.iter().map(|&(_, v)| v).fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = top_k.iter().map(|&(_, v)| (v - max_v).exp()).collect();
-    let sum_exp: f32 = exps.iter().sum();
+    // OLMoE (moe_renorm=false) softmaxes over ALL experts without renormalizing the top-k;
+    // Mixtral/Qwen-MoE/gpt-oss renormalize over the selected experts. See Config::moe_renorm.
+    let (exps, sum_exp): (Vec<f32>, f32) = if cfg.moe_renorm {
+        let max_v = top_k.iter().map(|&(_, v)| v).fold(f32::NEG_INFINITY, f32::max);
+        let e: Vec<f32> = top_k.iter().map(|&(_, v)| (v - max_v).exp()).collect();
+        let s: f32 = e.iter().sum();
+        (e, s)
+    } else {
+        let max_all = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let denom: f32 = logits.iter().map(|v| (v - max_all).exp()).sum();
+        (top_k.iter().map(|&(_, v)| (v - max_all).exp()).collect(), denom)
+    };
 
     let mut output = vec![0.0f32; d];
 
@@ -1175,6 +1195,27 @@ fn main() {
     if args.iter().any(|a| a == "--list-tensors") {
         for t in &gguf.tensors {
             println!("{:60} type={} dims={:?}", t.name, t.ggml_type, t.dims);
+        }
+        return;
+    }
+
+    // ── Tokenize debug: `tinyq4 model --tokenize "text"` ──────────────────────────
+    if let Some(p) = args.iter().position(|a| a == "--tokenize") {
+        let text = args.get(p + 1).map(|s| s.as_str()).unwrap_or("Hello, world!");
+        if let Some(t) = &tokenizer {
+            let chat = args.iter().any(|a| a == "--chat");
+            let ids: Vec<u32> = if chat {
+                t.encode_messages(&[("user", text)])
+            } else {
+                t.encode(text)
+            };
+            println!("text   : {:?}", text);
+            println!("n_tok  : {}", ids.len());
+            println!("ids    : {:?}", ids);
+            let pieces: Vec<String> = ids.iter().map(|&id| t.decode_token(id)).collect();
+            println!("pieces : {:?}", pieces);
+        } else {
+            println!("no tokenizer");
         }
         return;
     }
