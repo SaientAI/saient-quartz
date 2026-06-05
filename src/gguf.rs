@@ -181,6 +181,10 @@ pub fn ggml_type_size(ggml_type: u32, n_elems: usize) -> usize {
         14 => (n_elems / 256) * 210,         // Q6_K: 256 per block
         20 => (n_elems / 32) * 18,           // IQ4_NL: 32 per block, 2+16 bytes
         30 => n_elems * 2,                   // BF16: 2 bytes each
+        16 => (n_elems / 256) * 66,          // IQ2_XXS: 256/block, 2 + 32*2 bytes
+        17 => (n_elems / 256) * 74,          // IQ2_XS:  256/block, 2 + 32*2 + 8 bytes
+        22 => (n_elems / 256) * 82,          // IQ2_S:   256/block, 2 + 64 + 8 + 8 bytes
+        21 => (n_elems / 256) * 110,         // IQ3_S:   256/block, 2 + 64 + 8 + 32 + 4 bytes
         t  => panic!("unsupported ggml_type: {}", t),
     }
 }

@@ -2,6 +2,8 @@
 
 mod gguf;
 mod dequant;
+mod iq2_tables;   // IQ2 grid seed + sign tables (generated from ggml-quants.c)
+mod iq3_tables;   // IQ3_S grid table (generated from ggml-common.h)
 mod tokenizer;
 mod server;
 #[cfg(feature = "cuda")]
@@ -238,7 +240,10 @@ impl Weights {
         Self {
             _gguf: keep,
             embed:      ti("token_embd.weight"),
-            lm_head:    ti("output.weight"),
+            // Tied embeddings (small Qwen2.5, Gemma, …): no separate output.weight — the
+            // lm_head reuses token_embd. Fall back to it instead of panicking.
+            lm_head:    if tmap.contains_key("output.weight") { ti("output.weight") }
+                        else { ti("token_embd.weight") },
             final_norm: dq("output_norm.weight"),
             attn_norm, q_proj, k_proj, v_proj, out_proj,
             q_bias, k_bias, v_bias, out_bias, attn_sinks,

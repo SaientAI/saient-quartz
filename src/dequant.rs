@@ -349,6 +349,175 @@ fn gemv_f32_data(x: &[f32], data: &[u8], in_dim: usize, out_dim: usize) -> Vec<f
     }).collect()
 }
 
+// ── IQ2 (XXS / XS / S) — 2-bit grid-codebook quants ────────────────────────────
+// The grid is ggml's hardcoded iq2*_grid table: each u64 packs the 8 int8 codebook
+// values for that entry (e.g. iq2s_grid[0] = 0x08…08 = [8,8,8,8,8,8,8,8]).
+fn build_iq2_grid(table: &[u64]) -> Vec<[i8; 8]> {
+    table.iter().map(|&g| {
+        let b = g.to_le_bytes();
+        [b[0] as i8, b[1] as i8, b[2] as i8, b[3] as i8, b[4] as i8, b[5] as i8, b[6] as i8, b[7] as i8]
+    }).collect()
+}
+fn iq2_grid(grid_size: usize) -> &'static Vec<[i8; 8]> {
+    use crate::iq2_tables::*;
+    use std::sync::OnceLock;
+    static G256:  OnceLock<Vec<[i8;8]>> = OnceLock::new();
+    static G512:  OnceLock<Vec<[i8;8]>> = OnceLock::new();
+    static G1024: OnceLock<Vec<[i8;8]>> = OnceLock::new();
+    match grid_size {
+        256 => G256.get_or_init(|| build_iq2_grid(&IQ2XXS_GRID)),
+        512 => G512.get_or_init(|| build_iq2_grid(&IQ2XS_GRID)),
+        _   => G1024.get_or_init(|| build_iq2_grid(&IQ2S_GRID)),
+    }
+}
+
+fn dequant_iq2_xxs(data: &[u8], n_elems: usize) -> Vec<f32> {
+    use crate::iq2_tables::{KSIGNS_IQ2XS, KMASK_IQ2XS};
+    let grid = iq2_grid(256);
+    let nb = n_elems / 256; const BS: usize = 66;
+    let mut out = Vec::with_capacity(n_elems);
+    for ib in 0..nb {
+        let blk = &data[ib*BS..ib*BS+BS];
+        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let qs = &blk[2..];                                   // 64 bytes = u16[32]
+        for ib32 in 0..8 {
+            let b = 8 * ib32;
+            let a0 = [qs[b], qs[b+1], qs[b+2], qs[b+3]];      // 4 grid indices
+            let a1 = u32::from_le_bytes([qs[b+4], qs[b+5], qs[b+6], qs[b+7]]); // signs + scale
+            let db = d * (0.5 + (a1 >> 28) as f32) * 0.25;
+            for l in 0..4 {
+                let g = &grid[a0[l] as usize];
+                let signs = KSIGNS_IQ2XS[((a1 >> (7 * l)) & 127) as usize];
+                for j in 0..8 {
+                    let s = if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    out.push(db * g[j] as f32 * s);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn dequant_iq2_xs(data: &[u8], n_elems: usize) -> Vec<f32> {
+    use crate::iq2_tables::{KSIGNS_IQ2XS, KMASK_IQ2XS};
+    let grid = iq2_grid(512);
+    let nb = n_elems / 256; const BS: usize = 74;
+    let mut out = Vec::with_capacity(n_elems);
+    for ib in 0..nb {
+        let blk = &data[ib*BS..ib*BS+BS];
+        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let qs = &blk[2..66];                                 // u16[32]
+        let scales = &blk[66..74];                            // u8[8]
+        for ib32 in 0..8 {
+            let db0 = d * (0.5 + (scales[ib32] & 0xf) as f32) * 0.25;
+            let db1 = d * (0.5 + (scales[ib32] >> 4)  as f32) * 0.25;
+            for l in 0..4 {
+                let qi = 2 * (4*ib32 + l);
+                let q = u16::from_le_bytes([qs[qi], qs[qi+1]]);
+                let g = &grid[(q & 511) as usize];
+                let signs = KSIGNS_IQ2XS[(q >> 9) as usize];
+                let db = if l < 2 { db0 } else { db1 };
+                for j in 0..8 {
+                    let s = if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    out.push(db * g[j] as f32 * s);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn dequant_iq2_s(data: &[u8], n_elems: usize) -> Vec<f32> {
+    use crate::iq2_tables::KMASK_IQ2XS;
+    let grid = iq2_grid(1024);
+    let nb = n_elems / 256; const BS: usize = 82;
+    let mut out = Vec::with_capacity(n_elems);
+    for ib in 0..nb {
+        let blk = &data[ib*BS..ib*BS+BS];
+        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let qs = &blk[2..66];                                 // u8[64]: [0..32]=idx, [32..64]=signs
+        let qh = &blk[66..74];                                // u8[8]
+        let scales = &blk[74..82];                            // u8[8]
+        for ib32 in 0..8 {
+            let db0 = d * (0.5 + (scales[ib32] & 0xf) as f32) * 0.25;
+            let db1 = d * (0.5 + (scales[ib32] >> 4)  as f32) * 0.25;
+            for l in 0..4 {
+                let db = if l < 2 { db0 } else { db1 };
+                let idx = (qs[4*ib32 + l] as usize)
+                        | (((qh[ib32] as usize) << (8 - 2*l)) & 0x300);
+                let g = &grid[idx];
+                let signs = qs[32 + 4*ib32 + l];
+                for j in 0..8 {
+                    let s = if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    out.push(db * g[j] as f32 * s);
+                }
+            }
+        }
+    }
+    out
+}
+
+// ── Q5_K — standard 5-bit K-quant (256/block, 176 bytes) ───────────────────────
+fn dequant_q5_k(data: &[u8], n_elems: usize) -> Vec<f32> {
+    let nb = n_elems / 256; const BS: usize = 176;
+    let mut out = Vec::with_capacity(n_elems);
+    for ib in 0..nb {
+        let blk = &data[ib*BS..ib*BS+BS];
+        let d    = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+        let scales = &blk[4..16];
+        let qh = &blk[16..48];     // QK_K/8 = 32 bytes (high bits)
+        let qs = &blk[48..176];    // QK_K/2 = 128 bytes (low 4 bits)
+        let (mut is, mut u1, mut u2) = (0usize, 1u8, 2u8);
+        for jb in 0..4 {                       // QK_K in steps of 64
+            let ql = &qs[jb*32..jb*32+32];
+            let (sc1, mm1) = get_scale_min_k4(is,     scales);
+            let (d1, m1) = (d * sc1 as f32, dmin * mm1 as f32);
+            let (sc2, mm2) = get_scale_min_k4(is + 1, scales);
+            let (d2, m2) = (d * sc2 as f32, dmin * mm2 as f32);
+            for l in 0..32 { out.push(d1 * (((ql[l] & 0xF) as f32) + if qh[l] & u1 != 0 {16.0} else {0.0}) - m1); }
+            for l in 0..32 { out.push(d2 * (((ql[l] >> 4)  as f32) + if qh[l] & u2 != 0 {16.0} else {0.0}) - m2); }
+            is += 2; u1 <<= 2; u2 <<= 2;
+        }
+    }
+    out
+}
+
+// ── IQ3_S — 3-bit grid-codebook quant (256/block, 110 bytes) ───────────────────
+fn dequant_iq3_s(data: &[u8], n_elems: usize) -> Vec<f32> {
+    use crate::iq2_tables::KMASK_IQ2XS;
+    use crate::iq3_tables::IQ3S_GRID;
+    #[inline] fn g(idx: usize) -> [i8; 4] { let b = IQ3S_GRID[idx].to_le_bytes(); [b[0] as i8, b[1] as i8, b[2] as i8, b[3] as i8] }
+    let nb = n_elems / 256; const BS: usize = 110;
+    let mut out = Vec::with_capacity(n_elems);
+    for ib in 0..nb {
+        let blk = &data[ib*BS..ib*BS+BS];
+        let d  = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let qs = &blk[2..66];        // 64 bytes
+        let qh = &blk[66..74];       // 8 bytes
+        let sg = &blk[74..106];      // 32 bytes (signs)
+        let scales = &blk[106..110]; // 4 bytes
+        let (mut qo, mut so, mut ho) = (0usize, 0usize, 0usize);
+        for ib32 in (0..8).step_by(2) {
+            let db1 = d * (1.0 + 2.0 * (scales[ib32/2] & 0xf) as f32);
+            let db2 = d * (1.0 + 2.0 * (scales[ib32/2] >> 4)  as f32);
+            for (half, db, qhb) in [(0usize, db1, qh[ho]), (1usize, db2, qh[ho+1])] {
+                let qbase = qo + half*8;
+                let sbase = so + half*4;
+                for l in 0..4 {
+                    let i0 = qs[qbase + 2*l]   as usize | (((qhb as usize) << (8 - 2*l)) & 256);
+                    let i1 = qs[qbase + 2*l+1] as usize | (((qhb as usize) << (7 - 2*l)) & 256);
+                    let (g1, g2, s) = (g(i0), g(i1), sg[sbase + l]);
+                    for j in 0..4 { out.push(db * g1[j] as f32 * if s & KMASK_IQ2XS[j]   != 0 {-1.0} else {1.0}); }
+                    for j in 0..4 { out.push(db * g2[j] as f32 * if s & KMASK_IQ2XS[j+4] != 0 {-1.0} else {1.0}); }
+                }
+            }
+            qo += 16; so += 8; ho += 2;
+        }
+    }
+    out
+}
+
 pub fn dequant(data: &[u8], ggml_type: u32, n_elems: usize) -> Vec<f32> {
     match ggml_type {
         0  => dequant_f32(data, n_elems),
@@ -357,7 +526,12 @@ pub fn dequant(data: &[u8], ggml_type: u32, n_elems: usize) -> Vec<f32> {
         7  => dequant_q5_1(data, n_elems),
         8  => dequant_q8_0(data, n_elems),
         12 => dequant_q4_k(data, n_elems),
+        13 => dequant_q5_k(data, n_elems),
         14 => dequant_q6_k(data, n_elems),
+        16 => dequant_iq2_xxs(data, n_elems),
+        17 => dequant_iq2_xs(data, n_elems),
+        21 => dequant_iq3_s(data, n_elems),
+        22 => dequant_iq2_s(data, n_elems),
         20 => dequant_iq4nl(data, n_elems),
         30 => dequant_bf16(data, n_elems),
         t  => panic!("dequant: unsupported ggml_type {}", t),
