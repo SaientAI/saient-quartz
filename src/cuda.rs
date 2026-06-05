@@ -11,6 +11,7 @@ unsafe extern "C" {
     fn cuda_set_iq2xxs_grid(host: *const u64);
     fn cuda_set_iq2xs_grid(host: *const u64);
     fn cuda_set_ksigns(host: *const u8);
+    fn cuda_mem_info(free_b: *mut usize, total_b: *mut usize);
     fn cuda_alloc(bytes: usize) -> *mut c_void;
     fn cuda_drop(ptr: *mut c_void);
     fn cuda_h2d(dst: *mut c_void, src: *const c_void, bytes: usize);
@@ -365,13 +366,29 @@ impl GpuForwardState {
         let kv_d = cfg.kv_total_dim();
         let fd   = cfg.ffn_dim;
         let nl   = cfg.n_layers;
-        let mseq = cfg.yarn_orig_ctx.max(4096);
-
         let nh   = cfg.n_heads;
-        // Cap KV cache at 2048 tokens so lm_head fits in VRAM on 16 GB GPUs.
-        // yarn_orig_ctx can be 4096 but KV cache at 4096 = 384 MB leaving no room
-        // for lm_head (1.1 GB BF16). At 2048 KV cache = 192 MB.
-        let mseq = mseq.min(2048);
+
+        // Size the KV cache to actual free VRAM instead of a fixed cap. A hard 2048-token
+        // cap silently clamped positions and melted long generations into garbage. Here we
+        // measure the VRAM left after the layer weights are uploaded (lm_head uploads next,
+        // so reserve it), spend the rest on KV, and cap at the model's trained context.
+        //   per_tok = kv_d * 4B * n_layers * 2 (separate K and V caches)
+        let per_tok = kv_d * 4 * nl * 2;
+        let (free_vram, _total) = unsafe {
+            let (mut f, mut t) = (0usize, 0usize);
+            cuda_mem_info(&mut f, &mut t);
+            (f, t)
+        };
+        let lm_head_bytes = crate::gguf::ggml_type_size(w.lm_head.ggml_type, w.lm_head.n_elems());
+        let margin = 768 * 1024 * 1024;  // activations/scratch headroom — avoid OOM mid-run
+        let budget = free_vram.saturating_sub(lm_head_bytes + margin);
+        let fit = (budget / per_tok.max(1)).max(2048);
+        // `TINYQ4_CTX` lets the app pass the user's context-length setting as an upper bound.
+        let env_cap = std::env::var("TINYQ4_CTX").ok().and_then(|s| s.parse::<usize>().ok());
+        let cap = env_cap.unwrap_or(usize::MAX).min(cfg.context_length.max(2048));
+        let mseq = fit.min(cap).max(2048);
+        eprintln!("KV cache: max_seq={} (free {} MB, lm_head {} MB, per_tok {} B, model_ctx {})",
+            mseq, free_vram / (1024*1024), lm_head_bytes / (1024*1024), per_tok, cfg.context_length);
         let a = GpuBuf::alloc_f32;
         let d_hidden     = a(d);
         let d_norm_out   = a(d);

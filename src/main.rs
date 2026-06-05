@@ -25,6 +25,7 @@ pub(crate) struct Config {
     n_kv_heads:      usize,
     n_layers:        usize,
     ffn_dim:         usize,
+    context_length:  usize,   // model's trained context — upper bound for the KV cache
     rope_theta:      f32,
     head_dim:        usize,   // actual Q/K head dim (from attention.key_length)
     n_experts:       usize,   // 0 = dense FFN
@@ -53,6 +54,9 @@ impl Config {
             .expect("missing feed_forward_length") as usize;
         let rope_theta = g.arch_f32_any(&["rope.freq_base", "attention.rope.freq_base"])
             .unwrap_or(10_000.0);
+
+        let context_length = g.arch_u32_any(&["context_length"])
+            .map(|v| v as usize).filter(|&v| v > 0).unwrap_or(8192);
 
         let head_dim = g.arch_u32_any(&["attention.key_length"])
             .map(|v| v as usize)
@@ -113,7 +117,7 @@ impl Config {
         let rope_neox = !matches!(arch,
             "llama" | "baichuan" | "starcoder" | "minicpm" | "internlm2" | "orion" | "plamo" | "xverse");
 
-        Self { vocab_size, embed_dim, n_heads, n_kv_heads, n_layers, ffn_dim,
+        Self { vocab_size, embed_dim, n_heads, n_kv_heads, n_layers, ffn_dim, context_length,
                rope_theta, head_dim, n_experts, n_experts_used, moe_renorm,
                yarn_scale, yarn_orig_ctx, clamped_swiglu, swa_window, rope_neox }
     }

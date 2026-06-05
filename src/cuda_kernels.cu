@@ -1039,6 +1039,9 @@ void cuda_set_iq2xs_grid(const uint64_t* host) {
 void cuda_set_ksigns(const uint8_t* host) {
     cudaMemcpyToSymbol(g_ksigns, host, 128);
 }
+void cuda_mem_info(size_t* free_b, size_t* total_b) {
+    cudaMemGetInfo(free_b, total_b);
+}
 
 void cuda_gemv(uint32_t ggml_type,
                const uint8_t* d_data,
