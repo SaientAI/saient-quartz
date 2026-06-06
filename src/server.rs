@@ -40,7 +40,10 @@ pub async fn run(port: u16, state: Arc<AppState>) {
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{}", port);
+    // Bind localhost only by default so the LLM + agent endpoints are not exposed to the
+    // LAN. Set TINYQ4_BIND=0.0.0.0 to opt into network access (e.g. remote/headless use).
+    let host = std::env::var("TINYQ4_BIND").unwrap_or_else(|_| "127.0.0.1".into());
+    let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await
         .unwrap_or_else(|e| panic!("cannot bind {}: {}", addr, e));
     eprintln!("tinyq4 server listening on http://{}", addr);
