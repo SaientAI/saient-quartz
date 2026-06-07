@@ -259,6 +259,73 @@ fn q4k_row_scalar(x: &[f32], row: &[u8]) -> f32 { q4k_row(x, row) }
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 unsafe fn q4k_row_avx2(x: &[f32], row: &[u8]) -> f32 { q4k_row(x, row) }
 
+// ── ARM NEON Q4_K row dot ─────────────────────────────────────────────────────
+// The scalar float reductions don't auto-vectorise without fast-math, so on
+// aarch64 we hand-vectorise: unpack 4-bit nibbles → f32 lanes and FMA against x.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn q4_dot32_neon(x: *const f32, qs: *const u8, hi: bool) -> (f32, f32) {
+    use core::arch::aarch64::*;
+    let q0 = vld1q_u8(qs);
+    let q1 = vld1q_u8(qs.add(16));
+    let (n0, n1) = if hi {
+        (vshrq_n_u8::<4>(q0), vshrq_n_u8::<4>(q1))
+    } else {
+        let m = vdupq_n_u8(0x0F);
+        (vandq_u8(q0, m), vandq_u8(q1, m))
+    };
+    let mut accsq = vdupq_n_f32(0.0);
+    let mut accsx = vdupq_n_f32(0.0);
+    for (ni, base) in [(n0, 0usize), (n1, 16usize)] {
+        let lo16 = vmovl_u8(vget_low_u8(ni));
+        let hi16 = vmovl_u8(vget_high_u8(ni));
+        let chunks = [
+            vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16))),
+            vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo16))),
+            vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16))),
+            vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi16))),
+        ];
+        let mut k = 0usize;
+        while k < 4 {
+            let xv = vld1q_f32(x.add(base + k * 4));
+            accsq = vfmaq_f32(accsq, xv, chunks[k]);
+            accsx = vaddq_f32(accsx, xv);
+            k += 1;
+        }
+    }
+    (vaddvq_f32(accsq), vaddvq_f32(accsx))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn q4k_row_neon(x: &[f32], row: &[u8]) -> f32 {
+    const BYTES: usize = 144;
+    let bpr = row.len() / BYTES;
+    let mut acc = 0.0f32;
+    for b in 0..bpr {
+        let blk    = &row[b * BYTES..(b + 1) * BYTES];
+        let d      = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dmin   = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+        let scales = &blk[4..16];
+        let qs     = &blk[16..144];
+        let xb     = &x[b * 256..b * 256 + 256];
+        let (mut q_off, mut is, mut o) = (0usize, 0usize, 0usize);
+        for _ in 0..4 {
+            let (sc1, m1) = get_scale_min_k4(is,     scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d1 = d * sc1 as f32;  let m1 = dmin * m1 as f32;
+            let d2 = d * sc2 as f32;  let m2 = dmin * m2 as f32;
+            unsafe {
+                let (sq1, sx1) = q4_dot32_neon(xb.as_ptr().add(o),      qs.as_ptr().add(q_off), false);
+                acc += d1 * sq1 - m1 * sx1;
+                let (sq2, sx2) = q4_dot32_neon(xb.as_ptr().add(o + 32), qs.as_ptr().add(q_off), true);
+                acc += d2 * sq2 - m2 * sx2;
+            }
+            o += 64; q_off += 32; is += 2;
+        }
+    }
+    acc
+}
+
 fn q6k_row_scalar(x: &[f32], row: &[u8]) -> f32 { q6k_row(x, row) }
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 unsafe fn q6k_row_avx2(x: &[f32], row: &[u8]) -> f32 { q6k_row(x, row) }
@@ -286,10 +353,14 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 { dot(a, b) }
 fn gemv_q4_k(x: &[f32], data: &[u8], in_dim: usize, out_dim: usize) -> Vec<f32> {
     debug_assert_eq!(in_dim % 256, 0, "in_dim must be a multiple of 256 for Q4_K");
     let row_bytes = (in_dim / 256) * 144;
+    #[cfg(not(target_arch = "aarch64"))]
     let avx = cpu_has_avx2();
     (0..out_dim).into_par_iter().map(|j| {
         let row = &data[j * row_bytes..(j + 1) * row_bytes];
-        if avx { unsafe { q4k_row_avx2(x, row) } } else { q4k_row_scalar(x, row) }
+        #[cfg(target_arch = "aarch64")]
+        { q4k_row_neon(x, row) }
+        #[cfg(not(target_arch = "aarch64"))]
+        { if avx { unsafe { q4k_row_avx2(x, row) } } else { q4k_row_scalar(x, row) } }
     }).collect()
 }
 
