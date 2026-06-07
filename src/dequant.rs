@@ -107,10 +107,10 @@ fn q6k_row_batched(x: &[f32], in_dim: usize, n: usize, row: &[u8], acc: &mut [f3
 }
 
 fn q4k_batched_scalar(x: &[f32], in_dim: usize, n: usize, row: &[u8], acc: &mut [f32]) { q4k_row_batched(x, in_dim, n, row, acc) }
-#[target_feature(enable = "avx2,fma")]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 unsafe fn q4k_batched_avx2(x: &[f32], in_dim: usize, n: usize, row: &[u8], acc: &mut [f32]) { q4k_row_batched(x, in_dim, n, row, acc) }
 fn q6k_batched_scalar(x: &[f32], in_dim: usize, n: usize, row: &[u8], acc: &mut [f32]) { q6k_row_batched(x, in_dim, n, row, acc) }
-#[target_feature(enable = "avx2,fma")]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 unsafe fn q6k_batched_avx2(x: &[f32], in_dim: usize, n: usize, row: &[u8], acc: &mut [f32]) { q6k_row_batched(x, in_dim, n, row, acc) }
 
 // Batched matrix-vector: X [n, in_dim] times W^T -> [n, out_dim] (token-major).
@@ -256,16 +256,19 @@ fn q6k_row(x: &[f32], row: &[u8]) -> f32 {
 }
 
 fn q4k_row_scalar(x: &[f32], row: &[u8]) -> f32 { q4k_row(x, row) }
-#[target_feature(enable = "avx2,fma")]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 unsafe fn q4k_row_avx2(x: &[f32], row: &[u8]) -> f32 { q4k_row(x, row) }
 
 fn q6k_row_scalar(x: &[f32], row: &[u8]) -> f32 { q6k_row(x, row) }
-#[target_feature(enable = "avx2,fma")]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 unsafe fn q6k_row_avx2(x: &[f32], row: &[u8]) -> f32 { q6k_row(x, row) }
 
 #[inline]
 fn cpu_has_avx2() -> bool {
-    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+    #[cfg(target_arch = "x86_64")]
+    { is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") }
+    #[cfg(not(target_arch = "x86_64"))]
+    { false }
 }
 
 #[inline(always)]
@@ -277,7 +280,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 fn dot_scalar(a: &[f32], b: &[f32]) -> f32 { dot(a, b) }
-#[target_feature(enable = "avx2,fma")]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 { dot(a, b) }
 
 fn gemv_q4_k(x: &[f32], data: &[u8], in_dim: usize, out_dim: usize) -> Vec<f32> {
