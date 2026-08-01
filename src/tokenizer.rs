@@ -1,42 +1,43 @@
 // BPE tokenizer loaded from GGUF metadata.
 // Supports Qwen2, LLaMA-family, and any model using tokenizer.ggml.* keys.
 
-use std::collections::HashMap;
 use crate::gguf::{GgufFile, GgufValue};
+use std::collections::HashMap;
 
 pub struct Tokenizer {
-    vocab:       Vec<String>,
+    vocab: Vec<String>,
     token_to_id: HashMap<String, u32>,
-    merges:      HashMap<(String, String), u32>,
-    byte_to_u:   [char; 256],     // GPT-2 byte→unicode encoding table
-    u_to_byte:   HashMap<char, u8>, // inverse
-    spm:         bool,
+    merges: HashMap<(String, String), u32>,
+    byte_to_u: [char; 256],       // GPT-2 byte→unicode encoding table
+    u_to_byte: HashMap<char, u8>, // inverse
+    spm: bool,
     max_token_chars: usize,
-    pub bos_id:       u32,
-    pub eos_id:       u32,
-    pub unk_id:       u32,
-    pub im_start_id:  u32,
-    pub im_end_id:    u32,
-    pub msg_start_id: u32,  // <|start|> — GPT-oss role delimiter
-    pub end_id:       u32,
-    pub return_id:    u32,
-    pub channel_id:   u32,  // <|channel|> — GPT-oss channel switch
-    pub message_id:   u32,  // <|message|> — GPT-oss message start
-    chat_template:    Option<String>,  // embedded Jinja chat template (tokenizer.chat_template)
-    bos_token:        String,          // BOS as text, for {{ bos_token }} in the template
-    eos_token:        String,          // EOS as text, for {{ eos_token }} in the template
-    add_bos:          bool,            // prepend BOS to the encoded prompt (llama/mistral need it)
+    pub bos_id: u32,
+    pub eos_id: u32,
+    pub unk_id: u32,
+    pub im_start_id: u32,
+    pub im_end_id: u32,
+    pub msg_start_id: u32, // <|start|> — GPT-oss role delimiter
+    pub end_id: u32,
+    pub return_id: u32,
+    pub channel_id: u32,           // <|channel|> — GPT-oss channel switch
+    pub message_id: u32,           // <|message|> — GPT-oss message start
+    chat_template: Option<String>, // embedded Jinja chat template (tokenizer.chat_template)
+    bos_token: String,             // BOS as text, for {{ bos_token }} in the template
+    eos_token: String,             // EOS as text, for {{ eos_token }} in the template
+    add_bos: bool,                 // prepend BOS to the encoded prompt (llama/mistral need it)
     // CONTROL/USER_DEFINED tokens indexed by first byte, each bucket longest-first, so a
     // rendered template's special markers (<|im_start|>, [INST], </s>, <|start|>…) tokenize
     // atomically instead of shattering into text pieces.
-    special_first:    HashMap<u8, Vec<(String, u32)>>,
+    special_first: HashMap<u8, Vec<(String, u32)>>,
 }
 
 impl Tokenizer {
     pub fn from_gguf(gguf: &GgufFile) -> Option<Self> {
         // Vocab
         let vocab: Vec<String> = match gguf.metadata.get("tokenizer.ggml.tokens")? {
-            GgufValue::Array(arr) => arr.iter()
+            GgufValue::Array(arr) => arr
+                .iter()
                 .map(|v| v.as_str().unwrap_or("").to_string())
                 .collect(),
             _ => return None,
@@ -53,54 +54,76 @@ impl Tokenizer {
             for (rank, v) in arr.iter().enumerate() {
                 if let Some(s) = v.as_str() {
                     if let Some(pos) = s.find(' ') {
-                        merges.insert((s[..pos].to_string(), s[pos+1..].to_string()), rank as u32);
+                        merges.insert(
+                            (s[..pos].to_string(), s[pos + 1..].to_string()),
+                            rank as u32,
+                        );
                     }
                 }
             }
         }
 
         let (byte_to_u, u_to_byte) = build_byte_unicode_tables();
-        let model_name = gguf.metadata
+        let model_name = gguf
+            .metadata
             .get("tokenizer.ggml.model")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let spm = model_name.contains("llama")
             || model_name.contains("sentencepiece")
             || vocab.iter().any(|tok| tok.starts_with('▁'));
-        let max_token_chars = vocab.iter().map(|tok| tok.chars().count()).max().unwrap_or(1);
+        let max_token_chars = vocab
+            .iter()
+            .map(|tok| tok.chars().count())
+            .max()
+            .unwrap_or(1);
 
         // Special token IDs
         let find = |s: &str| token_to_id.get(s).copied().unwrap_or(u32::MAX);
-        let bos_id      = find("<|endoftext|>")
-            .min(find("<s>"))
-            .min(gguf.metadata.get("tokenizer.ggml.bos_token_id")
+        let bos_id = find("<|endoftext|>").min(find("<s>")).min(
+            gguf.metadata
+                .get("tokenizer.ggml.bos_token_id")
                 .and_then(|v| v.as_u32())
-                .unwrap_or(u32::MAX));
-        let unk_id      = find("<unk>")
-            .min(gguf.metadata.get("tokenizer.ggml.unknown_token_id")
+                .unwrap_or(u32::MAX),
+        );
+        let unk_id = find("<unk>").min(
+            gguf.metadata
+                .get("tokenizer.ggml.unknown_token_id")
                 .and_then(|v| v.as_u32())
-                .unwrap_or(u32::MAX));
-        let im_end_id   = find("<|im_end|>");
+                .unwrap_or(u32::MAX),
+        );
+        let im_end_id = find("<|im_end|>");
         let im_start_id = find("<|im_start|>");
-        let end_id      = find("<|end|>");      // GPT-oss native EOS
-        let return_id   = find("<|return|>");   // GPT-oss final turn terminator
-        let msg_start_id = find("<|start|>");    // GPT-oss role delimiter
-        let channel_id   = find("<|channel|>");  // GPT-oss channel switch
-        let message_id   = find("<|message|>");  // GPT-oss message start
-        let eos_id = if return_id != u32::MAX { return_id }
-                     else if end_id != u32::MAX   { end_id }
-                     else if im_end_id != u32::MAX { im_end_id }
-                     else { token_to_id.get("</s>").copied().unwrap_or(bos_id) };
+        let end_id = find("<|end|>"); // GPT-oss native EOS
+        let return_id = find("<|return|>"); // GPT-oss final turn terminator
+        let msg_start_id = find("<|start|>"); // GPT-oss role delimiter
+        let channel_id = find("<|channel|>"); // GPT-oss channel switch
+        let message_id = find("<|message|>"); // GPT-oss message start
+        let eos_id = if return_id != u32::MAX {
+            return_id
+        } else if end_id != u32::MAX {
+            end_id
+        } else if im_end_id != u32::MAX {
+            im_end_id
+        } else {
+            token_to_id.get("</s>").copied().unwrap_or(bos_id)
+        };
 
         // Embedded Jinja chat template (the ground-truth prompt format the model was
         // trained with). Rendering this beats guessing the format from which special
         // tokens exist — e.g. OLMoE's role markers (<|user|>) are plain text, not vocab
         // tokens, so the heuristic ladder mis-formats it.
-        let chat_template = gguf.metadata.get("tokenizer.chat_template")
-            .and_then(|v| v.as_str()).map(|s| s.to_string());
+        let chat_template = gguf
+            .metadata
+            .get("tokenizer.chat_template")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let id_to_tok = |id: u32| -> String {
-            if id != u32::MAX && (id as usize) < vocab.len() { vocab[id as usize].clone() }
-            else { String::new() }
+            if id != u32::MAX && (id as usize) < vocab.len() {
+                vocab[id as usize].clone()
+            } else {
+                String::new()
+            }
         };
         let bos_token = id_to_tok(bos_id);
         let eos_token = id_to_tok(eos_id);
@@ -125,7 +148,9 @@ impl Tokenizer {
         }
         if specials.is_empty() {
             for (s, &id) in &token_to_id {
-                if s.starts_with("<|") && s.ends_with("|>") { specials.push((s.clone(), id)); }
+                if s.starts_with("<|") && s.ends_with("|>") {
+                    specials.push((s.clone(), id));
+                }
             }
         }
         let mut special_first: HashMap<u8, Vec<(String, u32)>> = HashMap::new();
@@ -135,14 +160,33 @@ impl Tokenizer {
             }
         }
         for v in special_first.values_mut() {
-            v.sort_by(|a, b| b.0.len().cmp(&a.0.len()));  // longest match first
+            v.sort_by(|a, b| b.0.len().cmp(&a.0.len())); // longest match first
         }
 
-        Some(Self { vocab, token_to_id, merges, byte_to_u, u_to_byte,
-                    spm, max_token_chars,
-                    bos_id, eos_id, unk_id, im_start_id, im_end_id, msg_start_id,
-                    end_id, return_id, channel_id, message_id,
-                    chat_template, bos_token, eos_token, add_bos, special_first })
+        Some(Self {
+            vocab,
+            token_to_id,
+            merges,
+            byte_to_u,
+            u_to_byte,
+            spm,
+            max_token_chars,
+            bos_id,
+            eos_id,
+            unk_id,
+            im_start_id,
+            im_end_id,
+            msg_start_id,
+            end_id,
+            return_id,
+            channel_id,
+            message_id,
+            chat_template,
+            bos_token,
+            eos_token,
+            add_bos,
+            special_first,
+        })
     }
 
     // Render the model's embedded Jinja chat template. Returns None if there is no
@@ -158,12 +202,19 @@ impl Tokenizer {
         env.set_lstrip_blocks(true);
         // Some HF templates call raise_exception() on malformed input; with valid input
         // it is never hit, but the function must exist or rendering errors out.
-        env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
-            Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
-        });
+        env.add_function(
+            "raise_exception",
+            |msg: String| -> Result<String, minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    msg,
+                ))
+            },
+        );
         env.add_template("chat", tmpl_src).ok()?;
         let tmpl = env.get_template("chat").ok()?;
-        let msgs: Vec<BTreeMap<&str, &str>> = messages.iter()
+        let msgs: Vec<BTreeMap<&str, &str>> = messages
+            .iter()
             .map(|(r, c)| BTreeMap::from([("role", *r), ("content", *c)]))
             .collect();
         let ctx = minijinja::context! {
@@ -173,10 +224,14 @@ impl Tokenizer {
             eos_token => self.eos_token.as_str(),
         };
         let out = tmpl.render(ctx).ok()?;
-        if std::env::var_os("TINYQ4_DEBUG_PROMPT").is_some() {
+        if std::env::var_os("QUARTZ_DEBUG_PROMPT").is_some() {
             eprintln!("=== rendered prompt ===\n{}\n=== end ===", out);
         }
-        if out.trim().is_empty() { None } else { Some(out) }
+        if out.trim().is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     // ── Encode ────────────────────────────────────────────────────────────────
@@ -248,18 +303,24 @@ impl Tokenizer {
     pub fn encode_template(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
         let bytes = text.as_bytes();
-        let mut i = 0usize;          // scan cursor (always on a char boundary)
+        let mut i = 0usize; // scan cursor (always on a char boundary)
         let mut text_start = 0usize; // start of the pending plain-text run
 
         while i < text.len() {
             let mut hit: Option<(usize, u32)> = None;
             if let Some(cands) = self.special_first.get(&bytes[i]) {
-                for (s, id) in cands {  // longest first
-                    if text[i..].starts_with(s.as_str()) { hit = Some((s.len(), *id)); break; }
+                for (s, id) in cands {
+                    // longest first
+                    if text[i..].starts_with(s.as_str()) {
+                        hit = Some((s.len(), *id));
+                        break;
+                    }
                 }
             }
             if let Some((len, id)) = hit {
-                if text_start < i { ids.extend(self.encode(&text[text_start..i])); }
+                if text_start < i {
+                    ids.extend(self.encode(&text[text_start..i]));
+                }
                 ids.push(id);
                 i += len;
                 text_start = i;
@@ -267,7 +328,9 @@ impl Tokenizer {
                 i += text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
             }
         }
-        if text_start < text.len() { ids.extend(self.encode(&text[text_start..])); }
+        if text_start < text.len() {
+            ids.extend(self.encode(&text[text_start..]));
+        }
         ids
     }
 
@@ -289,7 +352,7 @@ impl Tokenizer {
         // ground-truth format it was trained with. Beats guessing from special tokens
         // (e.g. OLMoE's <|user|> markers are plain text, not vocab tokens). gpt-oss keeps
         // its hand-tuned harmony path below (Reasoning: low + channels).
-        if !has_native && std::env::var_os("TINYQ4_NO_JINJA").is_none() {
+        if !has_native && std::env::var_os("QUARTZ_NO_JINJA").is_none() {
             if let Some(rendered) = self.render_chat_template(messages) {
                 let mut ids = self.encode_template(&rendered);
                 // llama/mistral templates omit the leading <s>; the tokenizer adds it.
@@ -303,8 +366,10 @@ impl Tokenizer {
         if has_native {
             prompt.push_str("<|start|>system<|message|>");
             prompt.push_str("Knowledge cutoff: 2024-06\n\n");
-            prompt.push_str("Reasoning: low\n\n");   // keep gpt-oss snappy — minimal analysis ramble
-            prompt.push_str("# Valid channels: analysis, final. Channel must be included for every message.");
+            prompt.push_str("Reasoning: low\n\n"); // keep gpt-oss snappy — minimal analysis ramble
+            prompt.push_str(
+                "# Valid channels: analysis, final. Channel must be included for every message.",
+            );
             prompt.push_str("<|end|>");
 
             let mut first_message = 0usize;
@@ -347,7 +412,9 @@ impl Tokenizer {
             }
             prompt.push_str("<|im_start|>assistant\n");
         } else {
-            if self.token_to_id.contains_key("<|user|>") && self.token_to_id.contains_key("<|assistant|>") {
+            if self.token_to_id.contains_key("<|user|>")
+                && self.token_to_id.contains_key("<|assistant|>")
+            {
                 for (role, content) in messages {
                     match *role {
                         "system" | "developer" => {
@@ -419,9 +486,13 @@ impl Tokenizer {
     }
 
     pub fn token_bytes(&self, id: u32) -> Vec<u8> {
-        if id as usize >= self.vocab.len() { return Vec::new(); }
+        if id as usize >= self.vocab.len() {
+            return Vec::new();
+        }
         let tok = &self.vocab[id as usize];
-        if self.is_special(id) { return Vec::new(); }
+        if self.is_special(id) {
+            return Vec::new();
+        }
         if let Some(hex) = tok.strip_prefix("<0x").and_then(|s| s.strip_suffix('>')) {
             if let Ok(byte) = u8::from_str_radix(hex, 16) {
                 return vec![byte];
@@ -468,7 +539,9 @@ impl Tokenizer {
     // ── BPE internals ─────────────────────────────────────────────────────────
 
     fn bpe(&self, word: &str) -> Vec<u32> {
-        if word.is_empty() { return vec![]; }
+        if word.is_empty() {
+            return vec![];
+        }
 
         // Direct vocab hit (common for short tokens)
         if let Some(&id) = self.token_to_id.get(word) {
@@ -480,7 +553,9 @@ impl Tokenizer {
 
         // Merge loop: repeatedly apply the lowest-rank merge
         loop {
-            if syms.len() <= 1 { break; }
+            if syms.len() <= 1 {
+                break;
+            }
 
             let mut best_rank = u32::MAX;
             let mut best_i = usize::MAX;
@@ -488,12 +563,17 @@ impl Tokenizer {
             for i in 0..syms.len() - 1 {
                 let key = (syms[i].as_str(), syms[i + 1].as_str());
                 if let Some(&rank) = self.merges.get(&(syms[i].clone(), syms[i + 1].clone())) {
-                    if rank < best_rank { best_rank = rank; best_i = i; }
+                    if rank < best_rank {
+                        best_rank = rank;
+                        best_i = i;
+                    }
                     let _ = key;
                 }
             }
 
-            if best_i == usize::MAX { break; }
+            if best_i == usize::MAX {
+                break;
+            }
 
             let merged = format!("{}{}", syms[best_i], syms[best_i + 1]);
             syms[best_i] = merged;
@@ -547,7 +627,12 @@ fn pre_tokenize(text: &str) -> Vec<String> {
                 let mut w = String::from(' ');
                 if next_is_alpha {
                     while let Some(&c) = chars.peek() {
-                        if c.is_alphabetic() { w.push(c); chars.next(); } else { break; }
+                        if c.is_alphabetic() {
+                            w.push(c);
+                            chars.next();
+                        } else {
+                            break;
+                        }
                     }
                 }
                 words.push(w);
@@ -555,14 +640,24 @@ fn pre_tokenize(text: &str) -> Vec<String> {
             c if c.is_alphabetic() => {
                 let mut w = String::new();
                 while let Some(&c) = chars.peek() {
-                    if c.is_alphabetic() { w.push(c); chars.next(); } else { break; }
+                    if c.is_alphabetic() {
+                        w.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
                 }
                 words.push(w);
             }
             c if c.is_ascii_digit() => {
                 let mut w = String::new();
                 while let Some(&c) = chars.peek() {
-                    if c.is_ascii_digit() { w.push(c); chars.next(); } else { break; }
+                    if c.is_ascii_digit() {
+                        w.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
                 }
                 words.push(w);
             }
@@ -581,7 +676,7 @@ fn pre_tokenize(text: &str) -> Vec<String> {
 // map to themselves. The remaining 68 bytes map to U+0100 ... U+0143.
 // Space (0x20) → Ġ (U+0120), newline (0x0A) → Ċ (U+010A), etc.
 
-fn build_byte_unicode_tables() -> ([char; 256], HashMap<char, u8>) {
+pub(crate) fn build_byte_unicode_tables() -> ([char; 256], HashMap<char, u8>) {
     let mut b2u = ['\0'; 256];
     let mut u2b: HashMap<char, u8> = HashMap::new();
 

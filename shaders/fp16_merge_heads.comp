@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float input_values[];
+};
+layout(set = 0, binding = 3, std430) writeonly buffer OutputBuffer {
+    float16_t output_values[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint batch;
+    uint heads;
+    uint sequence;
+    uint width;
+} dimensions;
+
+void main() {
+    uint element = gl_GlobalInvocationID.x;
+    uint channels = dimensions.heads * dimensions.width;
+    uint total = dimensions.batch * dimensions.sequence * channels;
+    if (element >= total) {
+        return;
+    }
+    uint dimension = element % dimensions.width;
+    uint channel = (element / dimensions.width) % dimensions.heads;
+    uint position = (element / channels) % dimensions.sequence;
+    uint sample_index = element / (dimensions.sequence * channels);
+    uint input_index =
+        ((sample_index * dimensions.heads + channel) * dimensions.sequence + position) *
+            dimensions.width + dimension;
+    uint output_index =
+        (sample_index * dimensions.sequence + position) * channels +
+            channel * dimensions.width + dimension;
+    output_values[output_index] = float16_t(input_values[input_index]);
+}

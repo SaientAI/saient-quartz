@@ -1,0 +1,54 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float input_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer BiasBuffer {
+    float bias_values[];
+};
+layout(set = 0, binding = 3, std430) writeonly buffer OutputBuffer {
+    float16_t output_values[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint rows;
+    uint width;
+} dimensions;
+
+float quartz_erf(float value) {
+    float sign_value = value < 0.0 ? -1.0 : 1.0;
+    float x = abs(value);
+    float t = 1.0 / (1.0 + 0.5 * x);
+    float tau = t * exp(
+        -x * x - 1.26551223 +
+        t * (1.00002368 +
+        t * (0.37409196 +
+        t * (0.09678418 +
+        t * (-0.18628806 +
+        t * (0.27886807 +
+        t * (-1.13520398 +
+        t * (1.48851587 +
+        t * (-0.82215223 + t * 0.17087277)))))))));
+    return sign_value * (1.0 - tau);
+}
+
+void main() {
+    uint element = gl_GlobalInvocationID.x;
+    uint total = dimensions.rows * dimensions.width;
+    if (element >= total) {
+        return;
+    }
+    uint row = element / dimensions.width;
+    uint column = element % dimensions.width;
+    uint projected_width = dimensions.width * 2;
+    float value = input_values[row * projected_width + column] + bias_values[column];
+    float gate = input_values[row * projected_width + dimensions.width + column] +
+        bias_values[dimensions.width + column];
+    float activated = gate * 0.5 *
+        (1.0 + quartz_erf(gate * 0.7071067811865476));
+    output_values[element] = float16_t(value * activated);
+}

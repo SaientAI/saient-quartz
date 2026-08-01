@@ -1,0 +1,94 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Each invocation produces eight output channels for one NCHW output pixel.
+// The input value is reused across those channels and products are FP16 while
+// the complete convolution sum remains FP32.
+layout(local_size_x = 8, local_size_y = 4, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float16_t input_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer {
+    float16_t weight_values[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint batch;
+    uint input_channels;
+    uint input_height;
+    uint input_width;
+    uint output_channels;
+    uint kernel_height;
+    uint kernel_width;
+    uint stride_y;
+    uint stride_x;
+    uint padding_y;
+    uint padding_x;
+    uint output_height;
+    uint output_width;
+} dimensions;
+
+void main() {
+    uint output_pixel = gl_GlobalInvocationID.x;
+    uint output_channel = gl_GlobalInvocationID.y * 8;
+    uint sample_index = gl_GlobalInvocationID.z;
+    uint output_plane = dimensions.output_height * dimensions.output_width;
+    if (sample_index >= dimensions.batch || output_pixel >= output_plane ||
+        output_channel >= dimensions.output_channels) {
+        return;
+    }
+
+    uint output_y = output_pixel / dimensions.output_width;
+    uint output_x = output_pixel % dimensions.output_width;
+    float sums[8];
+    for (uint lane = 0; lane < 8; ++lane) {
+        sums[lane] = 0.0;
+    }
+    uint input_plane = dimensions.input_height * dimensions.input_width;
+    uint kernel_plane = dimensions.kernel_height * dimensions.kernel_width;
+
+    for (uint input_channel = 0; input_channel < dimensions.input_channels;
+         ++input_channel) {
+        for (uint kernel_y = 0; kernel_y < dimensions.kernel_height; ++kernel_y) {
+            int input_y = int(output_y * dimensions.stride_y + kernel_y) -
+                          int(dimensions.padding_y);
+            if (input_y < 0 || input_y >= int(dimensions.input_height)) {
+                continue;
+            }
+            for (uint kernel_x = 0; kernel_x < dimensions.kernel_width; ++kernel_x) {
+                int input_x = int(output_x * dimensions.stride_x + kernel_x) -
+                              int(dimensions.padding_x);
+                if (input_x < 0 || input_x >= int(dimensions.input_width)) {
+                    continue;
+                }
+                uint input_index =
+                    (sample_index * dimensions.input_channels + input_channel) * input_plane +
+                    uint(input_y) * dimensions.input_width + uint(input_x);
+                float16_t input_value = input_values[input_index];
+                for (uint lane = 0; lane < 8; ++lane) {
+                    uint channel = output_channel + lane;
+                    if (channel < dimensions.output_channels) {
+                        uint weight_index =
+                            (channel * dimensions.input_channels + input_channel) *
+                                kernel_plane +
+                            kernel_y * dimensions.kernel_width + kernel_x;
+                        sums[lane] += float(input_value * weight_values[weight_index]);
+                    }
+                }
+            }
+        }
+    }
+
+    for (uint lane = 0; lane < 8; ++lane) {
+        uint channel = output_channel + lane;
+        if (channel < dimensions.output_channels) {
+            output_values[(sample_index * dimensions.output_channels + channel) * output_plane +
+                          output_pixel] = sums[lane];
+        }
+    }
+}

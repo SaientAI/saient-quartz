@@ -1,0 +1,37 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer ResidualBuffer {
+    float residual_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer HiddenBuffer {
+    float hidden_values[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+layout(set = 0, binding = 3, std430) readonly buffer BiasBuffer {
+    float biases[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint elements;
+    uint channels;
+    uint plane;
+    uint has_residual_bias;
+} dimensions;
+
+void main() {
+    uint element = gl_GlobalInvocationID.x;
+    if (element >= dimensions.elements) {
+        return;
+    }
+    uint channel = (element / dimensions.plane) % dimensions.channels;
+    float value = residual_values[element] + hidden_values[element] + biases[channel];
+    if (dimensions.has_residual_bias != 0) {
+        value += biases[dimensions.channels + channel];
+    }
+    output_values[element] = value;
+}

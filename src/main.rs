@@ -1,99 +1,138 @@
-// tinyq4 — minimal GGUF transformer runtime
+// quartz — minimal GGUF transformer runtime
 
-mod gguf;
-mod dequant;
-mod iq2_tables;   // IQ2 grid seed + sign tables (generated from ggml-quants.c)
-mod iq3_tables;   // IQ3_S grid table (generated from ggml-common.h)
-mod tokenizer;
-mod server;
+mod clip_tokenizer;
 #[cfg(feature = "cuda")]
 mod cuda;
+mod dequant;
+mod gguf;
+mod iq2_tables; // IQ2 grid seed + sign tables (generated from ggml-quants.c)
+mod iq3_tables; // IQ3_S grid table (generated from ggml-common.h)
+mod safetensors;
+mod sd15;
+mod sd_clip;
+mod sd_ops;
+mod sd_pipeline;
+mod sd_scheduler;
+mod sd_unet;
+mod sd_vae;
+mod sdxl;
+mod sdxl_clip;
+mod sdxl_pipeline;
+mod sdxl_scheduler;
+mod sdxl_unet;
+mod server;
+mod tensor;
+mod tokenizer;
+#[cfg(feature = "vulkan")]
+mod vulkan;
 
 use rayon::prelude::*;
 use std::sync::Arc;
 
 use gguf::{GgufFile, TensorInfo, ggml_type_size};
-use tokenizer::Tokenizer;
 use std::path::Path;
+use tokenizer::Tokenizer;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 pub(crate) struct Config {
-    vocab_size:      usize,
-    embed_dim:       usize,
-    n_heads:         usize,
-    n_kv_heads:      usize,
-    n_layers:        usize,
-    ffn_dim:         usize,
-    context_length:  usize,   // model's trained context — upper bound for the KV cache
-    rope_theta:      f32,
-    head_dim:        usize,   // actual Q/K head dim (from attention.key_length)
-    n_experts:       usize,   // 0 = dense FFN
-    n_experts_used:  usize,   // top-k for MoE routing
-    moe_renorm:      bool,    // true = renormalize top-k router weights (Mixtral/Qwen/gpt-oss); false = softmax over all, no renorm (OLMoE)
-    yarn_scale:      f32,     // RoPE scaling factor (1.0 = no scaling)
-    yarn_orig_ctx:   usize,   // original context length for YARN
-    clamped_swiglu:  bool,    // true = gpt-oss clamped OAI SwiGLU experts; false = standard SiLU
-    swa_window:      usize,   // sliding-window attention span (0 = full attention everywhere)
-    rope_neox:       bool,    // RoPE convention: true = NEOX rotate-halves (qwen2/gpt-oss/olmoe); false = NORM rotate-pairs (llama/mistral)
+    vocab_size: usize,
+    embed_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    n_layers: usize,
+    ffn_dim: usize,
+    context_length: usize, // model's trained context — upper bound for the KV cache
+    norm_eps: f32,         // model-specific RMSNorm epsilon
+    rope_theta: f32,
+    head_dim: usize,       // actual Q/K head dim (from attention.key_length)
+    n_experts: usize,      // 0 = dense FFN
+    n_experts_used: usize, // top-k for MoE routing
+    moe_renorm: bool, // true = renormalize top-k router weights (Mixtral/Qwen/gpt-oss); false = softmax over all, no renorm (OLMoE)
+    yarn_scale: f32,  // RoPE scaling factor (1.0 = no scaling)
+    yarn_orig_ctx: usize, // original context length for YARN
+    clamped_swiglu: bool, // true = gpt-oss clamped OAI SwiGLU experts; false = standard SiLU
+    swa_window: usize, // sliding-window attention span (0 = full attention everywhere)
+    rope_neox: bool, // RoPE convention: true = NEOX rotate-halves (qwen2/gpt-oss/olmoe); false = NORM rotate-pairs (llama/mistral)
 }
 
 impl Config {
     fn from_gguf(g: &GgufFile) -> Self {
-        let embed_dim  = g.arch_u32("embedding_length")
+        let embed_dim = g
+            .arch_u32("embedding_length")
             .expect("missing embedding_length") as usize;
-        let n_heads = g.arch_u32_any(&["head_count", "attention.head_count"])
+        let n_heads = g
+            .arch_u32_any(&["head_count", "attention.head_count"])
             .expect("missing head_count") as usize;
-        let n_kv_heads = g.arch_u32_any(&["head_count_kv", "attention.head_count_kv"])
+        let n_kv_heads = g
+            .arch_u32_any(&["head_count_kv", "attention.head_count_kv"])
             .unwrap_or(n_heads as u32) as usize;
-        let n_layers   = g.arch_u32("block_count")
-            .expect("missing block_count") as usize;
-        let ffn_dim    = g.arch_u32_any(&[
-            "expert_feed_forward_length", "feed_forward_length",
-            "attention.feed_forward_length"])
+        let n_layers = g.arch_u32("block_count").expect("missing block_count") as usize;
+        let ffn_dim = g
+            .arch_u32_any(&[
+                "expert_feed_forward_length",
+                "feed_forward_length",
+                "attention.feed_forward_length",
+            ])
             .expect("missing feed_forward_length") as usize;
-        let rope_theta = g.arch_f32_any(&["rope.freq_base", "attention.rope.freq_base"])
+        let rope_theta = g
+            .arch_f32_any(&["rope.freq_base", "attention.rope.freq_base"])
             .unwrap_or(10_000.0);
 
-        let context_length = g.arch_u32_any(&["context_length"])
-            .map(|v| v as usize).filter(|&v| v > 0).unwrap_or(8192);
+        let context_length = g
+            .arch_u32_any(&["context_length"])
+            .map(|v| v as usize)
+            .filter(|&v| v > 0)
+            .unwrap_or(8192);
 
-        let head_dim = g.arch_u32_any(&["attention.key_length"])
+        let norm_eps = g
+            .arch_f32_any(&["attention.layer_norm_rms_epsilon", "layer_norm_rms_epsilon"])
+            .unwrap_or(1e-5);
+
+        let head_dim = g
+            .arch_u32_any(&["attention.key_length"])
             .map(|v| v as usize)
             .unwrap_or(embed_dim / n_heads);
 
-        let vocab_size = g.arch_u32("vocab_size")
+        let vocab_size = g
+            .arch_u32("vocab_size")
             .or_else(|| {
                 let arch = g.architecture().unwrap_or("llama");
-                g.metadata.get(&format!("{}.vocab_size", arch))
+                g.metadata
+                    .get(&format!("{}.vocab_size", arch))
                     .and_then(|v| v.as_u32())
             })
             .or_else(|| {
-                if let Some(gguf::GgufValue::Array(arr)) =
-                    g.metadata.get("tokenizer.ggml.tokens")
-                {
+                if let Some(gguf::GgufValue::Array(arr)) = g.metadata.get("tokenizer.ggml.tokens") {
                     Some(arr.len() as u32)
-                } else { None }
+                } else {
+                    None
+                }
             })
             .expect("cannot determine vocab_size") as usize;
 
-        let n_experts = g.arch_u32_any(&["expert_count", "experts_count", "num_experts"])
+        let n_experts = g
+            .arch_u32_any(&["expert_count", "experts_count", "num_experts"])
             .unwrap_or(0) as usize;
-        let n_experts_used = g.arch_u32_any(&["expert_used_count", "experts_used"])
-            .unwrap_or(if n_experts > 0 { 2 } else { 0 } as u32) as usize;
+        let n_experts_used =
+            g.arch_u32_any(&["expert_used_count", "experts_used"])
+                .unwrap_or(if n_experts > 0 { 2 } else { 0 } as u32) as usize;
 
         // Whether to renormalize the top-k router weights. Mixtral/Qwen-MoE/gpt-oss softmax
         // over the selected experts (renorm); OLMoE softmaxes over ALL experts and does NOT
         // renormalize the top-k (norm_topk_prob=false). Renormalizing OLMoE over-weights the
         // FFN and compounds into garbage. Honor the GGUF flag when present, else default by arch.
-        let moe_renorm = match g.metadata.get(&format!("{}.expert_weights_norm",
-                g.architecture().unwrap_or("llama"))) {
+        let moe_renorm = match g.metadata.get(&format!(
+            "{}.expert_weights_norm",
+            g.architecture().unwrap_or("llama")
+        )) {
             Some(gguf::GgufValue::Bool(b)) => *b,
             _ => g.architecture().unwrap_or("llama") != "olmoe",
         };
 
         let yarn_scale = g.arch_f32_any(&["rope.scaling.factor"]).unwrap_or(1.0);
-        let yarn_orig_ctx = g.arch_u32_any(&["rope.scaling.original_context_length"])
+        let yarn_orig_ctx = g
+            .arch_u32_any(&["rope.scaling.original_context_length"])
             .map(|v| v as usize)
             .unwrap_or(0);
 
@@ -109,17 +148,45 @@ impl Config {
         // gpt-oss for now so we don't mis-window them.
         let swa_window = if arch.contains("gpt-oss") {
             g.arch_u32_any(&["attention.sliding_window"]).unwrap_or(0) as usize
-        } else { 0 };
+        } else {
+            0
+        };
 
         // RoPE convention. llama.cpp permutes Q/K during conversion so llama-family GGUFs
         // expect "NORM" rope (rotate adjacent pairs); qwen2/gpt-oss/olmoe/gemma/phi etc. use
         // "NEOX" (rotate halves). Applying the wrong one scrambles attention into word-salad.
-        let rope_neox = !matches!(arch,
-            "llama" | "baichuan" | "starcoder" | "minicpm" | "internlm2" | "orion" | "plamo" | "xverse");
+        let rope_neox = !matches!(
+            arch,
+            "llama"
+                | "baichuan"
+                | "starcoder"
+                | "minicpm"
+                | "internlm2"
+                | "orion"
+                | "plamo"
+                | "xverse"
+        );
 
-        Self { vocab_size, embed_dim, n_heads, n_kv_heads, n_layers, ffn_dim, context_length,
-               rope_theta, head_dim, n_experts, n_experts_used, moe_renorm,
-               yarn_scale, yarn_orig_ctx, clamped_swiglu, swa_window, rope_neox }
+        Self {
+            vocab_size,
+            embed_dim,
+            n_heads,
+            n_kv_heads,
+            n_layers,
+            ffn_dim,
+            context_length,
+            norm_eps,
+            rope_theta,
+            head_dim,
+            n_experts,
+            n_experts_used,
+            moe_renorm,
+            yarn_scale,
+            yarn_orig_ctx,
+            clamped_swiglu,
+            swa_window,
+            rope_neox,
+        }
     }
 
     /// First key position attended by a token at `pos` on layer `layer`.
@@ -132,24 +199,30 @@ impl Config {
         }
     }
 
-    fn q_total_dim(&self) -> usize { self.n_heads    * self.head_dim }
-    fn kv_total_dim(&self) -> usize { self.n_kv_heads * self.head_dim }
-    fn use_yarn(&self) -> bool { self.yarn_scale > 1.0 && self.yarn_orig_ctx > 0 }
+    fn q_total_dim(&self) -> usize {
+        self.n_heads * self.head_dim
+    }
+    fn kv_total_dim(&self) -> usize {
+        self.n_kv_heads * self.head_dim
+    }
+    fn use_yarn(&self) -> bool {
+        self.yarn_scale > 1.0 && self.yarn_orig_ctx > 0
+    }
 }
 
 // ── MoE per-layer metadata (expert weights accessed lazily from mmap) ─────────
 
 pub(crate) struct MoeLayerInfo {
-    router_w:   Vec<f32>,    // [n_experts × embed_dim] — small, dequanted upfront
-    router_b:   Vec<f32>,    // [n_experts] or empty
-    gate_info:  TensorInfo,  // full 3D tensor info; bytes slice accessed at inference
-    up_info:    TensorInfo,
-    down_info:  TensorInfo,
-    gate_bias:  Vec<f32>,    // [n_experts × ffn_dim] or empty
-    up_bias:    Vec<f32>,
-    down_bias:  Vec<f32>,    // [n_experts × embed_dim] or empty
-    expert_in_out_elems: usize,  // embed_dim × ffn_dim (gate/up per expert)
-    expert_down_elems:   usize,  // ffn_dim × embed_dim (down per expert)
+    router_w: Vec<f32>,    // [n_experts × embed_dim] — small, dequanted upfront
+    router_b: Vec<f32>,    // [n_experts] or empty
+    gate_info: TensorInfo, // full 3D tensor info; bytes slice accessed at inference
+    up_info: TensorInfo,
+    down_info: TensorInfo,
+    gate_bias: Vec<f32>, // [n_experts × ffn_dim] or empty
+    up_bias: Vec<f32>,
+    down_bias: Vec<f32>,        // [n_experts × embed_dim] or empty
+    expert_in_out_elems: usize, // embed_dim × ffn_dim (gate/up per expert)
+    expert_down_elems: usize,   // ffn_dim × embed_dim (down per expert)
 }
 
 // ── Weights ───────────────────────────────────────────────────────────────────
@@ -157,31 +230,31 @@ pub(crate) struct MoeLayerInfo {
 // and accessed lazily via fused GEMV — no 33-MB f32 intermediates in RAM.
 
 pub(crate) struct Weights {
-    _gguf:      Arc<GgufFile>,   // keeps mmap alive
+    _gguf: Arc<GgufFile>, // keeps mmap alive
     // Small pre-dequanted weights (norms, biases, MoE routers)
-    attn_norm:  Vec<Vec<f32>>,
-    ffn_norm:   Vec<Vec<f32>>,
+    attn_norm: Vec<Vec<f32>>,
+    ffn_norm: Vec<Vec<f32>>,
     final_norm: Vec<f32>,
-    q_bias:     Vec<Vec<f32>>,
-    k_bias:     Vec<Vec<f32>>,
-    v_bias:     Vec<Vec<f32>>,
-    out_bias:   Vec<Vec<f32>>,
-    attn_sinks: Vec<Vec<f32>>,  // [n_layers][n_heads] sink logit per head
-    q_norm:     Vec<Vec<f32>>,  // Qwen3/OLMoE QK-norm weights (empty if arch has none)
-    k_norm:     Vec<Vec<f32>>,
+    q_bias: Vec<Vec<f32>>,
+    k_bias: Vec<Vec<f32>>,
+    v_bias: Vec<Vec<f32>>,
+    out_bias: Vec<Vec<f32>>,
+    attn_sinks: Vec<Vec<f32>>, // [n_layers][n_heads] sink logit per head
+    q_norm: Vec<Vec<f32>>,     // Qwen3/OLMoE QK-norm weights (empty if arch has none)
+    k_norm: Vec<Vec<f32>>,
     // Large weights — lazy mmap access, GEMV at inference time
-    embed:      TensorInfo,      // token_embd.weight [vocab × embed]
-    lm_head:    TensorInfo,      // output.weight     [vocab × embed]
-    q_proj:     Vec<TensorInfo>, // [n_layers] each [embed × q_total]
-    k_proj:     Vec<TensorInfo>,
-    v_proj:     Vec<TensorInfo>,
-    out_proj:   Vec<TensorInfo>, // [n_layers] each [q_total × embed]
+    embed: TensorInfo,       // token_embd.weight [vocab × embed]
+    lm_head: TensorInfo,     // output.weight     [vocab × embed]
+    q_proj: Vec<TensorInfo>, // [n_layers] each [embed × q_total]
+    k_proj: Vec<TensorInfo>,
+    v_proj: Vec<TensorInfo>,
+    out_proj: Vec<TensorInfo>, // [n_layers] each [q_total × embed]
     // Dense FFN (non-MoE) — lazy mmap access, GEMV at inference time
-    gate:       Vec<TensorInfo>,
-    up:         Vec<TensorInfo>,
-    down:       Vec<TensorInfo>,
+    gate: Vec<TensorInfo>,
+    up: Vec<TensorInfo>,
+    down: Vec<TensorInfo>,
     // MoE layers (already lazy via TensorInfo inside MoeLayerInfo)
-    moe:        Vec<MoeLayerInfo>,
+    moe: Vec<MoeLayerInfo>,
 }
 
 impl Weights {
@@ -189,49 +262,59 @@ impl Weights {
         let keep = Arc::clone(&gguf);
         let g = &*gguf;
         let tmap = g.tensor_map();
-        let q_d  = cfg.q_total_dim();
+        let q_d = cfg.q_total_dim();
         let kv_d = cfg.kv_total_dim();
-        let fd   = cfg.ffn_dim;
-        let d    = cfg.embed_dim;
+        let fd = cfg.ffn_dim;
+        let d = cfg.embed_dim;
 
         let dq = |name: &str| -> Vec<f32> {
-            let info = tmap.get(name)
+            let info = tmap
+                .get(name)
                 .unwrap_or_else(|| panic!("tensor not found: {}", name));
             dequant::dequant(g.tensor_data(info), info.ggml_type, info.n_elems())
         };
         let dq_or_zero = |name: &str, size: usize| -> Vec<f32> {
-            if tmap.contains_key(name) { dq(name) } else { vec![0.0f32; size] }
+            if tmap.contains_key(name) {
+                dq(name)
+            } else {
+                vec![0.0f32; size]
+            }
         };
         let dq_or_empty = |name: &str| -> Vec<f32> {
-            if tmap.contains_key(name) { dq(name) } else { Vec::new() }
+            if tmap.contains_key(name) {
+                dq(name)
+            } else {
+                Vec::new()
+            }
         };
         let ti = |name: &str| -> TensorInfo {
-            (*tmap.get(name)
+            (*tmap
+                .get(name)
                 .unwrap_or_else(|| panic!("tensor not found: {}", name)))
-                .clone()
+            .clone()
         };
 
         let is_moe = cfg.n_experts > 0;
         let expert_in_out_elems = d * fd;
-        let expert_down_elems   = fd * d;
+        let expert_down_elems = fd * d;
 
-        let mut attn_norm  = Vec::new();
-        let mut q_proj     = Vec::new();
-        let mut k_proj     = Vec::new();
-        let mut v_proj     = Vec::new();
-        let mut out_proj   = Vec::new();
-        let mut q_bias     = Vec::new();
-        let mut k_bias     = Vec::new();
-        let mut v_bias     = Vec::new();
-        let mut out_bias   = Vec::new();
+        let mut attn_norm = Vec::new();
+        let mut q_proj = Vec::new();
+        let mut k_proj = Vec::new();
+        let mut v_proj = Vec::new();
+        let mut out_proj = Vec::new();
+        let mut q_bias = Vec::new();
+        let mut k_bias = Vec::new();
+        let mut v_bias = Vec::new();
+        let mut out_bias = Vec::new();
         let mut attn_sinks = Vec::new();
-        let mut ffn_norm   = Vec::new();
-        let mut gate       = Vec::new();
-        let mut up         = Vec::new();
-        let mut down       = Vec::new();
-        let mut moe        = Vec::new();
-        let mut q_norm     = Vec::new();
-        let mut k_norm     = Vec::new();
+        let mut ffn_norm = Vec::new();
+        let mut gate = Vec::new();
+        let mut up = Vec::new();
+        let mut down = Vec::new();
+        let mut moe = Vec::new();
+        let mut q_norm = Vec::new();
+        let mut k_norm = Vec::new();
 
         for l in 0..cfg.n_layers {
             attn_norm.push(dq(&format!("blk.{}.attn_norm.weight", l)));
@@ -239,18 +322,18 @@ impl Weights {
             q_norm.push(dq_or_empty(&format!("blk.{}.attn_q_norm.weight", l)));
             k_norm.push(dq_or_empty(&format!("blk.{}.attn_k_norm.weight", l)));
             // Large projections → lazy TensorInfo, GEMV at runtime
-            q_proj  .push(ti(&format!("blk.{}.attn_q.weight", l)));
-            k_proj  .push(ti(&format!("blk.{}.attn_k.weight", l)));
-            v_proj  .push(ti(&format!("blk.{}.attn_v.weight", l)));
+            q_proj.push(ti(&format!("blk.{}.attn_q.weight", l)));
+            k_proj.push(ti(&format!("blk.{}.attn_k.weight", l)));
+            v_proj.push(ti(&format!("blk.{}.attn_v.weight", l)));
             out_proj.push(ti(&format!("blk.{}.attn_output.weight", l)));
-            q_bias  .push(dq_or_zero(&format!("blk.{}.attn_q.bias", l),    q_d));
-            k_bias  .push(dq_or_zero(&format!("blk.{}.attn_k.bias", l),    kv_d));
-            v_bias  .push(dq_or_zero(&format!("blk.{}.attn_v.bias", l),    kv_d));
+            q_bias.push(dq_or_zero(&format!("blk.{}.attn_q.bias", l), q_d));
+            k_bias.push(dq_or_zero(&format!("blk.{}.attn_k.bias", l), kv_d));
+            v_bias.push(dq_or_zero(&format!("blk.{}.attn_v.bias", l), kv_d));
             out_bias.push(dq_or_empty(&format!("blk.{}.attn_output.bias", l)));
             attn_sinks.push(dq_or_empty(&format!("blk.{}.attn_sinks.weight", l)));
 
             let post_attn_key = format!("blk.{}.post_attention_norm.weight", l);
-            let ffn_norm_key  = format!("blk.{}.ffn_norm.weight", l);
+            let ffn_norm_key = format!("blk.{}.ffn_norm.weight", l);
             ffn_norm.push(if tmap.contains_key(post_attn_key.as_str()) {
                 dq(&post_attn_key)
             } else {
@@ -261,37 +344,58 @@ impl Weights {
                 let router_w = dq(&format!("blk.{}.ffn_gate_inp.weight", l));
                 let router_b = dq_or_empty(&format!("blk.{}.ffn_gate_inp.bias", l));
                 let gate_info = ti(&format!("blk.{}.ffn_gate_exps.weight", l));
-                let up_info   = ti(&format!("blk.{}.ffn_up_exps.weight", l));
+                let up_info = ti(&format!("blk.{}.ffn_up_exps.weight", l));
                 let down_info = ti(&format!("blk.{}.ffn_down_exps.weight", l));
                 let gate_bias = dq_or_empty(&format!("blk.{}.ffn_gate_exps.bias", l));
-                let up_bias   = dq_or_empty(&format!("blk.{}.ffn_up_exps.bias", l));
+                let up_bias = dq_or_empty(&format!("blk.{}.ffn_up_exps.bias", l));
                 let down_bias = dq_or_empty(&format!("blk.{}.ffn_down_exps.bias", l));
                 moe.push(MoeLayerInfo {
-                    router_w, router_b,
-                    gate_info, up_info, down_info,
-                    gate_bias, up_bias, down_bias,
+                    router_w,
+                    router_b,
+                    gate_info,
+                    up_info,
+                    down_info,
+                    gate_bias,
+                    up_bias,
+                    down_bias,
                     expert_in_out_elems,
                     expert_down_elems,
                 });
             } else {
                 gate.push(ti(&format!("blk.{}.ffn_gate.weight", l)));
-                up  .push(ti(&format!("blk.{}.ffn_up.weight", l)));
+                up.push(ti(&format!("blk.{}.ffn_up.weight", l)));
                 down.push(ti(&format!("blk.{}.ffn_down.weight", l)));
             }
         }
 
         Self {
             _gguf: keep,
-            embed:      ti("token_embd.weight"),
+            embed: ti("token_embd.weight"),
             // Tied embeddings (small Qwen2.5, Gemma, …): no separate output.weight — the
             // lm_head reuses token_embd. Fall back to it instead of panicking.
-            lm_head:    if tmap.contains_key("output.weight") { ti("output.weight") }
-                        else { ti("token_embd.weight") },
+            lm_head: if tmap.contains_key("output.weight") {
+                ti("output.weight")
+            } else {
+                ti("token_embd.weight")
+            },
             final_norm: dq("output_norm.weight"),
-            attn_norm, q_proj, k_proj, v_proj, out_proj,
-            q_bias, k_bias, v_bias, out_bias, attn_sinks,
-            q_norm, k_norm,
-            ffn_norm, gate, up, down, moe,
+            attn_norm,
+            q_proj,
+            k_proj,
+            v_proj,
+            out_proj,
+            q_bias,
+            k_bias,
+            v_bias,
+            out_bias,
+            attn_sinks,
+            q_norm,
+            k_norm,
+            ffn_norm,
+            gate,
+            up,
+            down,
+            moe,
         }
     }
 }
@@ -302,14 +406,19 @@ impl Weights {
 // through to the same dequant::gemv path as before.
 
 pub(crate) struct GpuState {
-    #[cfg(feature = "cuda")] w:  cuda::GpuWeights,
-    #[cfg(feature = "cuda")] sc: cuda::GpuScratch,
-    #[cfg(feature = "cuda")] fs: cuda::GpuForwardState,
+    #[cfg(feature = "cuda")]
+    w: cuda::GpuWeights,
+    #[cfg(feature = "cuda")]
+    sc: cuda::GpuScratch,
+    #[cfg(feature = "cuda")]
+    fs: cuda::GpuForwardState,
 }
 
 impl GpuState {
     #[cfg(not(feature = "cuda"))]
-    pub fn new_cpu() -> Self { Self {} }
+    pub fn new_cpu() -> Self {
+        Self {}
+    }
 
     #[cfg(feature = "cuda")]
     pub fn new(weights: &Weights, gguf: &GgufFile, cfg: &Config) -> Self {
@@ -322,70 +431,271 @@ impl GpuState {
     }
 
     #[cfg(feature = "cuda")]
-    fn fwd(&self, token: usize, pos: usize, need_logits: bool,
-            cfg: &Config, w: &Weights, gguf: &GgufFile) -> Vec<f32> {
-        self.fs.forward_gpu_step(token, pos, need_logits, cfg, w, &self.w, gguf)
+    fn fwd(
+        &self,
+        token: usize,
+        pos: usize,
+        need_logits: bool,
+        cfg: &Config,
+        w: &Weights,
+        gguf: &GgufFile,
+    ) -> Vec<f32> {
+        self.fs
+            .forward_gpu_step(token, pos, need_logits, cfg, w, &self.w, gguf)
     }
 
-    fn gemv_q(&self, l: usize, x: &[f32], ti: &TensorInfo, gguf: &GgufFile, id: usize, od: usize) -> Vec<f32> {
-        #[cfg(feature = "cuda")] { let _ = (ti, gguf); return self.sc.gemv(x, &self.w.q_proj[l], self.w.q_proj_type[l], id, od); }
-        #[cfg(not(feature = "cuda"))] { let _ = l; dequant::gemv(x, gguf.tensor_data(ti), ti.ggml_type, id, od) }
+    fn gemv_q(
+        &self,
+        l: usize,
+        x: &[f32],
+        ti: &TensorInfo,
+        gguf: &GgufFile,
+        id: usize,
+        od: usize,
+    ) -> Vec<f32> {
+        #[cfg(feature = "cuda")]
+        {
+            let _ = (ti, gguf);
+            return self
+                .sc
+                .gemv(x, &self.w.q_proj[l], self.w.q_proj_type[l], id, od);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = l;
+            dequant::gemv(x, gguf.tensor_data(ti), ti.ggml_type, id, od)
+        }
     }
-    fn gemv_k(&self, l: usize, x: &[f32], ti: &TensorInfo, gguf: &GgufFile, id: usize, od: usize) -> Vec<f32> {
-        #[cfg(feature = "cuda")] { let _ = (ti, gguf); return self.sc.gemv(x, &self.w.k_proj[l], self.w.k_proj_type[l], id, od); }
-        #[cfg(not(feature = "cuda"))] { let _ = l; dequant::gemv(x, gguf.tensor_data(ti), ti.ggml_type, id, od) }
+    fn gemv_k(
+        &self,
+        l: usize,
+        x: &[f32],
+        ti: &TensorInfo,
+        gguf: &GgufFile,
+        id: usize,
+        od: usize,
+    ) -> Vec<f32> {
+        #[cfg(feature = "cuda")]
+        {
+            let _ = (ti, gguf);
+            return self
+                .sc
+                .gemv(x, &self.w.k_proj[l], self.w.k_proj_type[l], id, od);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = l;
+            dequant::gemv(x, gguf.tensor_data(ti), ti.ggml_type, id, od)
+        }
     }
-    fn gemv_v(&self, l: usize, x: &[f32], ti: &TensorInfo, gguf: &GgufFile, id: usize, od: usize) -> Vec<f32> {
-        #[cfg(feature = "cuda")] { let _ = (ti, gguf); return self.sc.gemv(x, &self.w.v_proj[l], self.w.v_proj_type[l], id, od); }
-        #[cfg(not(feature = "cuda"))] { let _ = l; dequant::gemv(x, gguf.tensor_data(ti), ti.ggml_type, id, od) }
+    fn gemv_v(
+        &self,
+        l: usize,
+        x: &[f32],
+        ti: &TensorInfo,
+        gguf: &GgufFile,
+        id: usize,
+        od: usize,
+    ) -> Vec<f32> {
+        #[cfg(feature = "cuda")]
+        {
+            let _ = (ti, gguf);
+            return self
+                .sc
+                .gemv(x, &self.w.v_proj[l], self.w.v_proj_type[l], id, od);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = l;
+            dequant::gemv(x, gguf.tensor_data(ti), ti.ggml_type, id, od)
+        }
     }
-    fn gemv_out(&self, l: usize, x: &[f32], ti: &TensorInfo, gguf: &GgufFile, id: usize, od: usize) -> Vec<f32> {
-        #[cfg(feature = "cuda")] { let _ = (ti, gguf); return self.sc.gemv(x, &self.w.out_proj[l], self.w.out_proj_type[l], id, od); }
-        #[cfg(not(feature = "cuda"))] { let _ = l; dequant::gemv(x, gguf.tensor_data(ti), ti.ggml_type, id, od) }
+    fn gemv_out(
+        &self,
+        l: usize,
+        x: &[f32],
+        ti: &TensorInfo,
+        gguf: &GgufFile,
+        id: usize,
+        od: usize,
+    ) -> Vec<f32> {
+        #[cfg(feature = "cuda")]
+        {
+            let _ = (ti, gguf);
+            return self
+                .sc
+                .gemv(x, &self.w.out_proj[l], self.w.out_proj_type[l], id, od);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = l;
+            dequant::gemv(x, gguf.tensor_data(ti), ti.ggml_type, id, od)
+        }
     }
-    fn gemv_lm_head(&self, x: &[f32], ti: &TensorInfo, gguf: &GgufFile, id: usize, od: usize) -> Vec<f32> {
+    fn gemv_lm_head(
+        &self,
+        x: &[f32],
+        ti: &TensorInfo,
+        gguf: &GgufFile,
+        id: usize,
+        od: usize,
+    ) -> Vec<f32> {
         // lm_head kept on CPU to save ~1.5 GB VRAM; BF16 rayon gemv is still fast.
         let _ = self;
         dequant::gemv(x, gguf.tensor_data(ti), ti.ggml_type, id, od)
     }
-    fn gemv_moe_gate(&self, ml: usize, expert: usize, x: &[f32], info: &TensorInfo, gguf: &GgufFile, id: usize, od: usize) -> Vec<f32> {
-        #[cfg(feature = "cuda")] { let _ = (info, gguf); let sl = cuda::gpu_expert_slice(&self.w.moe_gate[ml], self.w.moe_gate_type[ml], expert, id * od); return self.sc.gemv_slice(x, &sl, id, od); }
-        #[cfg(not(feature = "cuda"))] { let _ = ml; dequant::gemv(x, get_expert_slice(gguf, info, expert, id * od), info.ggml_type, id, od) }
+    fn gemv_moe_gate(
+        &self,
+        ml: usize,
+        expert: usize,
+        x: &[f32],
+        info: &TensorInfo,
+        gguf: &GgufFile,
+        id: usize,
+        od: usize,
+    ) -> Vec<f32> {
+        #[cfg(feature = "cuda")]
+        {
+            let _ = (info, gguf);
+            let sl = cuda::gpu_expert_slice(
+                &self.w.moe_gate[ml],
+                self.w.moe_gate_type[ml],
+                expert,
+                id * od,
+            );
+            return self.sc.gemv_slice(x, &sl, id, od);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = ml;
+            dequant::gemv(
+                x,
+                get_expert_slice(gguf, info, expert, id * od),
+                info.ggml_type,
+                id,
+                od,
+            )
+        }
     }
-    fn gemv_moe_up(&self, ml: usize, expert: usize, x: &[f32], info: &TensorInfo, gguf: &GgufFile, id: usize, od: usize) -> Vec<f32> {
-        #[cfg(feature = "cuda")] { let _ = (info, gguf); let sl = cuda::gpu_expert_slice(&self.w.moe_up[ml], self.w.moe_up_type[ml], expert, id * od); return self.sc.gemv_slice(x, &sl, id, od); }
-        #[cfg(not(feature = "cuda"))] { let _ = ml; dequant::gemv(x, get_expert_slice(gguf, info, expert, id * od), info.ggml_type, id, od) }
+    fn gemv_moe_up(
+        &self,
+        ml: usize,
+        expert: usize,
+        x: &[f32],
+        info: &TensorInfo,
+        gguf: &GgufFile,
+        id: usize,
+        od: usize,
+    ) -> Vec<f32> {
+        #[cfg(feature = "cuda")]
+        {
+            let _ = (info, gguf);
+            let sl =
+                cuda::gpu_expert_slice(&self.w.moe_up[ml], self.w.moe_up_type[ml], expert, id * od);
+            return self.sc.gemv_slice(x, &sl, id, od);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = ml;
+            dequant::gemv(
+                x,
+                get_expert_slice(gguf, info, expert, id * od),
+                info.ggml_type,
+                id,
+                od,
+            )
+        }
     }
-    fn gemv_moe_down(&self, ml: usize, expert: usize, x: &[f32], info: &TensorInfo, gguf: &GgufFile, id: usize, od: usize) -> Vec<f32> {
-        #[cfg(feature = "cuda")] { let _ = (info, gguf); let sl = cuda::gpu_expert_slice(&self.w.moe_down[ml], self.w.moe_down_type[ml], expert, id * od); return self.sc.gemv_slice(x, &sl, id, od); }
-        #[cfg(not(feature = "cuda"))] { let _ = ml; dequant::gemv(x, get_expert_slice(gguf, info, expert, id * od), info.ggml_type, id, od) }
+    fn gemv_moe_down(
+        &self,
+        ml: usize,
+        expert: usize,
+        x: &[f32],
+        info: &TensorInfo,
+        gguf: &GgufFile,
+        id: usize,
+        od: usize,
+    ) -> Vec<f32> {
+        #[cfg(feature = "cuda")]
+        {
+            let _ = (info, gguf);
+            let sl = cuda::gpu_expert_slice(
+                &self.w.moe_down[ml],
+                self.w.moe_down_type[ml],
+                expert,
+                id * od,
+            );
+            return self.sc.gemv_slice(x, &sl, id, od);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = ml;
+            dequant::gemv(
+                x,
+                get_expert_slice(gguf, info, expert, id * od),
+                info.ggml_type,
+                id,
+                od,
+            )
+        }
     }
 }
 
 // ── Ops ───────────────────────────────────────────────────────────────────────
 
-fn rms_norm(x: &[f32], w: &[f32]) -> Vec<f32> {
-    let rms = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + 1e-5).sqrt();
+fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let rms = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt();
     x.iter().enumerate().map(|(i, &v)| v / rms * w[i]).collect()
+}
+
+fn apply_qk_norm(x: &mut [f32], w: &[f32], n_heads: usize, head_dim: usize, eps: f32) {
+    if w.is_empty() {
+        return;
+    }
+    if w.len() == head_dim {
+        for head in 0..n_heads {
+            let range = head * head_dim..(head + 1) * head_dim;
+            let normalized = rms_norm(&x[range.clone()], w, eps);
+            x[range].copy_from_slice(&normalized);
+        }
+    } else {
+        assert_eq!(
+            w.len(),
+            x.len(),
+            "Q/K norm weight shape does not match projection"
+        );
+        let normalized = rms_norm(x, w, eps);
+        x.copy_from_slice(&normalized);
+    }
 }
 
 // Used for small pre-dequanted weights (router, norms, and biases).
 pub(crate) fn matmul(x: &[f32], w: &[f32], in_dim: usize, out_dim: usize) -> Vec<f32> {
-    (0..out_dim).into_par_iter().map(|j| {
-        let row = &w[j * in_dim..(j + 1) * in_dim];
-        x.iter().zip(row).map(|(&a, &b)| a * b).sum()
-    }).collect()
+    (0..out_dim)
+        .into_par_iter()
+        .map(|j| {
+            let row = &w[j * in_dim..(j + 1) * in_dim];
+            x.iter().zip(row).map(|(&a, &b)| a * b).sum()
+        })
+        .collect()
 }
 
 // NeoX-style RoPE with optional YARN scaling (GPT-oss uses yarn, scale=32, orig_ctx=4096).
-fn rope_yarn(x: &mut [f32], pos: usize, dim: usize, theta: f32,
-             yarn_scale: f32, yarn_orig_ctx: usize, neox: bool) {
+fn rope_yarn(
+    x: &mut [f32],
+    pos: usize,
+    dim: usize,
+    theta: f32,
+    yarn_scale: f32,
+    yarn_orig_ctx: usize,
+    neox: bool,
+) {
     use std::f32::consts::PI;
     let half = dim / 2;
     let beta_fast: f32 = 32.0;
     let beta_slow: f32 = 1.0;
-    let hfw = yarn_orig_ctx as f32 / beta_fast;  // high-freq wavelen threshold
-    let lfw = yarn_orig_ctx as f32 / beta_slow;  // low-freq  wavelen threshold
+    let hfw = yarn_orig_ctx as f32 / beta_fast; // high-freq wavelen threshold
+    let lfw = yarn_orig_ctx as f32 / beta_slow; // low-freq  wavelen threshold
 
     for i in 0..half {
         let std_inv = 1.0f32 / theta.powf(2.0 * i as f32 / dim as f32);
@@ -399,7 +709,11 @@ fn rope_yarn(x: &mut [f32], pos: usize, dim: usize, theta: f32,
         let angle = pos as f32 * eff_inv;
         let (sin, cos) = angle.sin_cos();
         // NEOX rotates halves (i, i+half); NORM (llama) rotates adjacent pairs (2i, 2i+1).
-        let (i0, i1) = if neox { (i, i + half) } else { (2 * i, 2 * i + 1) };
+        let (i0, i1) = if neox {
+            (i, i + half)
+        } else {
+            (2 * i, 2 * i + 1)
+        };
         let x0 = x[i0];
         let x1 = x[i1];
         x[i0] = x0 * cos - x1 * sin;
@@ -409,11 +723,19 @@ fn rope_yarn(x: &mut [f32], pos: usize, dim: usize, theta: f32,
 
 fn softmax(x: &mut [f32]) {
     let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let sum: f32 = x.iter_mut().map(|v| { *v = (*v - max).exp(); *v }).sum();
+    let sum: f32 = x
+        .iter_mut()
+        .map(|v| {
+            *v = (*v - max).exp();
+            *v
+        })
+        .sum();
     x.iter_mut().for_each(|v| *v /= sum);
 }
 
-fn silu(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
 
 // GPT-oss OAI SwiGLU: clamp gate to [−∞,7], up to [-7,7], alpha=1.702, offset up by +1.
 fn swiglu_oai(gate: f32, up: f32) -> f32 {
@@ -427,49 +749,85 @@ fn swiglu_oai(gate: f32, up: f32) -> f32 {
 // ── Attention (GQA) ───────────────────────────────────────────────────────────
 
 fn attention(
-    q_ti: &TensorInfo, k_ti: &TensorInfo, v_ti: &TensorInfo, o_ti: &TensorInfo,
+    q_ti: &TensorInfo,
+    k_ti: &TensorInfo,
+    v_ti: &TensorInfo,
+    o_ti: &TensorInfo,
     gguf: &GgufFile,
-    q_bias: &[f32], k_bias: &[f32], v_bias: &[f32],
-    sinks:  &[f32],
-    x:      &[f32],
-    cfg:    &Config,
-    pos:    usize,
+    q_bias: &[f32],
+    k_bias: &[f32],
+    v_bias: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    sinks: &[f32],
+    x: &[f32],
+    cfg: &Config,
+    pos: usize,
     kv_cache: &mut Vec<(Vec<f32>, Vec<f32>)>,
-    layer:  usize,
-    gpu:    &GpuState,
+    layer: usize,
+    gpu: &GpuState,
 ) -> Vec<f32> {
-    let d    = cfg.embed_dim;
-    let h    = cfg.n_heads;
-    let kv   = cfg.n_kv_heads;
-    let hd   = cfg.head_dim;
-    let q_d  = cfg.q_total_dim();
+    let d = cfg.embed_dim;
+    let h = cfg.n_heads;
+    let kv = cfg.n_kv_heads;
+    let hd = cfg.head_dim;
+    let q_d = cfg.q_total_dim();
     let kv_d = cfg.kv_total_dim();
 
     let mut q = gpu.gemv_q(layer, x, q_ti, gguf, d, q_d);
     let mut k = gpu.gemv_k(layer, x, k_ti, gguf, d, kv_d);
     let mut v = gpu.gemv_v(layer, x, v_ti, gguf, d, kv_d);
 
-    for i in 0..q_d  { q[i] += q_bias[i]; }
-    for i in 0..kv_d { k[i] += k_bias[i]; }
-    for i in 0..kv_d { v[i] += v_bias[i]; }
+    for i in 0..q_d {
+        q[i] += q_bias[i];
+    }
+    for i in 0..kv_d {
+        k[i] += k_bias[i];
+    }
+    for i in 0..kv_d {
+        v[i] += v_bias[i];
+    }
+
+    // Qwen3 and OLMoE normalize projected Q/K before RoPE. Qwen3 stores one
+    // head-sized norm tensor; OLMoE may store one for the full projection.
+    apply_qk_norm(&mut q, q_norm, h, hd, cfg.norm_eps);
+    apply_qk_norm(&mut k, k_norm, kv, hd, cfg.norm_eps);
 
     let (ys, yo) = (cfg.yarn_scale, cfg.yarn_orig_ctx);
-    for head in 0..h  {
-        rope_yarn(&mut q[head*hd..(head+1)*hd], pos, hd, cfg.rope_theta, ys, yo, cfg.rope_neox);
+    for head in 0..h {
+        rope_yarn(
+            &mut q[head * hd..(head + 1) * hd],
+            pos,
+            hd,
+            cfg.rope_theta,
+            ys,
+            yo,
+            cfg.rope_neox,
+        );
     }
     for head in 0..kv {
-        rope_yarn(&mut k[head*hd..(head+1)*hd], pos, hd, cfg.rope_theta, ys, yo, cfg.rope_neox);
+        rope_yarn(
+            &mut k[head * hd..(head + 1) * hd],
+            pos,
+            hd,
+            cfg.rope_theta,
+            ys,
+            yo,
+            cfg.rope_neox,
+        );
     }
 
     kv_cache[layer].0.extend_from_slice(&k);
     kv_cache[layer].1.extend_from_slice(&v);
 
-    let seq   = pos + 1;
+    let seq = pos + 1;
     // YARN: GGML applies mscale to rope(Q) AND rope(K), so dot product gets mscale².
     let mscale2 = if cfg.yarn_scale > 1.0 && cfg.yarn_orig_ctx > 0 {
         let m = 1.0_f32 + 0.1 * cfg.yarn_scale.ln();
         m * m
-    } else { 1.0_f32 };
+    } else {
+        1.0_f32
+    };
     let scale = (hd as f32).sqrt().recip() * mscale2;
     let mut attn_out = vec![0.0f32; q_d];
 
@@ -478,26 +836,45 @@ fn attention(
 
     for head in 0..h {
         let kv_head = (head * kv) / h;
-        let q_h = &q[head*hd..(head+1)*hd];
+        let q_h = &q[head * hd..(head + 1) * hd];
 
-        let mut scores: Vec<f32> = (k_start..seq).map(|t| {
-            let k_t = &kv_cache[layer].0[t * kv_d + kv_head * hd
-                                        ..t * kv_d + (kv_head+1) * hd];
-            q_h.iter().zip(k_t).map(|(a, b)| a * b).sum::<f32>() * scale
-        }).collect();
+        let mut scores: Vec<f32> = (k_start..seq)
+            .map(|t| {
+                let k_t =
+                    &kv_cache[layer].0[t * kv_d + kv_head * hd..t * kv_d + (kv_head + 1) * hd];
+                q_h.iter().zip(k_t).map(|(a, b)| a * b).sum::<f32>() * scale
+            })
+            .collect();
 
-        let sink = if sinks.len() > head { sinks[head] } else { f32::NEG_INFINITY };
+        let sink = if sinks.len() > head {
+            sinks[head]
+        } else {
+            f32::NEG_INFINITY
+        };
 
-        let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max).max(sink);
-        let mut sum: f32 = scores.iter_mut().map(|s| { *s = (*s - max).exp(); *s }).sum();
-        if sink > f32::NEG_INFINITY { sum += (sink - max).exp(); }
+        let max = scores
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max)
+            .max(sink);
+        let mut sum: f32 = scores
+            .iter_mut()
+            .map(|s| {
+                *s = (*s - max).exp();
+                *s
+            })
+            .sum();
+        if sink > f32::NEG_INFINITY {
+            sum += (sink - max).exp();
+        }
         scores.iter_mut().for_each(|s| *s /= sum);
 
-        let out_h = &mut attn_out[head*hd..(head+1)*hd];
+        let out_h = &mut attn_out[head * hd..(head + 1) * hd];
         for t in k_start..seq {
-            let v_t = &kv_cache[layer].1[t * kv_d + kv_head * hd
-                                        ..t * kv_d + (kv_head+1) * hd];
-            for i in 0..hd { out_h[i] += scores[t - k_start] * v_t[i]; }
+            let v_t = &kv_cache[layer].1[t * kv_d + kv_head * hd..t * kv_d + (kv_head + 1) * hd];
+            for i in 0..hd {
+                out_h[i] += scores[t - k_start] * v_t[i];
+            }
         }
     }
 
@@ -514,10 +891,10 @@ pub(crate) fn ffn_lazy(
     gguf: &GgufFile,
     cfg: &Config,
 ) -> Vec<f32> {
-    let d  = cfg.embed_dim;
+    let d = cfg.embed_dim;
     let fd = cfg.ffn_dim;
     let gate = dequant::gemv(x, gguf.tensor_data(gate_ti), gate_ti.ggml_type, d, fd);
-    let up   = dequant::gemv(x, gguf.tensor_data(up_ti),   up_ti.ggml_type,   d, fd);
+    let up = dequant::gemv(x, gguf.tensor_data(up_ti), up_ti.ggml_type, d, fd);
     let h: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
     dequant::gemv(&h, gguf.tensor_data(down_ti), down_ti.ggml_type, fd, d)
 }
@@ -535,33 +912,48 @@ fn get_expert_slice<'a>(
     &all_data[expert * bytes..(expert + 1) * bytes]
 }
 
-fn moe_ffn(x: &[f32], moe: &MoeLayerInfo, gguf: &GgufFile, cfg: &Config, moe_layer: usize, gpu: &GpuState) -> Vec<f32> {
-    let d  = cfg.embed_dim;
+fn moe_ffn(
+    x: &[f32],
+    moe: &MoeLayerInfo,
+    gguf: &GgufFile,
+    cfg: &Config,
+    moe_layer: usize,
+    gpu: &GpuState,
+) -> Vec<f32> {
+    let d = cfg.embed_dim;
     let fd = cfg.ffn_dim;
     let ne = cfg.n_experts;
-    let k  = cfg.n_experts_used;
+    let k = cfg.n_experts_used;
 
     let mut logits = matmul(x, &moe.router_w, d, ne);
     if !moe.router_b.is_empty() {
-        logits.iter_mut().zip(&moe.router_b).for_each(|(v, b)| *v += b);
+        logits
+            .iter_mut()
+            .zip(&moe.router_b)
+            .for_each(|(v, b)| *v += b);
     }
 
-    let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate()
-        .map(|(i, &v)| (i, v)).collect();
+    let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
     indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
     let top_k = &indexed[..k];
 
     // OLMoE (moe_renorm=false) softmaxes over ALL experts without renormalizing the top-k;
     // Mixtral/Qwen-MoE/gpt-oss renormalize over the selected experts. See Config::moe_renorm.
     let (exps, sum_exp): (Vec<f32>, f32) = if cfg.moe_renorm {
-        let max_v = top_k.iter().map(|&(_, v)| v).fold(f32::NEG_INFINITY, f32::max);
+        let max_v = top_k
+            .iter()
+            .map(|&(_, v)| v)
+            .fold(f32::NEG_INFINITY, f32::max);
         let e: Vec<f32> = top_k.iter().map(|&(_, v)| (v - max_v).exp()).collect();
         let s: f32 = e.iter().sum();
         (e, s)
     } else {
         let max_all = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let denom: f32 = logits.iter().map(|v| (v - max_all).exp()).sum();
-        (top_k.iter().map(|&(_, v)| (v - max_all).exp()).collect(), denom)
+        (
+            top_k.iter().map(|&(_, v)| (v - max_all).exp()).collect(),
+            denom,
+        )
     };
 
     let mut output = vec![0.0f32; d];
@@ -570,20 +962,27 @@ fn moe_ffn(x: &[f32], moe: &MoeLayerInfo, gguf: &GgufFile, cfg: &Config, moe_lay
         let rw = exps[i] / sum_exp;
 
         let mut g = gpu.gemv_moe_gate(moe_layer, eid, x, &moe.gate_info, gguf, d, fd);
-        let mut u = gpu.gemv_moe_up  (moe_layer, eid, x, &moe.up_info,   gguf, d, fd);
+        let mut u = gpu.gemv_moe_up(moe_layer, eid, x, &moe.up_info, gguf, d, fd);
 
         if !moe.gate_bias.is_empty() {
             let off = eid * fd;
-            g.iter_mut().zip(&moe.gate_bias[off..off+fd]).for_each(|(a, b)| *a += b);
+            g.iter_mut()
+                .zip(&moe.gate_bias[off..off + fd])
+                .for_each(|(a, b)| *a += b);
         }
         if !moe.up_bias.is_empty() {
             let off = eid * fd;
-            u.iter_mut().zip(&moe.up_bias[off..off+fd]).for_each(|(a, b)| *a += b);
+            u.iter_mut()
+                .zip(&moe.up_bias[off..off + fd])
+                .for_each(|(a, b)| *a += b);
         }
 
         // gpt-oss = clamped OAI SwiGLU; other MoE archs (Mixtral, Qwen3-MoE) = standard SiLU.
         let h: Vec<f32> = if cfg.clamped_swiglu {
-            g.iter().zip(&u).map(|(&gv, &uv)| swiglu_oai(gv, uv)).collect()
+            g.iter()
+                .zip(&u)
+                .map(|(&gv, &uv)| swiglu_oai(gv, uv))
+                .collect()
         } else {
             g.iter().zip(&u).map(|(&gv, &uv)| silu(gv) * uv).collect()
         };
@@ -591,7 +990,9 @@ fn moe_ffn(x: &[f32], moe: &MoeLayerInfo, gguf: &GgufFile, cfg: &Config, moe_lay
 
         if !moe.down_bias.is_empty() {
             let off = eid * d;
-            out.iter_mut().zip(&moe.down_bias[off..off+d]).for_each(|(a, b)| *a += b);
+            out.iter_mut()
+                .zip(&moe.down_bias[off..off + d])
+                .for_each(|(a, b)| *a += b);
         }
 
         output.iter_mut().zip(&out).for_each(|(a, b)| *a += rw * b);
@@ -606,38 +1007,56 @@ fn moe_ffn(x: &[f32], moe: &MoeLayerInfo, gguf: &GgufFile, cfg: &Config, moe_lay
 /// Returns the final hidden state before final_norm and lm_head.
 fn embed_and_layers(
     token: usize,
-    pos:   usize,
-    cfg:   &Config,
-    w:     &Weights,
-    kv:    &mut Vec<(Vec<f32>, Vec<f32>)>,
-    gpu:   &GpuState,
+    pos: usize,
+    cfg: &Config,
+    w: &Weights,
+    kv: &mut Vec<(Vec<f32>, Vec<f32>)>,
+    gpu: &GpuState,
 ) -> Vec<f32> {
-    let d    = cfg.embed_dim;
+    let d = cfg.embed_dim;
     let gguf = &*w._gguf;
 
     // Lazy single-row embed lookup — dequants 2160B from mmap, not 2.32GB f32.
     let embed_data = gguf.tensor_data(&w.embed);
     let embed_row_bytes = ggml_type_size(w.embed.ggml_type, d);
-    assert!(token < cfg.vocab_size, "token {} out of vocab range {}", token, cfg.vocab_size);
-    let embed_slice = &embed_data[token * embed_row_bytes..(token+1) * embed_row_bytes];
+    assert!(
+        token < cfg.vocab_size,
+        "token {} out of vocab range {}",
+        token,
+        cfg.vocab_size
+    );
+    let embed_slice = &embed_data[token * embed_row_bytes..(token + 1) * embed_row_bytes];
     let mut x = dequant::dequant(embed_slice, w.embed.ggml_type, d);
 
     for l in 0..cfg.n_layers {
         let res = x.clone();
-        let n1  = rms_norm(&x, &w.attn_norm[l]);
+        let n1 = rms_norm(&x, &w.attn_norm[l], cfg.norm_eps);
         let mut a = attention(
-            &w.q_proj[l], &w.k_proj[l], &w.v_proj[l], &w.out_proj[l],
+            &w.q_proj[l],
+            &w.k_proj[l],
+            &w.v_proj[l],
+            &w.out_proj[l],
             gguf,
-            &w.q_bias[l], &w.k_bias[l], &w.v_bias[l],
+            &w.q_bias[l],
+            &w.k_bias[l],
+            &w.v_bias[l],
+            &w.q_norm[l],
+            &w.k_norm[l],
             &w.attn_sinks[l],
-            &n1, cfg, pos, kv, l, gpu);
+            &n1,
+            cfg,
+            pos,
+            kv,
+            l,
+            gpu,
+        );
         if !w.out_bias[l].is_empty() {
             a.iter_mut().zip(&w.out_bias[l]).for_each(|(v, b)| *v += b);
         }
         x = res.iter().zip(&a).map(|(r, av)| r + av).collect();
 
         let res = x.clone();
-        let n2  = rms_norm(&x, &w.ffn_norm[l]);
+        let n2 = rms_norm(&x, &w.ffn_norm[l], cfg.norm_eps);
         let f = if cfg.n_experts > 0 {
             moe_ffn(&n2, &w.moe[l], gguf, cfg, l, gpu)
         } else {
@@ -650,16 +1069,16 @@ fn embed_and_layers(
 
 fn forward(
     token: usize,
-    pos:   usize,
-    cfg:   &Config,
-    w:     &Weights,
-    kv:    &mut Vec<(Vec<f32>, Vec<f32>)>,
-    gpu:   &GpuState,
+    pos: usize,
+    cfg: &Config,
+    w: &Weights,
+    kv: &mut Vec<(Vec<f32>, Vec<f32>)>,
+    gpu: &GpuState,
 ) -> Vec<f32> {
-    let x    = embed_and_layers(token, pos, cfg, w, kv, gpu);
-    let d    = cfg.embed_dim;
+    let x = embed_and_layers(token, pos, cfg, w, kv, gpu);
+    let d = cfg.embed_dim;
     let gguf = &*w._gguf;
-    let x    = rms_norm(&x, &w.final_norm);
+    let x = rms_norm(&x, &w.final_norm, cfg.norm_eps);
     gpu.gemv_lm_head(&x, &w.lm_head, gguf, d, cfg.vocab_size)
 }
 
@@ -670,10 +1089,10 @@ fn forward(
 
 fn prefill(
     tokens: &[usize],
-    cfg:    &Config,
-    w:      &Weights,
-    kv:     &mut Vec<(Vec<f32>, Vec<f32>)>,
-    gpu:    &GpuState,
+    cfg: &Config,
+    w: &Weights,
+    kv: &mut Vec<(Vec<f32>, Vec<f32>)>,
+    gpu: &GpuState,
 ) -> Vec<f32> {
     assert!(!tokens.is_empty(), "empty prompt");
     // Batched prefill (opt-in via KAIRO_PREFILL=batch) is verified-correct but, on
@@ -681,7 +1100,9 @@ fn prefill(
     // amortizing weight decode is cancelled by activation memory locality). The
     // real prefill fix is integer SIMD kernels, a separate project. Default to the
     // proven sequential path.
-    let use_batched = std::env::var("KAIRO_PREFILL").map(|v| v == "batch").unwrap_or(false);
+    let use_batched = std::env::var("KAIRO_PREFILL")
+        .map(|v| v == "batch")
+        .unwrap_or(false);
     if cfg.n_experts == 0 && use_batched {
         return prefill_batched(tokens, cfg, w, kv, gpu);
     }
@@ -698,19 +1119,19 @@ fn prefill(
 // so its output matches the sequential path. Returns the last token's logits.
 fn prefill_batched(
     tokens: &[usize],
-    cfg:    &Config,
-    w:      &Weights,
-    kv:     &mut Vec<(Vec<f32>, Vec<f32>)>,
-    gpu:    &GpuState,
+    cfg: &Config,
+    w: &Weights,
+    kv: &mut Vec<(Vec<f32>, Vec<f32>)>,
+    gpu: &GpuState,
 ) -> Vec<f32> {
-    let n    = tokens.len();
-    let d    = cfg.embed_dim;
-    let h    = cfg.n_heads;
-    let kvh  = cfg.n_kv_heads;
-    let hd   = cfg.head_dim;
-    let q_d  = cfg.q_total_dim();
+    let n = tokens.len();
+    let d = cfg.embed_dim;
+    let h = cfg.n_heads;
+    let kvh = cfg.n_kv_heads;
+    let hd = cfg.head_dim;
+    let q_d = cfg.q_total_dim();
     let kv_d = cfg.kv_total_dim();
-    let fd   = cfg.ffn_dim;
+    let fd = cfg.ffn_dim;
     let gguf = &*w._gguf;
 
     // Embed all tokens -> X [n, d]
@@ -719,7 +1140,12 @@ fn prefill_batched(
     let mut x = vec![0.0f32; n * d];
     for t in 0..n {
         let tok = tokens[t];
-        assert!(tok < cfg.vocab_size, "token {} out of vocab range {}", tok, cfg.vocab_size);
+        assert!(
+            tok < cfg.vocab_size,
+            "token {} out of vocab range {}",
+            tok,
+            cfg.vocab_size
+        );
         let slice = &embed_data[tok * embed_row_bytes..(tok + 1) * embed_row_bytes];
         let row = dequant::dequant(slice, w.embed.ggml_type, d);
         x[t * d..(t + 1) * d].copy_from_slice(&row);
@@ -729,16 +1155,18 @@ fn prefill_batched(
     let mscale2 = if cfg.yarn_scale > 1.0 && cfg.yarn_orig_ctx > 0 {
         let m = 1.0_f32 + 0.1 * cfg.yarn_scale.ln();
         m * m
-    } else { 1.0_f32 };
+    } else {
+        1.0_f32
+    };
     let scale = (hd as f32).sqrt().recip() * mscale2;
 
     for l in 0..cfg.n_layers {
-        let base = kv[l].0.len() / kv_d;  // absolute position of the first new token
+        let base = kv[l].0.len() / kv_d; // absolute position of the first new token
 
         // Attention: normed input -> Q/K/V (batched), bias+RoPE per token.
         let mut n1 = vec![0.0f32; n * d];
         for t in 0..n {
-            let nn = rms_norm(&x[t * d..(t + 1) * d], &w.attn_norm[l]);
+            let nn = rms_norm(&x[t * d..(t + 1) * d], &w.attn_norm[l], cfg.norm_eps);
             n1[t * d..(t + 1) * d].copy_from_slice(&nn);
         }
         let (qti, kti, vti, oti) = (&w.q_proj[l], &w.k_proj[l], &w.v_proj[l], &w.out_proj[l]);
@@ -749,13 +1177,41 @@ fn prefill_batched(
         for t in 0..n {
             let pos = base + t;
             let qt = &mut q[t * q_d..(t + 1) * q_d];
-            for i in 0..q_d { qt[i] += w.q_bias[l][i]; }
-            for head in 0..h { rope_yarn(&mut qt[head * hd..(head + 1) * hd], pos, hd, cfg.rope_theta, ys, yo, cfg.rope_neox); }
+            for i in 0..q_d {
+                qt[i] += w.q_bias[l][i];
+            }
+            apply_qk_norm(qt, &w.q_norm[l], h, hd, cfg.norm_eps);
+            for head in 0..h {
+                rope_yarn(
+                    &mut qt[head * hd..(head + 1) * hd],
+                    pos,
+                    hd,
+                    cfg.rope_theta,
+                    ys,
+                    yo,
+                    cfg.rope_neox,
+                );
+            }
             let kt = &mut k[t * kv_d..(t + 1) * kv_d];
-            for i in 0..kv_d { kt[i] += w.k_bias[l][i]; }
-            for head in 0..kvh { rope_yarn(&mut kt[head * hd..(head + 1) * hd], pos, hd, cfg.rope_theta, ys, yo, cfg.rope_neox); }
+            for i in 0..kv_d {
+                kt[i] += w.k_bias[l][i];
+            }
+            apply_qk_norm(kt, &w.k_norm[l], kvh, hd, cfg.norm_eps);
+            for head in 0..kvh {
+                rope_yarn(
+                    &mut kt[head * hd..(head + 1) * hd],
+                    pos,
+                    hd,
+                    cfg.rope_theta,
+                    ys,
+                    yo,
+                    cfg.rope_neox,
+                );
+            }
             let vt = &mut v[t * kv_d..(t + 1) * kv_d];
-            for i in 0..kv_d { vt[i] += w.v_bias[l][i]; }
+            for i in 0..kv_d {
+                vt[i] += w.v_bias[l][i];
+            }
         }
         // Append K/V to the cache in position order before attending.
         for t in 0..n {
@@ -768,24 +1224,44 @@ fn prefill_batched(
         for t in 0..n {
             let pos = base + t;
             let seq = pos + 1;
-            let k_start = cfg.attn_start(l, pos);  // SWA window for gpt-oss even layers
+            let k_start = cfg.attn_start(l, pos); // SWA window for gpt-oss even layers
             let qt = &q[t * q_d..(t + 1) * q_d];
             for head in 0..h {
                 let kv_head = (head * kvh) / h;
                 let q_h = &qt[head * hd..(head + 1) * hd];
-                let sink = if w.attn_sinks[l].len() > head { w.attn_sinks[l][head] } else { f32::NEG_INFINITY };
-                let mut scores: Vec<f32> = (k_start..seq).map(|p| {
-                    let k_p = &kv[l].0[p * kv_d + kv_head * hd..p * kv_d + (kv_head + 1) * hd];
-                    q_h.iter().zip(k_p).map(|(a, b)| a * b).sum::<f32>() * scale
-                }).collect();
-                let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max).max(sink);
-                let mut sum: f32 = scores.iter_mut().map(|s| { *s = (*s - max).exp(); *s }).sum();
-                if sink > f32::NEG_INFINITY { sum += (sink - max).exp(); }
+                let sink = if w.attn_sinks[l].len() > head {
+                    w.attn_sinks[l][head]
+                } else {
+                    f32::NEG_INFINITY
+                };
+                let mut scores: Vec<f32> = (k_start..seq)
+                    .map(|p| {
+                        let k_p = &kv[l].0[p * kv_d + kv_head * hd..p * kv_d + (kv_head + 1) * hd];
+                        q_h.iter().zip(k_p).map(|(a, b)| a * b).sum::<f32>() * scale
+                    })
+                    .collect();
+                let max = scores
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max)
+                    .max(sink);
+                let mut sum: f32 = scores
+                    .iter_mut()
+                    .map(|s| {
+                        *s = (*s - max).exp();
+                        *s
+                    })
+                    .sum();
+                if sink > f32::NEG_INFINITY {
+                    sum += (sink - max).exp();
+                }
                 scores.iter_mut().for_each(|s| *s /= sum);
                 let out_h = &mut attn_out[t * q_d + head * hd..t * q_d + (head + 1) * hd];
                 for p in k_start..seq {
                     let v_p = &kv[l].1[p * kv_d + kv_head * hd..p * kv_d + (kv_head + 1) * hd];
-                    for i in 0..hd { out_h[i] += scores[p - k_start] * v_p[i]; }
+                    for i in 0..hd {
+                        out_h[i] += scores[p - k_start] * v_p[i];
+                    }
                 }
             }
         }
@@ -796,7 +1272,9 @@ fn prefill_batched(
         for t in 0..n {
             for i in 0..d {
                 let mut av = ao[t * d + i];
-                if has_obias { av += w.out_bias[l][i]; }
+                if has_obias {
+                    av += w.out_bias[l][i];
+                }
                 x[t * d + i] += av;
             }
         }
@@ -804,20 +1282,24 @@ fn prefill_batched(
         // Dense FFN (SwiGLU), batched.
         let mut n2 = vec![0.0f32; n * d];
         for t in 0..n {
-            let nn = rms_norm(&x[t * d..(t + 1) * d], &w.ffn_norm[l]);
+            let nn = rms_norm(&x[t * d..(t + 1) * d], &w.ffn_norm[l], cfg.norm_eps);
             n2[t * d..(t + 1) * d].copy_from_slice(&nn);
         }
         let (gti, uti, dti) = (&w.gate[l], &w.up[l], &w.down[l]);
         let gate = dequant::gemm(&n2, gguf.tensor_data(gti), gti.ggml_type, d, fd, n);
-        let up   = dequant::gemm(&n2, gguf.tensor_data(uti), uti.ggml_type, d, fd, n);
+        let up = dequant::gemm(&n2, gguf.tensor_data(uti), uti.ggml_type, d, fd, n);
         let mut hbuf = vec![0.0f32; n * fd];
-        for i in 0..n * fd { hbuf[i] = silu(gate[i]) * up[i]; }
+        for i in 0..n * fd {
+            hbuf[i] = silu(gate[i]) * up[i];
+        }
         let down = dequant::gemm(&hbuf, gguf.tensor_data(dti), dti.ggml_type, fd, d, n);
-        for i in 0..n * d { x[i] += down[i]; }
+        for i in 0..n * d {
+            x[i] += down[i];
+        }
     }
 
     let last = &x[(n - 1) * d..n * d];
-    let xf = rms_norm(last, &w.final_norm);
+    let xf = rms_norm(last, &w.final_norm, cfg.norm_eps);
     gpu.gemv_lm_head(&xf, &w.lm_head, gguf, d, cfg.vocab_size)
 }
 
@@ -864,27 +1346,29 @@ where
 
 #[cfg(feature = "cuda")]
 fn generate_gpu<F, P>(
-    prompt_ids:     &[usize],
-    max_new:        usize,
-    temperature:    f32,
-    top_k:          usize,
+    prompt_ids: &[usize],
+    max_new: usize,
+    temperature: f32,
+    top_k: usize,
     repeat_penalty: f32,
-    seed:           Option<u64>,
-    cfg:            &Config,
-    w:              &Weights,
-    gpu:            &GpuState,
-    tok:            Option<&Tokenizer>,
-    mut on_token:   F,
+    seed: Option<u64>,
+    cfg: &Config,
+    w: &Weights,
+    gpu: &GpuState,
+    tok: Option<&Tokenizer>,
+    mut on_token: F,
     mut on_prefill: P,
 ) -> Vec<usize>
-where F: FnMut(&str, bool), P: FnMut(usize, usize)
+where
+    F: FnMut(&str, bool),
+    P: FnMut(usize, usize),
 {
-    use rand::{SeedableRng, RngCore};
     use rand::rngs::StdRng;
+    use rand::{RngCore, SeedableRng};
 
     assert!(!prompt_ids.is_empty(), "empty prompt");
     let gguf = &*w._gguf;
-    let n    = prompt_ids.len();
+    let n = prompt_ids.len();
 
     // Prefill: all tokens except last populate the KV cache without computing logits
     for i in 0..n - 1 {
@@ -893,12 +1377,16 @@ where F: FnMut(&str, bool), P: FnMut(usize, usize)
     }
     on_prefill(n - 1, n);
     let mut logits = gpu.fwd(prompt_ids[n - 1], n - 1, true, cfg, w, gguf);
-    let mut pos    = n;
+    let mut pos = n;
 
     let mut rng: StdRng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
-        None    => StdRng::seed_from_u64(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() as u64),
+        None => StdRng::seed_from_u64(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64,
+        ),
     };
 
     // GPT-oss channel tracking.
@@ -908,8 +1396,8 @@ where F: FnMut(&str, bool), P: FnMut(usize, usize)
     // We handle both via a one-token lookahead: short alphabetic tokens are buffered;
     // if <|message|> follows, we treat the buffer as the channel name.
     let has_native = tok.map(|t| t.message_id != u32::MAX).unwrap_or(false);
-    let mut is_reasoning  = false;
-    let mut in_chan_decl  = false;
+    let mut is_reasoning = false;
+    let mut in_chan_decl = false;
     let mut chan_name_buf = String::new();
     let mut lookahead: Option<Vec<u8>> = None; // one-token channel-name probe
 
@@ -921,21 +1409,32 @@ where F: FnMut(&str, bool), P: FnMut(usize, usize)
             let window_start = out.len().saturating_sub(64);
             for &tok_id in &out[window_start..] {
                 let v = &mut logits[tok_id];
-                if *v > 0.0 { *v /= repeat_penalty; } else { *v *= repeat_penalty; }
+                if *v > 0.0 {
+                    *v /= repeat_penalty;
+                } else {
+                    *v *= repeat_penalty;
+                }
             }
         }
 
         let next = if temperature <= 0.0 {
-            logits.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).unwrap().0
+            logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .unwrap()
+                .0
         } else {
             let k = top_k.min(logits.len());
-            let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate()
-                .map(|(i, &v)| (i, v / temperature)).collect();
+            let mut indexed: Vec<(usize, f32)> = logits
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i, v / temperature))
+                .collect();
             indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
             indexed.truncate(k);
             let max_v = indexed[0].1;
-            let mut probs: Vec<f32> = indexed.iter()
-                .map(|(_, v)| (*v - max_v).exp()).collect();
+            let mut probs: Vec<f32> = indexed.iter().map(|(_, v)| (*v - max_v).exp()).collect();
             let sum: f32 = probs.iter().sum();
             probs.iter_mut().for_each(|p| *p /= sum);
             let r: f32 = (rng.next_u64() as f64 / u64::MAX as f64) as f32;
@@ -943,12 +1442,18 @@ where F: FnMut(&str, bool), P: FnMut(usize, usize)
             let mut chosen = indexed[0].0;
             for (i, p) in probs.iter().enumerate() {
                 cum += p;
-                if r <= cum { chosen = indexed[i].0; break; }
+                if r <= cum {
+                    chosen = indexed[i].0;
+                    break;
+                }
             }
             chosen
         };
 
-        let is_eos = match tok { Some(t) => t.is_eos(next as u32), None => next == 2 };
+        let is_eos = match tok {
+            Some(t) => t.is_eos(next as u32),
+            None => next == 2,
+        };
         if is_eos {
             break;
         }
@@ -962,7 +1467,9 @@ where F: FnMut(&str, bool), P: FnMut(usize, usize)
                 }
                 if !pending_utf8.is_empty() {
                     let piece = String::from_utf8_lossy(&pending_utf8).into_owned();
-                    if !piece.is_empty() { on_token(&piece, is_reasoning); }
+                    if !piece.is_empty() {
+                        on_token(&piece, is_reasoning);
+                    }
                     pending_utf8.clear();
                 }
                 out.push(next);
@@ -1005,11 +1512,15 @@ where F: FnMut(&str, bool), P: FnMut(usize, usize)
                     }
                 } else if in_chan_decl {
                     if !t.is_special(tid) {
-                        chan_name_buf.push_str(
-                            &String::from_utf8_lossy(&t.token_bytes(tid)));
+                        chan_name_buf.push_str(&String::from_utf8_lossy(&t.token_bytes(tid)));
                         // Safety: if name grows long, it's not a channel name.
                         if chan_name_buf.len() > 20 {
-                            emit_utf8(&mut pending_utf8, chan_name_buf.as_bytes(), is_reasoning, &mut on_token);
+                            emit_utf8(
+                                &mut pending_utf8,
+                                chan_name_buf.as_bytes(),
+                                is_reasoning,
+                                &mut on_token,
+                            );
                             chan_name_buf.clear();
                             in_chan_decl = false;
                         }
@@ -1053,50 +1564,69 @@ where F: FnMut(&str, bool), P: FnMut(usize, usize)
     }
     if !pending_utf8.is_empty() {
         let piece = String::from_utf8_lossy(&pending_utf8).into_owned();
-        if !piece.is_empty() { on_token(&piece, is_reasoning); }
+        if !piece.is_empty() {
+            on_token(&piece, is_reasoning);
+        }
     }
     out
 }
 
 #[cfg_attr(feature = "cuda", allow(unreachable_code))]
 pub(crate) fn generate<F, P>(
-    prompt_ids:     &[usize],
-    max_new:        usize,
-    temperature:    f32,
-    top_k:          usize,
+    prompt_ids: &[usize],
+    max_new: usize,
+    temperature: f32,
+    top_k: usize,
     repeat_penalty: f32,
-    seed:           Option<u64>,
-    cfg:            &Config,
-    w:              &Weights,
-    gpu:            &GpuState,
-    tok:            Option<&Tokenizer>,
-    mut on_token:   F,
-    on_prefill:     P,
+    seed: Option<u64>,
+    cfg: &Config,
+    w: &Weights,
+    gpu: &GpuState,
+    tok: Option<&Tokenizer>,
+    mut on_token: F,
+    on_prefill: P,
 ) -> Vec<usize>
 where
     F: FnMut(&str, bool),
     P: FnMut(usize, usize),
 {
     #[cfg(feature = "cuda")]
-    return generate_gpu(prompt_ids, max_new, temperature, top_k, repeat_penalty,
-                        seed, cfg, w, gpu, tok, on_token, on_prefill);
+    return generate_gpu(
+        prompt_ids,
+        max_new,
+        temperature,
+        top_k,
+        repeat_penalty,
+        seed,
+        cfg,
+        w,
+        gpu,
+        tok,
+        on_token,
+        on_prefill,
+    );
 
     let _ = on_prefill; // CPU path has no per-token prefill callback
 
-    use rand::{SeedableRng, RngCore};
     use rand::rngs::StdRng;
+    use rand::{RngCore, SeedableRng};
 
     assert!(!prompt_ids.is_empty(), "empty prompt");
-    let mut kv: Vec<(Vec<f32>, Vec<f32>)> =
-        (0..cfg.n_layers).map(|_| (Vec::new(), Vec::new())).collect();
+    let mut kv: Vec<(Vec<f32>, Vec<f32>)> = (0..cfg.n_layers)
+        .map(|_| (Vec::new(), Vec::new()))
+        .collect();
 
     let mut logits = prefill(prompt_ids, cfg, w, &mut kv, gpu);
-    let mut pos    = prompt_ids.len();
+    let mut pos = prompt_ids.len();
 
     let mut rng: StdRng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
-        None    => StdRng::seed_from_u64(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() as u64),
+        None => StdRng::seed_from_u64(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64,
+        ),
     };
 
     let mut out = Vec::new();
@@ -1107,19 +1637,28 @@ where
             let window_start = out.len().saturating_sub(64);
             for &tok_id in &out[window_start..] {
                 let v = &mut logits[tok_id];
-                if *v > 0.0 { *v /= repeat_penalty; } else { *v *= repeat_penalty; }
+                if *v > 0.0 {
+                    *v /= repeat_penalty;
+                } else {
+                    *v *= repeat_penalty;
+                }
             }
         }
 
         let next = if temperature <= 0.0 {
             // Greedy: argmax
-            logits.iter().enumerate()
+            logits
+                .iter()
+                .enumerate()
                 .max_by(|(_, a), (_, b)| a.total_cmp(b))
-                .unwrap().0
+                .unwrap()
+                .0
         } else {
             // Temperature + top-k sampling
             let k = top_k.min(logits.len());
-            let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate()
+            let mut indexed: Vec<(usize, f32)> = logits
+                .iter()
+                .enumerate()
                 .map(|(i, &v)| (i, v / temperature))
                 .collect();
             indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
@@ -1137,16 +1676,21 @@ where
             let mut chosen = indexed[0].0;
             for (i, p) in probs.iter().enumerate() {
                 cum += p;
-                if r <= cum { chosen = indexed[i].0; break; }
+                if r <= cum {
+                    chosen = indexed[i].0;
+                    break;
+                }
             }
             chosen
         };
 
         let is_eos = match tok {
             Some(t) => t.is_eos(next as u32),
-            None    => next == 2,
+            None => next == 2,
         };
-        if is_eos { break; }
+        if is_eos {
+            break;
+        }
 
         match tok {
             Some(t) => {
@@ -1176,34 +1720,663 @@ where
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "vulkan")]
+fn print_tensor_difference(
+    label: &str,
+    reference: &tensor::Tensor,
+    accelerated: &tensor::Tensor,
+) -> bool {
+    const MAX_ABSOLUTE_ERROR: f32 = 0.01;
+    const MAX_RELATIVE_RMS_ERROR: f64 = 0.002;
+    if reference.shape() != accelerated.shape() {
+        println!(
+            "{label} difference: shape mismatch {:?} vs {:?}",
+            reference.shape(),
+            accelerated.shape()
+        );
+        return false;
+    }
+    let mut max_absolute = 0.0f32;
+    let mut absolute_sum = 0.0f64;
+    let mut squared_error = 0.0f64;
+    let mut reference_squared = 0.0f64;
+    let mut non_finite_reference = 0usize;
+    let mut non_finite_accelerated = 0usize;
+    for (&expected, &actual) in reference.data().iter().zip(accelerated.data()) {
+        if !expected.is_finite() {
+            non_finite_reference += 1;
+            continue;
+        }
+        if !actual.is_finite() {
+            non_finite_accelerated += 1;
+            continue;
+        }
+        let difference = f64::from(actual) - f64::from(expected);
+        max_absolute = max_absolute.max(difference.abs() as f32);
+        absolute_sum += difference.abs();
+        squared_error += difference * difference;
+        reference_squared += f64::from(expected) * f64::from(expected);
+    }
+    if non_finite_reference != 0 || non_finite_accelerated != 0 {
+        println!(
+            "{label} difference: {non_finite_reference} non-finite reference values, {non_finite_accelerated} non-finite accelerated values"
+        );
+        return false;
+    }
+    let count = reference.len() as f64;
+    let relative_rms = (squared_error / reference_squared.max(f64::MIN_POSITIVE)).sqrt();
+    let accepted = max_absolute <= MAX_ABSOLUTE_ERROR && relative_rms <= MAX_RELATIVE_RMS_ERROR;
+    println!(
+        "{label} difference: max_abs={max_absolute:.9} mean_abs={:.9} rms={:.9} relative_rms={relative_rms:.9} accepted={accepted}",
+        absolute_sum / count,
+        (squared_error / count).sqrt(),
+    );
+    accepted
+}
+
 fn main() {
     use std::io::Write;
 
     let args: Vec<String> = std::env::args().collect();
+
+    #[cfg(feature = "vulkan")]
+    if args.iter().any(|argument| argument == "--vulkan") {
+        vulkan::set_sd_acceleration(true);
+    }
+
+    if args.get(1).map(String::as_str) == Some("--vulkan-benchmark") {
+        #[cfg(feature = "vulkan")]
+        {
+            match vulkan::benchmark_fp16_gemm() {
+                Ok(result) => println!("{result}"),
+                Err(error) => {
+                    eprintln!("Vulkan benchmark failed: {error:#}");
+                    std::process::exit(2);
+                }
+            }
+            return;
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            eprintln!("this binary was built without the vulkan feature");
+            std::process::exit(2);
+        }
+    }
+
+    if args.get(1).map(String::as_str) == Some("--vulkan-host-import-probe") {
+        #[cfg(feature = "vulkan")]
+        {
+            let Some(path) = args.get(2) else {
+                eprintln!("usage: quartz --vulkan-host-import-probe <mapped-model-file>");
+                std::process::exit(2);
+            };
+            if let Err(error) = vulkan::probe_external_host_memory(path) {
+                eprintln!("Vulkan host-import probe failed: {error:#}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            eprintln!("this binary was built without the vulkan feature");
+            std::process::exit(2);
+        }
+    }
+
+    // Validate and exercise Quartz's native diffusion contract without loading
+    // a GGUF language model or starting the HTTP server.
+    if args.get(1).map(String::as_str) == Some("--inspect-sd15") {
+        let Some(root) = args.get(2) else {
+            eprintln!("usage: quartz --inspect-sd15 <model-directory> [--list-tensors]");
+            std::process::exit(2);
+        };
+        match sd15::Sd15Pack::open(root) {
+            Ok(pack) => {
+                #[cfg(feature = "vulkan")]
+                if args.iter().any(|argument| argument == "--stage-vulkan")
+                    || std::env::var("QUARTZ_SD_STAGE").is_ok_and(|value| value != "0")
+                {
+                    match pack.enable_staged_vulkan_loading() {
+                        Ok(()) => println!("Staged Vulkan weight loading: enabled"),
+                        Err(error) => {
+                            eprintln!("Staged Vulkan weight loading failed to enable: {error:#}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                pack.print_summary();
+                if args.iter().any(|argument| argument == "--list-tensors") {
+                    pack.print_tensors();
+                }
+                if let Some(position) = args.iter().position(|argument| argument == "--encode-clip")
+                {
+                    let prompt = args.get(position + 1).map(String::as_str).unwrap_or("");
+                    match pack.encode_prompt(prompt) {
+                        Ok(context) => {
+                            let sum = context.data().iter().sum::<f32>();
+                            let sumsq = context
+                                .data()
+                                .iter()
+                                .map(|value| value * value)
+                                .sum::<f32>();
+                            println!("CLIP context : {:?}", context.shape());
+                            println!("CLIP sum     : {sum:.9}");
+                            println!("CLIP sumsq   : {sumsq:.9}");
+                            println!("CLIP first16 : {:?}", &context.data()[..16]);
+                        }
+                        Err(error) => {
+                            eprintln!("CLIP execution failed: {error:#}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                if args.iter().any(|argument| argument == "--decode-vae-test")
+                    || args
+                        .iter()
+                        .any(|argument| argument == "--decode-vae-full-test")
+                {
+                    let edge = if args
+                        .iter()
+                        .any(|argument| argument == "--decode-vae-full-test")
+                    {
+                        64
+                    } else {
+                        1
+                    };
+                    let latent_values = if edge == 1 {
+                        vec![0.0, 0.1, -0.2, 0.3]
+                    } else {
+                        (0..4 * edge * edge)
+                            .map(|index| ((index % 23) as f32 - 11.0) / 16.0)
+                            .collect()
+                    };
+                    let latents = tensor::Tensor::new(vec![1, 4, edge, edge], latent_values)
+                        .expect("fixed VAE test tensor is valid");
+                    match pack.decode_unscaled_latents(&latents) {
+                        Ok(image) => {
+                            let sum = image.data().iter().sum::<f32>();
+                            let sumsq = image.data().iter().map(|value| value * value).sum::<f32>();
+                            println!("VAE test shape : {:?}", image.shape());
+                            println!("VAE test sum   : {sum:.9}");
+                            println!("VAE test sumsq : {sumsq:.9}");
+                            println!("VAE test first16: {:?}", &image.data()[..16]);
+                        }
+                        Err(error) => {
+                            eprintln!("VAE execution failed: {error:#}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                if args
+                    .iter()
+                    .any(|argument| argument == "--predict-unet-test")
+                    || args
+                        .iter()
+                        .any(|argument| argument == "--predict-unet-full-test")
+                {
+                    let edge = if args
+                        .iter()
+                        .any(|argument| argument == "--predict-unet-full-test")
+                    {
+                        64
+                    } else {
+                        8
+                    };
+                    let batch = if args.iter().any(|argument| argument == "--batch2") {
+                        2
+                    } else {
+                        1
+                    };
+                    let sample = tensor::Tensor::new(
+                        vec![batch, 4, edge, edge],
+                        (0..batch * 4 * edge * edge)
+                            .map(|index| ((index % 17) as f32 - 8.0) / 8.0)
+                            .collect(),
+                    )
+                    .expect("fixed UNet test tensor is valid");
+                    let context = pack
+                        .encode_prompt("A photo of a lion in the wild, ultra realistic")
+                        .unwrap_or_else(|error| {
+                            eprintln!("UNet test CLIP execution failed: {error:#}");
+                            std::process::exit(2);
+                        });
+                    let context = if batch == 2 {
+                        let mut data = context.data().to_vec();
+                        data.extend_from_slice(context.data());
+                        tensor::Tensor::new(vec![2, 77, 768], data)
+                            .expect("duplicated UNet context is valid")
+                    } else {
+                        context
+                    };
+                    let repeats = args
+                        .iter()
+                        .position(|argument| argument == "--repeat")
+                        .and_then(|index| args.get(index + 1))
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(1);
+                    if repeats == 0 || repeats > 10 {
+                        eprintln!("--repeat must be between 1 and 10");
+                        std::process::exit(2);
+                    }
+                    let mut latest_noise = None;
+                    for run in 0..repeats {
+                        let started = std::time::Instant::now();
+                        match pack.predict_noise(&sample, 951.0, &context) {
+                            Ok(noise) => {
+                                println!(
+                                    "UNet run {}/{}: {:.3} s",
+                                    run + 1,
+                                    repeats,
+                                    started.elapsed().as_secs_f64()
+                                );
+                                latest_noise = Some(noise);
+                            }
+                            Err(error) => {
+                                eprintln!("UNet execution failed: {error:#}");
+                                std::process::exit(2);
+                            }
+                        }
+                    }
+                    match latest_noise {
+                        Some(noise) => {
+                            let sum = noise.data().iter().sum::<f32>();
+                            let sumsq = noise.data().iter().map(|value| value * value).sum::<f32>();
+                            println!("UNet test shape : {:?}", noise.shape());
+                            println!("UNet test sum   : {sum:.9}");
+                            println!("UNet test sumsq : {sumsq:.9}");
+                            println!("UNet test first16: {:?}", &noise.data()[..16]);
+                        }
+                        None => unreachable!("repeat validation requires at least one run"),
+                    }
+                }
+                if let Some(position) = args
+                    .iter()
+                    .position(|argument| argument == "--generate-sd15")
+                {
+                    let Some(prompt) = args.get(position + 1) else {
+                        eprintln!("--generate-sd15 requires a prompt");
+                        std::process::exit(2);
+                    };
+                    let steps = args
+                        .iter()
+                        .position(|argument| argument == "--steps")
+                        .and_then(|index| args.get(index + 1))
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(20);
+                    let seed = args
+                        .iter()
+                        .position(|argument| argument == "--seed")
+                        .and_then(|index| args.get(index + 1))
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let negative_prompt = args
+                        .iter()
+                        .position(|argument| argument == "--negative-prompt")
+                        .and_then(|index| args.get(index + 1))
+                        .cloned()
+                        .unwrap_or_default();
+                    let guidance_scale = args
+                        .iter()
+                        .position(|argument| argument == "--guidance")
+                        .and_then(|index| args.get(index + 1))
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .unwrap_or(7.5);
+                    let output_path = args
+                        .iter()
+                        .position(|argument| argument == "--output")
+                        .and_then(|index| args.get(index + 1))
+                        .map(String::as_str)
+                        .unwrap_or("quartz-sd15.png");
+                    let request = sd_pipeline::GenerationRequest {
+                        prompt: prompt.clone(),
+                        negative_prompt,
+                        steps,
+                        guidance_scale,
+                        seed,
+                    };
+                    let started = std::time::Instant::now();
+                    match sd_pipeline::generate_with_control(
+                        &pack,
+                        &request,
+                        |progress| {
+                            println!(
+                                "SD1.5 progress: phase={} completed={} total={}",
+                                progress.phase.as_str(),
+                                progress.completed,
+                                progress.total,
+                            );
+                            let _ = std::io::stdout().flush();
+                        },
+                        || false,
+                    ) {
+                        Ok(image) => {
+                            let height = image.shape()[2];
+                            let width = image.shape()[3];
+                            if output_path.to_ascii_lowercase().ends_with(".ppm") {
+                                let rgb = sd_pipeline::rgb8(&image).unwrap_or_else(|error| {
+                                    eprintln!("SD1.5 RGB conversion failed: {error:#}");
+                                    std::process::exit(2);
+                                });
+                                let mut output =
+                                    std::fs::File::create(output_path).unwrap_or_else(|error| {
+                                        eprintln!("cannot write {output_path}: {error}");
+                                        std::process::exit(2);
+                                    });
+                                write!(output, "P6\n{width} {height}\n255\n")
+                                    .and_then(|_| output.write_all(&rgb))
+                                    .unwrap_or_else(|error| {
+                                        eprintln!("cannot write {output_path}: {error}");
+                                        std::process::exit(2);
+                                    });
+                            } else {
+                                let encoded = sd_pipeline::png(&image).unwrap_or_else(|error| {
+                                    eprintln!("SD1.5 PNG encoding failed: {error:#}");
+                                    std::process::exit(2);
+                                });
+                                std::fs::write(output_path, encoded).unwrap_or_else(|error| {
+                                    eprintln!("cannot write {output_path}: {error}");
+                                    std::process::exit(2);
+                                });
+                            }
+                            println!(
+                                "SD1.5 image: {output_path} ({width}x{height}, steps={steps}, seed={seed}, {:.3} s)",
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("SD1.5 generation failed: {error:#}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                #[cfg(feature = "vulkan")]
+                if args.iter().any(|argument| argument == "--compare-vulkan") {
+                    let prompt = "A photo of a lion in the wild, ultra realistic";
+                    let latents = tensor::Tensor::new(vec![1, 4, 1, 1], vec![0.0, 0.1, -0.2, 0.3])
+                        .expect("fixed VAE comparison tensor is valid");
+                    let sample = tensor::Tensor::new(
+                        vec![1, 4, 8, 8],
+                        (0..256)
+                            .map(|index| ((index % 17) as f32 - 8.0) / 8.0)
+                            .collect(),
+                    )
+                    .expect("fixed UNet comparison tensor is valid");
+
+                    vulkan::set_sd_acceleration(false);
+                    let cpu_clip = pack.encode_prompt(prompt).unwrap_or_else(|error| {
+                        eprintln!("CPU CLIP comparison failed: {error:#}");
+                        std::process::exit(2);
+                    });
+                    let cpu_vae = pack
+                        .decode_unscaled_latents(&latents)
+                        .unwrap_or_else(|error| {
+                            eprintln!("CPU VAE comparison failed: {error:#}");
+                            std::process::exit(2);
+                        });
+                    let cpu_unet = pack
+                        .predict_noise(&sample, 951.0, &cpu_clip)
+                        .unwrap_or_else(|error| {
+                            eprintln!("CPU UNet comparison failed: {error:#}");
+                            std::process::exit(2);
+                        });
+
+                    vulkan::set_sd_acceleration(true);
+                    let gpu_clip = pack.encode_prompt(prompt).unwrap_or_else(|error| {
+                        eprintln!("Vulkan CLIP comparison failed: {error:#}");
+                        std::process::exit(2);
+                    });
+                    let gpu_vae = pack
+                        .decode_unscaled_latents(&latents)
+                        .unwrap_or_else(|error| {
+                            eprintln!("Vulkan VAE comparison failed: {error:#}");
+                            std::process::exit(2);
+                        });
+                    let gpu_unet = pack
+                        .predict_noise(&sample, 951.0, &gpu_clip)
+                        .unwrap_or_else(|error| {
+                            eprintln!("Vulkan UNet comparison failed: {error:#}");
+                            std::process::exit(2);
+                        });
+                    let comparisons_ok = print_tensor_difference("CLIP", &cpu_clip, &gpu_clip)
+                        & print_tensor_difference("VAE", &cpu_vae, &gpu_vae)
+                        & print_tensor_difference("UNet", &cpu_unet, &gpu_unet);
+                    if !comparisons_ok {
+                        eprintln!("Vulkan comparison failed");
+                        std::process::exit(2);
+                    }
+                }
+                #[cfg(feature = "vulkan")]
+                if vulkan::sd_acceleration_requested() {
+                    vulkan::print_statistics();
+                }
+            }
+            Err(error) => {
+                eprintln!("SD1.5 pack rejected: {error:#}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
+    if args.get(1).map(String::as_str) == Some("--inspect-sdxl") {
+        let Some(root) = args.get(2) else {
+            eprintln!("usage: quartz --inspect-sdxl <model-directory> [--stage-vulkan]");
+            std::process::exit(2);
+        };
+        match sdxl::SdxlPack::open(root) {
+            Ok(pack) => {
+                #[cfg(feature = "vulkan")]
+                if args.iter().any(|argument| argument == "--stage-vulkan")
+                    || std::env::var("QUARTZ_SD_STAGE").is_ok_and(|value| value != "0")
+                {
+                    match pack.enable_staged_vulkan_loading() {
+                        Ok(budget) => println!(
+                            "Staged Vulkan weight loading: enabled (budget={} bytes, tensor_count_hint={})",
+                            budget.0, budget.1
+                        ),
+                        Err(error) => {
+                            eprintln!("Staged Vulkan weight loading failed to enable: {error:#}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                pack.print_summary();
+                if args.iter().any(|argument| argument == "--decode-sdxl-zero") {
+                    let resolution = args
+                        .iter()
+                        .position(|argument| argument == "--resolution")
+                        .and_then(|index| args.get(index + 1))
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(1024);
+                    if resolution == 0 || resolution % 8 != 0 {
+                        eprintln!("--decode-sdxl-zero resolution must be a non-zero multiple of 8");
+                        std::process::exit(2);
+                    }
+                    let output_path = args
+                        .iter()
+                        .position(|argument| argument == "--output")
+                        .and_then(|index| args.get(index + 1))
+                        .map(String::as_str)
+                        .unwrap_or("quartz-sdxl-vae.png");
+                    let latent_side = resolution / 8;
+                    let latents = tensor::Tensor::zeros(vec![1, 4, latent_side, latent_side])
+                        .unwrap_or_else(|error| {
+                            eprintln!("cannot allocate SDXL zero latents: {error:#}");
+                            std::process::exit(2);
+                        });
+                    let started = std::time::Instant::now();
+                    let image = pack.decode_latents(&latents).unwrap_or_else(|error| {
+                        eprintln!("SDXL VAE decode failed: {error:#}");
+                        std::process::exit(2);
+                    });
+                    let height = image.shape()[2];
+                    let width = image.shape()[3];
+                    let encoded = sd_pipeline::png(&image).unwrap_or_else(|error| {
+                        eprintln!("SDXL PNG encoding failed: {error:#}");
+                        std::process::exit(2);
+                    });
+                    std::fs::write(output_path, encoded).unwrap_or_else(|error| {
+                        eprintln!("cannot write {output_path}: {error}");
+                        std::process::exit(2);
+                    });
+                    println!(
+                        "SDXL VAE image: {output_path} ({width}x{height}, zero latents, {:.3} s)",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                if let Some(position) = args
+                    .iter()
+                    .position(|argument| argument == "--generate-sdxl")
+                {
+                    let Some(prompt) = args.get(position + 1) else {
+                        eprintln!("--generate-sdxl requires a prompt");
+                        std::process::exit(2);
+                    };
+                    let steps = args
+                        .iter()
+                        .position(|argument| argument == "--steps")
+                        .and_then(|index| args.get(index + 1))
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(20);
+                    let seed = args
+                        .iter()
+                        .position(|argument| argument == "--seed")
+                        .and_then(|index| args.get(index + 1))
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let negative_prompt = args
+                        .iter()
+                        .position(|argument| argument == "--negative-prompt")
+                        .and_then(|index| args.get(index + 1))
+                        .cloned()
+                        .unwrap_or_default();
+                    let guidance_scale = args
+                        .iter()
+                        .position(|argument| argument == "--guidance")
+                        .and_then(|index| args.get(index + 1))
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .unwrap_or(5.0);
+                    let resolution = args
+                        .iter()
+                        .position(|argument| argument == "--resolution")
+                        .and_then(|index| args.get(index + 1))
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(1024);
+                    let output_path = args
+                        .iter()
+                        .position(|argument| argument == "--output")
+                        .and_then(|index| args.get(index + 1))
+                        .map(String::as_str)
+                        .unwrap_or("quartz-sdxl.png");
+                    let request = sdxl_pipeline::GenerationRequest {
+                        prompt: prompt.clone(),
+                        negative_prompt,
+                        steps,
+                        guidance_scale,
+                        seed,
+                        resolution,
+                    };
+                    let started = std::time::Instant::now();
+                    match sdxl_pipeline::generate_with_control(
+                        &pack,
+                        &request,
+                        |progress| {
+                            println!(
+                                "SDXL progress: phase={} completed={} total={}",
+                                progress.phase.as_str(),
+                                progress.completed,
+                                progress.total,
+                            );
+                            let _ = std::io::stdout().flush();
+                        },
+                        || false,
+                    ) {
+                        Ok(image) => {
+                            let height = image.shape()[2];
+                            let width = image.shape()[3];
+                            let encoded = sd_pipeline::png(&image).unwrap_or_else(|error| {
+                                eprintln!("SDXL PNG encoding failed: {error:#}");
+                                std::process::exit(2);
+                            });
+                            std::fs::write(output_path, encoded).unwrap_or_else(|error| {
+                                eprintln!("cannot write {output_path}: {error}");
+                                std::process::exit(2);
+                            });
+                            println!(
+                                "SDXL image: {output_path} ({width}x{height}, steps={steps}, seed={seed}, {:.3} s)",
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("SDXL generation failed: {error:#}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                #[cfg(feature = "vulkan")]
+                if vulkan::sd_acceleration_requested() {
+                    vulkan::print_statistics();
+                }
+            }
+            Err(error) => {
+                eprintln!("SDXL pack rejected: {error:#}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
     let path = args.get(1).map(|s| s.as_str()).unwrap_or("tiny_model.gguf");
 
     println!("Opening {}...", path);
-    let gguf = Arc::new(
-        GgufFile::open(Path::new(path))
-            .unwrap_or_else(|e| panic!("{}", e))
-    );
+    let gguf = Arc::new(GgufFile::open(Path::new(path)).unwrap_or_else(|e| panic!("{}", e)));
 
-    println!("Architecture : {}", gguf.architecture().unwrap_or("unknown"));
+    println!(
+        "Architecture : {}",
+        gguf.architecture().unwrap_or("unknown")
+    );
 
     let cfg = Config::from_gguf(&gguf);
     println!(
-        "embed={} heads={} kv_heads={} head_dim={} layers={} ffn={} vocab={} rope_theta={}",
-        cfg.embed_dim, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
-        cfg.n_layers, cfg.ffn_dim, cfg.vocab_size, cfg.rope_theta
+        "embed={} heads={} kv_heads={} head_dim={} layers={} ffn={} vocab={} rope_theta={} norm_eps={}",
+        cfg.embed_dim,
+        cfg.n_heads,
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        cfg.n_layers,
+        cfg.ffn_dim,
+        cfg.vocab_size,
+        cfg.rope_theta,
+        cfg.norm_eps
     );
     if cfg.n_experts > 0 {
-        println!("MoE          : {} experts, top-{}", cfg.n_experts, cfg.n_experts_used);
+        println!(
+            "MoE          : {} experts, top-{}",
+            cfg.n_experts, cfg.n_experts_used
+        );
     }
-    println!("YARN         : scale={} orig_ctx={}", cfg.yarn_scale, cfg.yarn_orig_ctx);
-    println!("RoPE         : {}", if cfg.rope_neox { "NEOX (rotate-halves)" } else { "NORM (rotate-pairs)" });
+    println!(
+        "YARN         : scale={} orig_ctx={}",
+        cfg.yarn_scale, cfg.yarn_orig_ctx
+    );
+    println!(
+        "RoPE         : {}",
+        if cfg.rope_neox {
+            "NEOX (rotate-halves)"
+        } else {
+            "NORM (rotate-pairs)"
+        }
+    );
 
     let tokenizer = Tokenizer::from_gguf(&gguf);
-    println!("Tokenizer    : {}", if tokenizer.is_some() { "loaded" } else { "not found" });
+    println!(
+        "Tokenizer    : {}",
+        if tokenizer.is_some() {
+            "loaded"
+        } else {
+            "not found"
+        }
+    );
 
     // ── Tensor list mode ────────────────────────────────────────────────────────
     if args.iter().any(|a| a == "--list-tensors") {
@@ -1213,9 +2386,12 @@ fn main() {
         return;
     }
 
-    // ── Tokenize debug: `tinyq4 model --tokenize "text"` ──────────────────────────
+    // ── Tokenize debug: `quartz model --tokenize "text"` ──────────────────────────
     if let Some(p) = args.iter().position(|a| a == "--tokenize") {
-        let text = args.get(p + 1).map(|s| s.as_str()).unwrap_or("Hello, world!");
+        let text = args
+            .get(p + 1)
+            .map(|s| s.as_str())
+            .unwrap_or("Hello, world!");
         if let Some(t) = &tokenizer {
             let chat = args.iter().any(|a| a == "--chat");
             let ids: Vec<u32> = if chat {
@@ -1241,22 +2417,44 @@ fn main() {
             use std::collections::HashSet;
             let mut seen = HashSet::new();
             for ti in &gguf.tensors {
-                if ti.dims.len() != 2 || !seen.insert(ti.ggml_type) { continue; }
+                if ti.dims.len() != 2 || !seen.insert(ti.ggml_type) {
+                    continue;
+                }
                 let in_dim = ti.dims[0] as usize;
                 let out_dim = ti.dims[1] as usize;
-                if in_dim % 32 != 0 || in_dim == 0 || out_dim == 0 { continue; }
-                let x: Vec<f32> = (0..in_dim).map(|i| {
-                    let s = ((i as u64).wrapping_mul(2654435761) >> 8) & 0x3FF;
-                    s as f32 / 512.0 - 1.0
-                }).collect();
+                if in_dim % 32 != 0 || in_dim == 0 || out_dim == 0 {
+                    continue;
+                }
+                let x: Vec<f32> = (0..in_dim)
+                    .map(|i| {
+                        let s = ((i as u64).wrapping_mul(2654435761) >> 8) & 0x3FF;
+                        s as f32 / 512.0 - 1.0
+                    })
+                    .collect();
                 let data = gguf.tensor_data(ti);
                 let cpu = dequant::gemv(&x, data, ti.ggml_type, in_dim, out_dim);
                 let gpu = cuda::verify_gemv_cuda(&x, data, ti.ggml_type, in_dim, out_dim);
-                let maxdiff = cpu.iter().zip(&gpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-                let maxmag  = cpu.iter().map(|v| v.abs()).fold(1e-6f32, f32::max);
-                let status = if maxdiff / maxmag < 1e-3 { "OK" } else { "*** MISMATCH ***" };
-                println!("type {:3}  {:40}  in={:6} out={:6}  maxdiff={:.5}  rel={:.5}  {}",
-                    ti.ggml_type, ti.name, in_dim, out_dim, maxdiff, maxdiff / maxmag, status);
+                let maxdiff = cpu
+                    .iter()
+                    .zip(&gpu)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                let maxmag = cpu.iter().map(|v| v.abs()).fold(1e-6f32, f32::max);
+                let status = if maxdiff / maxmag < 1e-3 {
+                    "OK"
+                } else {
+                    "*** MISMATCH ***"
+                };
+                println!(
+                    "type {:3}  {:40}  in={:6} out={:6}  maxdiff={:.5}  rel={:.5}  {}",
+                    ti.ggml_type,
+                    ti.name,
+                    in_dim,
+                    out_dim,
+                    maxdiff,
+                    maxdiff / maxmag,
+                    status
+                );
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -1273,15 +2471,20 @@ fn main() {
     println!("Ready.");
     if !weights.attn_sinks.is_empty() && !weights.attn_sinks[0].is_empty() {
         let s = &weights.attn_sinks[0];
-        println!("AttnSink L0  : min={:.3} max={:.3} mean={:.3}",
+        println!(
+            "AttnSink L0  : min={:.3} max={:.3} mean={:.3}",
             s.iter().cloned().fold(f32::INFINITY, f32::min),
             s.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-            s.iter().sum::<f32>() / s.len() as f32);
+            s.iter().sum::<f32>() / s.len() as f32
+        );
     }
 
     // ── Server mode ─────────────────────────────────────────────────────────────
     if let Some(srv_pos) = args.iter().position(|a| a == "--server") {
-        let port: u16 = args.get(srv_pos + 1).and_then(|s| s.parse().ok()).unwrap_or(18081);
+        let port: u16 = args
+            .get(srv_pos + 1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(18081);
 
         // Spawn background thread to warm the mmap page cache for expert weights.
         // This runs AFTER the server starts listening, so it doesn't delay health checks.
@@ -1296,25 +2499,31 @@ fn main() {
                         _acc = _acc.wrapping_add(*byte);
                     }
                     touched += data.len();
-                    if touched > 20 * 1024 * 1024 * 1024 { break; }
+                    if touched > 20 * 1024 * 1024 * 1024 {
+                        break;
+                    }
                 }
-                eprintln!("tinyq4: mmap warmup complete ({:.1} GB touched)", touched as f64 / 1e9);
+                eprintln!(
+                    "quartz: mmap warmup complete ({:.1} GB touched)",
+                    touched as f64 / 1e9
+                );
             });
         }
 
         let state = server::AppState {
-            cfg:       Arc::new(cfg),
-            weights:   Arc::new(weights),
-            gpu:       Arc::new(gpu),
+            cfg: Arc::new(cfg),
+            weights: Arc::new(weights),
+            gpu: Arc::new(gpu),
             tokenizer: Arc::new(tokenizer),
-            model_id:  Path::new(path)
+            model_id: Path::new(path)
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .unwrap_or("tinyq4")
+                .unwrap_or("quartz")
                 .to_string(),
         };
         println!("Starting server on port {}...", port);
-        tokio::runtime::Runtime::new().unwrap()
+        tokio::runtime::Runtime::new()
+            .unwrap()
             .block_on(server::run(port, std::sync::Arc::new(state)));
         return;
     }
@@ -1326,7 +2535,11 @@ fn main() {
 
     let prompt_ids: Vec<usize> = match &tokenizer {
         Some(t) => {
-            let ids = if nosys { t.chat_encode_nosys(prompt_text) } else { t.chat_encode(prompt_text) };
+            let ids = if nosys {
+                t.chat_encode_nosys(prompt_text)
+            } else {
+                t.chat_encode(prompt_text)
+            };
             println!("Prompt       : {:?}", prompt_text);
             println!("Tokens       : {} ids", ids.len());
             ids.into_iter().map(|id| id as usize).collect()
@@ -1335,9 +2548,24 @@ fn main() {
     };
 
     println!("\n--- Response ---");
-    generate(&prompt_ids, max_new, 0.0, 40, 1.0, None, &cfg, &weights, &gpu, tokenizer.as_ref(),
-        |piece, _| { print!("{}", piece); std::io::stdout().flush().ok(); },
-        |done, total| { eprint!("\rprefill {}/{}...", done + 1, total); },
+    generate(
+        &prompt_ids,
+        max_new,
+        0.0,
+        40,
+        1.0,
+        None,
+        &cfg,
+        &weights,
+        &gpu,
+        tokenizer.as_ref(),
+        |piece, _| {
+            print!("{}", piece);
+            std::io::stdout().flush().ok();
+        },
+        |done, total| {
+            eprint!("\rprefill {}/{}...", done + 1, total);
+        },
     );
     println!("\n--- End ---");
 }

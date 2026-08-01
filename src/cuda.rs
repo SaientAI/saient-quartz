@@ -383,8 +383,8 @@ impl GpuForwardState {
         let margin = 768 * 1024 * 1024;  // activations/scratch headroom — avoid OOM mid-run
         let budget = free_vram.saturating_sub(lm_head_bytes + margin);
         let fit = (budget / per_tok.max(1)).max(2048);
-        // `TINYQ4_CTX` lets the app pass the user's context-length setting as an upper bound.
-        let env_cap = std::env::var("TINYQ4_CTX").ok().and_then(|s| s.parse::<usize>().ok());
+        // `QUARTZ_CTX` lets the app pass the user's context-length setting as an upper bound.
+        let env_cap = std::env::var("QUARTZ_CTX").ok().and_then(|s| s.parse::<usize>().ok());
         let cap = env_cap.unwrap_or(usize::MAX).min(cfg.context_length.max(2048));
         let mseq = fit.min(cap).max(2048);
         eprintln!("KV cache: max_seq={} (free {} MB, lm_head {} MB, per_tok {} B, model_ctx {})",
@@ -797,7 +797,7 @@ impl GpuForwardState {
                     cuda_vec_add(self.d_hidden.ptr as *mut f32,
                                  self.d_expert_acc.ptr as *const f32, d as i32);
                 } else {
-                    if std::env::var_os("TINYQ4_DENSE_FFN_CPU").is_some() {
+                    if std::env::var_os("QUARTZ_DENSE_FFN_CPU").is_some() {
                         let norm_cpu = self.download_norm_out();
                         let ffn_out = crate::ffn_lazy(&norm_cpu, &w.gate[l], &w.up[l], &w.down[l], gguf, cfg);
                         cuda_h2d(self.d_norm_out.ptr, ffn_out.as_ptr() as *const c_void, d * 4);

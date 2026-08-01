@@ -1,0 +1,96 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float input_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer ParameterBuffer {
+    float parameters[];
+};
+layout(set = 0, binding = 3, std430) writeonly buffer OutputBuffer {
+    float16_t output_values[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint batch;
+    uint channels;
+    uint height;
+    uint width;
+    uint groups;
+    uint has_input_bias;
+    uint has_channel_bias;
+    float epsilon;
+} dimensions;
+
+shared float partial_sum[256];
+shared float partial_square_sum[256];
+
+float source_value(uint sample_index, uint channel, uint pixel) {
+    uint plane = dimensions.height * dimensions.width;
+    float value = input_values[(sample_index * dimensions.channels + channel) * plane + pixel];
+    uint parameter_offset = dimensions.channels * 2;
+    if (dimensions.has_input_bias != 0) {
+        value += parameters[parameter_offset + channel];
+        parameter_offset += dimensions.channels;
+    }
+    if (dimensions.has_channel_bias != 0) {
+        value += parameters[parameter_offset + sample_index * dimensions.channels + channel];
+    }
+    return value;
+}
+
+void main() {
+    uint group_index = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint total_groups = dimensions.batch * dimensions.groups;
+    if (group_index >= total_groups) {
+        return;
+    }
+    uint sample_index = group_index / dimensions.groups;
+    uint group = group_index % dimensions.groups;
+    uint channels_per_group = dimensions.channels / dimensions.groups;
+    uint plane = dimensions.height * dimensions.width;
+    uint group_length = channels_per_group * plane;
+
+    float sum = 0.0;
+    float square_sum = 0.0;
+    for (uint element = lane; element < group_length; element += 256) {
+        uint local_channel = element / plane;
+        uint pixel = element % plane;
+        uint channel = group * channels_per_group + local_channel;
+        float value = source_value(sample_index, channel, pixel);
+        sum += value;
+        square_sum += value * value;
+    }
+    partial_sum[lane] = sum;
+    partial_square_sum[lane] = square_sum;
+    barrier();
+
+    for (uint offset = 128; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            partial_sum[lane] += partial_sum[lane + offset];
+            partial_square_sum[lane] += partial_square_sum[lane + offset];
+        }
+        barrier();
+    }
+    float mean = partial_sum[0] / float(group_length);
+    float variance = max(
+        partial_square_sum[0] / float(group_length) - mean * mean,
+        0.0);
+    float inverse_std = inversesqrt(variance + dimensions.epsilon);
+
+    for (uint element = lane; element < group_length; element += 256) {
+        uint local_channel = element / plane;
+        uint pixel = element % plane;
+        uint channel = group * channels_per_group + local_channel;
+        float value = source_value(sample_index, channel, pixel);
+        value = (value - mean) * inverse_std * parameters[channel] +
+            parameters[dimensions.channels + channel];
+        value = value / (1.0 + exp(-value));
+        uint output_index = (sample_index * dimensions.channels + channel) * plane + pixel;
+        output_values[output_index] = float16_t(value);
+    }
+}

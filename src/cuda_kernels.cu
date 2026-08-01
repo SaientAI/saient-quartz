@@ -1,4 +1,4 @@
-// tinyq4 CUDA kernels — dequant + GEMV for each quantisation format.
+// quartz CUDA kernels — dequant + GEMV for each quantisation format.
 // Compiled with nvcc -arch=sm_120 (Blackwell / RTX 5060 Ti).
 //
 // Each kernel: one warp (32 threads) per output row.

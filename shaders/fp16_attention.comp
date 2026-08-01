@@ -1,0 +1,131 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// One workgroup owns one query row. A 4096-element score row occupies 16 KiB
+// of shared memory, keeping full-resolution SD1.5 attention bounded without a
+// global QxK score tensor. The S24 GPU has enough workgroup capacity for 256
+// lanes, which lets more lanes share both the QK and probability/value work.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QueryBuffer {
+    f16vec4 query_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer KeyBuffer {
+    f16vec4 key_values[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer ValueBuffer {
+    float16_t value_values[];
+};
+layout(set = 0, binding = 3, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint batch_heads;
+    uint queries;
+    uint keys;
+    uint width;
+    float scale;
+    uint causal;
+    uint query_offset;
+} dimensions;
+
+shared float scores[4096];
+shared float reduction[256];
+
+void main() {
+    uint query_index = gl_WorkGroupID.x + dimensions.query_offset;
+    uint batch_head = gl_WorkGroupID.y;
+    uint lane = gl_LocalInvocationID.x;
+    if (query_index >= dimensions.queries ||
+        batch_head >= dimensions.batch_heads) {
+        return;
+    }
+    uint visible_keys = dimensions.causal != 0 ? query_index + 1 : dimensions.keys;
+    uint packed_width = dimensions.width / 4;
+    uint query_base = (batch_head * dimensions.queries + query_index) * packed_width;
+
+    for (uint key_index = lane; key_index < visible_keys; key_index += 256) {
+        uint key_base = (batch_head * dimensions.keys + key_index) * packed_width;
+        float dot_value = 0.0;
+        for (uint column = 0; column < packed_width; ++column) {
+            dot_value += float(dot(query_values[query_base + column],
+                                   key_values[key_base + column]));
+        }
+        scores[key_index] = dot_value * dimensions.scale;
+    }
+    barrier();
+
+    float local_max = -3.402823466e+38;
+    for (uint key_index = lane; key_index < visible_keys; key_index += 256) {
+        local_max = max(local_max, scores[key_index]);
+    }
+    reduction[lane] = local_max;
+    barrier();
+    for (uint offset = 128; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            reduction[lane] = max(reduction[lane], reduction[lane + offset]);
+        }
+        barrier();
+    }
+    float row_max = reduction[0];
+
+    float local_sum = 0.0;
+    for (uint key_index = lane; key_index < visible_keys; key_index += 256) {
+        float probability = exp(scores[key_index] - row_max);
+        scores[key_index] = probability;
+        local_sum += probability;
+    }
+    reduction[lane] = local_sum;
+    barrier();
+    for (uint offset = 128; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            reduction[lane] += reduction[lane + offset];
+        }
+        barrier();
+    }
+    float inverse_sum = 1.0 / reduction[0];
+    barrier();
+
+    // For head widths up to 256, divide each output-column reduction across as
+    // many lane segments as fit. SD1.5's 40/80/160-wide UNet heads therefore
+    // use 6/3/1 segments without changing the exact softmax computation.
+    if (dimensions.width <= 256) {
+        uint segments = 256 / dimensions.width;
+        uint active_lanes = segments * dimensions.width;
+        if (lane < active_lanes) {
+            uint column = lane % dimensions.width;
+            uint segment = lane / dimensions.width;
+            float value = 0.0;
+            for (uint key_index = segment; key_index < visible_keys; key_index += segments) {
+                uint value_index =
+                    (batch_head * dimensions.keys + key_index) * dimensions.width + column;
+                value += scores[key_index] * inverse_sum * float(value_values[value_index]);
+            }
+            reduction[lane] = value;
+        }
+        barrier();
+        if (lane < dimensions.width) {
+            float value = 0.0;
+            for (uint segment = 0; segment < segments; ++segment) {
+                value += reduction[lane + segment * dimensions.width];
+            }
+            uint output_index =
+                (batch_head * dimensions.queries + query_index) * dimensions.width + lane;
+            output_values[output_index] = value;
+        }
+    } else {
+        for (uint column = lane; column < dimensions.width; column += 256) {
+            float value = 0.0;
+            for (uint key_index = 0; key_index < visible_keys; ++key_index) {
+                uint value_index =
+                    (batch_head * dimensions.keys + key_index) * dimensions.width + column;
+                value += scores[key_index] * inverse_sum * float(value_values[value_index]);
+            }
+            uint output_index =
+                (batch_head * dimensions.queries + query_index) * dimensions.width + column;
+            output_values[output_index] = value;
+        }
+    }
+}

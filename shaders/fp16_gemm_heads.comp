@@ -1,0 +1,60 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 4, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    f16vec4 input_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer {
+    f16vec4 weight_values[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float16_t output_values[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint rows;
+    uint outputs;
+    uint width;
+    uint batch;
+    uint heads;
+    uint rows_per_batch;
+} dimensions;
+
+void main() {
+    uint output_channel = gl_GlobalInvocationID.x * 8;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= dimensions.rows || output_channel >= dimensions.outputs) {
+        return;
+    }
+    float sums[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    uint packed_width = dimensions.width / 4;
+    uint input_base = row * packed_width;
+    for (uint column = 0; column < packed_width; ++column) {
+        f16vec4 input_value = input_values[input_base + column];
+        for (uint lane = 0; lane < 8; ++lane) {
+            uint channel = output_channel + lane;
+            if (channel < dimensions.outputs) {
+                sums[lane] += float(dot(
+                    input_value,
+                    weight_values[channel * packed_width + column]));
+            }
+        }
+    }
+    uint sample_index = row / dimensions.rows_per_batch;
+    uint position = row % dimensions.rows_per_batch;
+    uint head_width = dimensions.outputs / dimensions.heads;
+    for (uint lane = 0; lane < 8; ++lane) {
+        uint channel = output_channel + lane;
+        if (channel < dimensions.outputs) {
+            uint head = channel / head_width;
+            uint dimension = channel % head_width;
+            uint output_index =
+                ((sample_index * dimensions.heads + head) * dimensions.rows_per_batch + position) *
+                    head_width + dimension;
+            output_values[output_index] = float16_t(sums[lane]);
+        }
+    }
+}

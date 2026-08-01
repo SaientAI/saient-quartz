@@ -74,7 +74,7 @@ tensors['output.weight']      = rng.standard_normal((VOCAB, EMBED)).astype(np.fl
 
 kv_bytes = b''
 kv_bytes += pack_kv_str('general.architecture',    'llama')
-kv_bytes += pack_kv_str('general.name',            'tinyq4-test')
+kv_bytes += pack_kv_str('general.name',            'quartz-test')
 kv_bytes += pack_kv_u32('general.file_type',       0)   # F32
 kv_bytes += pack_kv_u32('llama.embedding_length',  EMBED)
 kv_bytes += pack_kv_u32('llama.head_count',        N_HEADS)

@@ -1,0 +1,67 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Four FP16 values are multiplied together, then each packed partial is
+// promoted into an FP32 accumulator. Each invocation reuses that input across
+// eight output rows. SD1.5 projection widths are multiples of four, preserving
+// FP32 long-range accumulation while exposing native packed FP16 arithmetic.
+layout(local_size_x = 4, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    f16vec4 input_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer {
+    f16vec4 weight_values[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint rows;
+    uint outputs;
+    uint width;
+    uint row_offset;
+    uint output_plane;
+} dimensions;
+
+void main() {
+    uint output_index = gl_GlobalInvocationID.x * 8;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= dimensions.rows || output_index >= dimensions.outputs) {
+        return;
+    }
+    float sums[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    uint packed_width = dimensions.width / 4;
+    uint input_base = row * packed_width;
+    for (uint column = 0; column < packed_width; ++column) {
+        f16vec4 input_value = input_values[input_base + column];
+        for (uint lane = 0; lane < 8; ++lane) {
+            uint output_lane = output_index + lane;
+            if (output_lane < dimensions.outputs) {
+                sums[lane] += float(dot(
+                    input_value,
+                    weight_values[output_lane * packed_width + column]));
+            }
+        }
+    }
+    for (uint lane = 0; lane < 8; ++lane) {
+        uint output_lane = output_index + lane;
+        if (output_lane < dimensions.outputs) {
+            uint global_row = dimensions.row_offset + row;
+            uint output_address;
+            if (dimensions.output_plane == 0) {
+                output_address = global_row * dimensions.outputs + output_lane;
+            } else {
+                uint sample_index = global_row / dimensions.output_plane;
+                uint pixel = global_row % dimensions.output_plane;
+                output_address =
+                    (sample_index * dimensions.outputs + output_lane) *
+                        dimensions.output_plane +
+                    pixel;
+            }
+            output_values[output_address] = sums[lane];
+        }
+    }
+}

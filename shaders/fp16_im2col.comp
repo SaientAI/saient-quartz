@@ -1,0 +1,65 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float16_t input_values[];
+};
+layout(set = 0, binding = 3, std430) writeonly buffer ColumnBuffer {
+    float16_t column_values[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint input_channels;
+    uint input_height;
+    uint input_width;
+    uint kernel_height;
+    uint kernel_width;
+    uint stride_y;
+    uint stride_x;
+    uint padding_y;
+    uint padding_x;
+    uint output_height;
+    uint output_width;
+    uint row_start;
+    uint tile_rows;
+} dimensions;
+
+void main() {
+    uint width = dimensions.input_channels * dimensions.kernel_height *
+                 dimensions.kernel_width;
+    uint element = gl_GlobalInvocationID.x;
+    if (element >= dimensions.tile_rows * width) {
+        return;
+    }
+    uint tile_row = element / width;
+    uint column = element % width;
+    uint global_row = dimensions.row_start + tile_row;
+    uint output_plane = dimensions.output_height * dimensions.output_width;
+    uint sample_index = global_row / output_plane;
+    uint output_pixel = global_row % output_plane;
+    uint output_y = output_pixel / dimensions.output_width;
+    uint output_x = output_pixel % dimensions.output_width;
+
+    uint kernel_plane = dimensions.kernel_height * dimensions.kernel_width;
+    uint input_channel = column / kernel_plane;
+    uint kernel_element = column % kernel_plane;
+    uint kernel_y = kernel_element / dimensions.kernel_width;
+    uint kernel_x = kernel_element % dimensions.kernel_width;
+    int input_y = int(output_y * dimensions.stride_y + kernel_y) -
+                  int(dimensions.padding_y);
+    int input_x = int(output_x * dimensions.stride_x + kernel_x) -
+                  int(dimensions.padding_x);
+    float16_t value = float16_t(0.0);
+    if (input_y >= 0 && input_y < int(dimensions.input_height) &&
+        input_x >= 0 && input_x < int(dimensions.input_width)) {
+        uint input_plane = dimensions.input_height * dimensions.input_width;
+        uint input_index =
+            (sample_index * dimensions.input_channels + input_channel) * input_plane +
+            uint(input_y) * dimensions.input_width + uint(input_x);
+        value = input_values[input_index];
+    }
+    column_values[element] = value;
+}
