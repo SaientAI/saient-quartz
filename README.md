@@ -1,11 +1,27 @@
 # Quartz
 
-Quartz is a minimal, dependency-light Rust inference runtime for GGUF-format
-transformer language models, with a bundled Stable Diffusion (SD1.5/SDXL)
-image pipeline. It was built from scratch (no llama.cpp, no ggml, no Candle,
-no PyTorch/libtorch) to run well on constrained hardware — this repo's own
-CI-grade targets are a 4-core desktop CPU, a CUDA GPU, and an Android
-phone's Vulkan GPU via a single ~15k-line, mostly-`unsafe`-free codebase.
+Quartz is the on-device inference engine behind [Saient](https://saient.co.uk) —
+a from-scratch Rust runtime (no llama.cpp, no ggml, no Candle, no
+PyTorch/libtorch) that runs LLM chat and image generation entirely on a
+phone or desktop, no cloud round-trip.
+
+**It's the engine that made this possible:** Saient mobile generates
+full text-to-video clips — [Wan2.1 T2V](https://github.com/Wan-Video/Wan2.1),
+1.3B parameters — running end-to-end, locally, on a stock Samsung Galaxy
+S24's Vulkan GPU. Same phone also runs LLM chat and SDXL image
+generation locally through this engine. No server, no API key, nothing
+leaves the device.
+
+(The Wan video model itself runs through a separate, MIT-licensed
+companion binary — see [Relationship to the Wan video engine](#relationship-to-the-wan-video-engine)
+below for how the two fit together. This repo, Quartz proper, is the
+LLM chat + SDXL image half of the stack.)
+
+This repo covers Quartz: a minimal, dependency-light Rust inference
+runtime for GGUF-format transformer language models, with a bundled
+Stable Diffusion (SD1.5/SDXL) image pipeline. CI-grade targets are a
+4-core desktop CPU, a CUDA GPU, and an Android phone's Vulkan GPU, via
+a single ~15k-line, mostly-`unsafe`-free codebase.
 
 This project was previously developed under the name **tinyq4**. All crate,
 binary, and environment-variable names now use `quartz` / `QUARTZ_*`; the
