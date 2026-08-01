@@ -1,10 +1,12 @@
 [package]
-name = "tinyq4"
+name = "quartz"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [features]
 cuda = []
+vulkan = ["dep:ash"]
 
 [dependencies]
 memmap2 = "0.9"
@@ -18,6 +20,7 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 rand = { version = "0.8", features = ["small_rng"] }
 minijinja = { version = "2", features = ["loop_controls"] }
+ash = { version = "0.37", optional = true, default-features = false, features = ["loaded"] }
 
 [profile.release]
 opt-level = 3
