@@ -23,6 +23,7 @@ mod sdxl_unet;
 mod server;
 mod tensor;
 mod tokenizer;
+mod wan_scheduler;
 #[cfg(feature = "vulkan")]
 mod vulkan;
 

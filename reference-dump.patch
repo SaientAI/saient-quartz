@@ -1,0 +1,21 @@
+diff --git a/src/stable-diffusion.cpp b/src/stable-diffusion.cpp
+index 24e6839..721ce0e 100644
+--- a/src/stable-diffusion.cpp
++++ b/src/stable-diffusion.cpp
+@@ -4250,6 +4250,16 @@ struct SamplePlan {
+                                                       scheduler,
+                                                       sd_ctx->sd->version,
+                                                       sample_params->extra_sample_args);
++            // Reference dump for the Quartz reimplementation: reproducing Wan by eyeballing
++            // output frames is untenable (a wrong RoPE, a wrong AdaLN and a wrong VAE scale all
++            // look identical), so each stage is diffed numerically against this binary instead.
++            if (getenv("SAIENT_DUMP") != nullptr) {
++                fprintf(stderr, "SAIENT_SIGMAS steps=%d shift=%.6g n=%zu:",
++                        total_steps, (double)sample_params->flow_shift, sigmas.size());
++                for (float s : sigmas) fprintf(stderr, " %.9g", s);
++                fprintf(stderr, "\n");
++                fflush(stderr);
++            }
+         }
+ 
+         eta = resolve_eta(sd_ctx, eta, sample_method);
