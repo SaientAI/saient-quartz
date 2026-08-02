@@ -12,6 +12,10 @@ S24's Vulkan GPU. Same phone also runs LLM chat and SDXL image
 generation locally through this engine. No server, no API key, nothing
 leaves the device.
 
+📹 **[End-to-end proof video](https://youtu.be/ZXc5hBgoro0)** — a full
+on-device generation recorded with Wi-Fi and mobile data switched off,
+so there is no network path a cloud call could take.
+
 (The Wan video model itself runs through a separate, MIT-licensed
 companion binary — see [Relationship to the Wan video engine](#relationship-to-the-wan-video-engine)
 below for how the two fit together. This repo, Quartz proper, is the
