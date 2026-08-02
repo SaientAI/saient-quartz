@@ -1,5 +1,31 @@
+diff --git a/src/conditioning/conditioner.hpp b/src/conditioning/conditioner.hpp
+index 0b1f0d3..120f072 100644
+--- a/src/conditioning/conditioner.hpp
++++ b/src/conditioning/conditioner.hpp
+@@ -1427,6 +1427,21 @@ struct T5CLIPEmbedder : public Conditioner {
+             for (auto& mask_value : t5_mask) {
+                 mask_value = mask_value > 0.0f ? 0.0f : -HUGE_VALF;
+             }
++            // Reference dump: lets the Quartz T5 tokenizer be validated on its own, so a wrong
++            // embedding can be attributed to tokenisation or to the encoder rather than guessed at.
++            if (getenv("SAIENT_DUMP") != nullptr) {
++                static int dump_index = 0;
++                char path[256];
++                snprintf(path, sizeof(path), "/tmp/saient_ref/t5_ids_%d.txt", dump_index++);
++                FILE* fp = fopen(path, "w");
++                if (fp != nullptr) {
++                    fprintf(fp, "# text: %s\n", text.c_str());
++                    for (int id : t5_tokens) fprintf(fp, "%d\n", id);
++                    fclose(fp);
++                    fprintf(stderr, "SAIENT_DUMP %s n=%zu text='%s'\n", path, t5_tokens.size(), text.c_str());
++                    fflush(stderr);
++                }
++            }
+         }
+         return {t5_tokens, t5_weights, t5_mask};
+     }
 diff --git a/src/stable-diffusion.cpp b/src/stable-diffusion.cpp
-index 24e6839..721ce0e 100644
+index 24e6839..37d1676 100644
 --- a/src/stable-diffusion.cpp
 +++ b/src/stable-diffusion.cpp
 @@ -4250,6 +4250,16 @@ struct SamplePlan {
@@ -19,3 +45,41 @@ index 24e6839..721ce0e 100644
          }
  
          eta = resolve_eta(sd_ctx, eta, sample_method);
+@@ -6455,6 +6465,37 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
+                                                                    sd_vid_gen_params,
+                                                                    request,
+                                                                    latents);
++    // Reference dump for the Quartz reimplementation. Token ids and the encoder output are dumped
++    // separately so the tokenizer and the 24-block encoder can be validated independently — if the
++    // embedding is wrong, this says immediately which of the two is at fault.
++    if (getenv("SAIENT_DUMP") != nullptr) {
++        auto dump_f32 = [](const char* path, const sd::Tensor<float>& t) {
++            if (t.empty()) { fprintf(stderr, "SAIENT_DUMP %s: empty\n", path); return; }
++            FILE* fp = fopen(path, "wb");
++            if (fp == nullptr) { fprintf(stderr, "SAIENT_DUMP %s: cannot open\n", path); return; }
++            const auto& s = t.shape();
++            uint32_t nd = (uint32_t)s.size();
++            fwrite("SQD1", 1, 4, fp); fwrite(&nd, sizeof(nd), 1, fp);
++            for (int64_t d : s) fwrite(&d, sizeof(d), 1, fp);
++            fwrite(t.data(), sizeof(float), (size_t)t.numel(), fp);
++            fclose(fp);
++            fprintf(stderr, "SAIENT_DUMP %s shape=[", path);
++            for (size_t i = 0; i < s.size(); ++i) fprintf(stderr, "%s%lld", i ? "," : "", (long long)s[i]);
++            fprintf(stderr, "] numel=%lld\n", (long long)t.numel());
++        };
++        dump_f32("/tmp/saient_ref/cond_crossattn.bin", embeds.cond.c_crossattn);
++        dump_f32("/tmp/saient_ref/uncond_crossattn.bin", embeds.uncond.c_crossattn);
++        if (!embeds.cond.c_t5_ids.empty()) {
++            FILE* fp = fopen("/tmp/saient_ref/cond_t5_ids.txt", "w");
++            if (fp != nullptr) {
++                for (int64_t i = 0; i < embeds.cond.c_t5_ids.numel(); ++i)
++                    fprintf(fp, "%d\n", embeds.cond.c_t5_ids.data()[i]);
++                fclose(fp);
++                fprintf(stderr, "SAIENT_DUMP cond_t5_ids n=%lld\n", (long long)embeds.cond.c_t5_ids.numel());
++            }
++        }
++        fflush(stderr);
++    }
+     if (latent_upscale_enabled) {
+         LOG_INFO("generate_video %dx%dx%d -> LTX latent spatial upscale",
+                  request.width,
