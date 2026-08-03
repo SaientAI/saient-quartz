@@ -142,6 +142,32 @@ own license terms (MIT) and upstream attribution travel with it
 separately. See the mobile repo's `docs/VIDEO_PIPELINE.md` for how the
 two engines are orchestrated together on-device.
 
+### A native Wan2.1 implementation is in progress here
+
+Quartz now contains its own Wan2.1 implementation in Rust — the flow-matching
+scheduler, the SentencePiece Unigram tokenizer, the UMT5-XXL encoder, 3D RoPE,
+the 30-block DiT, and the stateful 3D causal VAE decoder — running on the same
+Vulkan backend as the rest of this repo, with no external inference runtime.
+Every stage was built against a numerical parity harness rather than by
+eyeballing output frames, because a wrong RoPE, a wrong AdaLN modulation and a
+wrong VAE scale all produce indistinguishable garbage. See
+[`reference/README.md`](reference/README.md).
+
+**It does not replace the C++ engine yet, and the app still ships that engine.**
+Two things are outstanding:
+
+1. The end-to-end parity test currently **fails** its pixel budget
+   (cosine `0.999`, but `max_abs 0.184` against a `0.03` tolerance). Each
+   individual stage matches; the residual traces to the DiT velocity, whose
+   delta is smaller than the reference engine's disagreement *with itself*
+   between its flash-attention and non-flash-attention paths. The tolerance has
+   not been relaxed to make this pass.
+2. Performance is nowhere near shipping. A 5-frame 416x240 clip takes about
+   **623 s** on a desktop RTX 5060 Ti, against roughly a second for the C++/GPU
+   engine. The Vulkan graph is deliberately unfused so that block-boundary
+   parity can identify the first divergent primitive; fusing it is a separate
+   and substantial piece of work.
+
 ## Status / provenance note
 
 This repo has uncommitted local changes beyond the rename performed for
