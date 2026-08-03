@@ -292,3 +292,15 @@ The real `decoder.middle.1` attention block was checked on
 execution took `10.004 ms`. The graph held 1,205,760 logical Vulkan bytes,
 1,187,328 device-local logical bytes, one activation upload, three prepared
 weight uploads, and one final download.
+
+The first assembled real decoder section now runs as one resident graph:
+
+`conv2 prelude -> cached decoder.conv1 -> middle.0 -> middle.1 attention -> middle.2`
+
+On `[1,16,1,2,3]` input it produced `[1,384,1,2,3]`, consumed the expected
+five independent cache slots, and matched scalar at cosine `1.0`, maximum
+error `2.384e-6`, and mean error `2.36e-7`. Scalar execution took `548.257 ms`;
+Vulkan execution took `29.323 ms`. The assembled graph held 33,430,848 logical
+Vulkan bytes, 33,384,000 device-local logical bytes, and 37,248 cache bytes. It
+used one activation upload, thirteen prepared-weight uploads, and one final
+download.

@@ -867,6 +867,15 @@ pub struct WanVae {
     head: CausalConv3d,
 }
 
+#[cfg(feature = "vulkan")]
+struct PreparedDecoderMiddle {
+    pre: PreparedCausalConv3d,
+    decoder_in: PreparedCausalConv3d,
+    middle_0: PreparedResidualBlock,
+    middle_attention: PreparedSpatialAttention,
+    middle_2: PreparedResidualBlock,
+}
+
 impl WanVae {
     pub fn load(weights: &SafeTensorFile) -> Result<Self> {
         let residual = |index| ResidualBlock::load(weights, &format!("decoder.upsamples.{index}"));
@@ -887,6 +896,47 @@ impl WanVae {
             head_norm: load_flat(weights, "decoder.head.0.gamma")?,
             head: CausalConv3d::load(weights, "decoder.head.2", [1, 1, 1], [1, 1, 1])?,
         })
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn prepare_decoder_middle(&self, backend: &dyn TensorBackend) -> Result<PreparedDecoderMiddle> {
+        Ok(PreparedDecoderMiddle {
+            pre: self.pre.prepare(backend)?,
+            decoder_in: self.decoder_in.prepare(backend)?,
+            middle_0: self.middle_0.prepare(backend)?,
+            middle_attention: self.middle_attention.prepare(backend)?,
+            middle_2: self.middle_2.prepare(backend)?,
+        })
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn decoder_middle_with_backend(
+        &self,
+        latents: &DeviceTensor,
+        cache: &mut DeviceFeatureCache,
+        backend: &dyn TensorBackend,
+        prepared: &PreparedDecoderMiddle,
+    ) -> Result<DeviceTensor> {
+        let transformed =
+            self.pre
+                .forward_uncached_with_backend(latents, backend, &prepared.pre)?;
+        let hidden = cached_causal_conv_with_backend(
+            &self.decoder_in,
+            &transformed,
+            cache,
+            backend,
+            &prepared.decoder_in,
+        )?;
+        let hidden =
+            self.middle_0
+                .forward_with_backend(&hidden, cache, backend, &prepared.middle_0)?;
+        let hidden = self.middle_attention.forward_with_backend(
+            &hidden,
+            backend,
+            &prepared.middle_attention,
+        )?;
+        self.middle_2
+            .forward_with_backend(&hidden, cache, backend, &prepared.middle_2)
     }
 
     /// Decode VAE-space latents to clamped `[0,1]` RGB pixels.
@@ -2076,6 +2126,117 @@ mod tests {
         drop(actual);
         drop(device_input);
         drop(prepared);
+        let after_drop = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after_drop.resident_allocated_bytes,
+            before.resident_allocated_bytes
+        );
+        assert_eq!(
+            after_drop.resident_device_local_bytes,
+            before.resident_device_local_bytes
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "loads real Wan VAE weights; run explicitly for decoder-middle parity"]
+    fn real_wan_vae_decoder_middle_matches_scalar() {
+        use crate::parity::{ParityTolerance, compare_tensors};
+
+        const VAE: &str =
+            "/home/tiny/projects/saient/models/wan2.1-t2v-1.3b-mobile-pack/wan_2.1_vae.safetensors";
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let before = crate::vulkan::persistence_stats().unwrap();
+        let weights = SafeTensorFile::open(VAE).unwrap();
+        let vae = WanVae::load(&weights).unwrap();
+        let input = Tensor::new(
+            vec![1, 16, 1, 2, 3],
+            (0..96)
+                .map(|index| ((index * 23) as f32 * 0.017).sin() * 1.25)
+                .collect(),
+        )
+        .unwrap();
+        let scalar_started = std::time::Instant::now();
+        let transformed = vae.pre.forward(&input, None).unwrap();
+        let mut scalar_cache = FeatureCache::new();
+        scalar_cache.begin_chunk();
+        let hidden = cached_causal_conv(&vae.decoder_in, &transformed, &mut scalar_cache).unwrap();
+        let hidden = vae
+            .middle_0
+            .forward(&hidden, &mut scalar_cache, &SCALAR_BACKEND)
+            .unwrap();
+        let hidden = vae
+            .middle_attention
+            .forward(&hidden, &SCALAR_BACKEND)
+            .unwrap();
+        let expected = vae
+            .middle_2
+            .forward(&hidden, &mut scalar_cache, &SCALAR_BACKEND)
+            .unwrap();
+        let scalar_runtime = scalar_started.elapsed();
+        assert_eq!(scalar_cache.index, 5);
+
+        let backend = &crate::backend::VULKAN_BACKEND;
+        let prepared = vae.prepare_decoder_middle(backend).unwrap();
+        let device_input = backend.upload_tensor(&input).unwrap();
+        let mut device_cache = DeviceFeatureCache::new();
+        device_cache.begin_chunk();
+        let vulkan_started = std::time::Instant::now();
+        let actual = vae
+            .decoder_middle_with_backend(&device_input, &mut device_cache, backend, &prepared)
+            .unwrap();
+        let output = backend.download_tensor(&actual).unwrap();
+        let vulkan_runtime = vulkan_started.elapsed();
+        let metrics = compare_tensors(&output, &expected).unwrap();
+        metrics
+            .require(ParityTolerance {
+                minimum_cosine_similarity: 0.999_99,
+                maximum_absolute_error: 0.01,
+                maximum_mean_absolute_error: 0.001,
+            })
+            .unwrap();
+        assert_eq!(output.shape(), &[1, 384, 1, 2, 3]);
+        assert_eq!(device_cache.active_index, 5);
+        let cache_stats = device_cache.stats().unwrap();
+        assert_eq!(cache_stats.occupied_slots, 5);
+        assert_eq!(cache_stats.replaced_slots, 0);
+        let expected_weight_uploads = 13
+            + usize::from(vae.middle_0.shortcut.is_some())
+            + usize::from(vae.middle_2.shortcut.is_some());
+        let after = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            expected_weight_uploads as u64
+        );
+        assert_eq!(
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            1
+        );
+        assert_eq!(after.resident_downloads - before.resident_downloads, 1);
+        println!(
+            "real Wan VAE decoder middle: input={:?} output={:?} cache_slots={} scalar_ms={:.3} vulkan_ms={:.3} cosine={:.9} max_abs={:.9} mean_abs={:.9} current_vulkan_bytes={} device_local_bytes={} cache_current_bytes={} cache_peak_bytes={} host_uploads={} weight_uploads={} downloads={}",
+            input.shape(),
+            output.shape(),
+            cache_stats.occupied_slots,
+            scalar_runtime.as_secs_f64() * 1_000.0,
+            vulkan_runtime.as_secs_f64() * 1_000.0,
+            metrics.cosine_similarity,
+            metrics.maximum_absolute_error,
+            metrics.mean_absolute_error,
+            after.resident_allocated_bytes - before.resident_allocated_bytes,
+            after.resident_device_local_bytes - before.resident_device_local_bytes,
+            cache_stats.current_bytes,
+            cache_stats.peak_bytes,
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            after.resident_downloads - before.resident_downloads,
+        );
+
+        device_cache.reset();
+        drop(actual);
+        drop(device_input);
+        drop(prepared);
+        drop(device_cache);
         let after_drop = crate::vulkan::persistence_stats().unwrap();
         assert_eq!(
             after_drop.resident_allocated_bytes,
