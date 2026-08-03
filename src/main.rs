@@ -29,6 +29,7 @@ mod tokenizer;
 mod umt5;
 #[cfg(feature = "vulkan")]
 mod vulkan;
+mod wan;
 mod wan_dit;
 mod wan_pipeline;
 mod wan_rope;
@@ -41,6 +42,33 @@ use std::sync::Arc;
 use gguf::{GgufFile, TensorInfo, ggml_type_size};
 use std::path::Path;
 use tokenizer::Tokenizer;
+
+fn cli_value<'a>(args: &'a [String], name: &str) -> anyhow::Result<Option<&'a str>> {
+    let Some(index) = args.iter().position(|argument| argument == name) else {
+        return Ok(None);
+    };
+    args.get(index + 1)
+        .map(String::as_str)
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("{name} requires a value"))
+}
+
+fn cli_string(args: &[String], name: &str, default: &str) -> anyhow::Result<String> {
+    Ok(cli_value(args, name)?.unwrap_or(default).to_owned())
+}
+
+fn cli_number<T>(args: &[String], name: &str, default: T) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let Some(value) = cli_value(args, name)? else {
+        return Ok(default);
+    };
+    value
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid {name} value {value:?}: {error}"))
+}
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -1828,6 +1856,185 @@ fn main() {
         #[cfg(not(feature = "vulkan"))]
         {
             eprintln!("this binary was built without the vulkan feature");
+            std::process::exit(2);
+        }
+    }
+
+    if args.get(1).map(String::as_str) == Some("--inspect-wan") {
+        let Some(root) = args.get(2) else {
+            eprintln!("usage: quartz --inspect-wan <model-directory> [--encode-wan <prompt>]");
+            std::process::exit(2);
+        };
+        match wan::WanModelPack::open(root) {
+            Ok(pack) => {
+                pack.print_summary();
+                if let Some(position) = args.iter().position(|argument| argument == "--encode-wan")
+                {
+                    let prompt = args.get(position + 1).map(String::as_str).unwrap_or("");
+                    match pack.encode_prompt(prompt) {
+                        Ok(context) => {
+                            let sum = context.data().iter().sum::<f32>();
+                            let sumsq = context
+                                .data()
+                                .iter()
+                                .map(|value| value * value)
+                                .sum::<f32>();
+                            println!("UMT5 context : {:?}", context.shape());
+                            println!("UMT5 sum     : {sum:.9}");
+                            println!("UMT5 sumsq   : {sumsq:.9}");
+                            println!("UMT5 first16 : {:?}", &context.data()[..16]);
+                        }
+                        Err(error) => {
+                            eprintln!("Wan UMT5 execution failed: {error:#}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("Wan pack rejected: {error:#}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
+    if args.get(1).map(String::as_str) == Some("--generate-wan") {
+        #[cfg(feature = "vulkan")]
+        {
+            let Some(root) = args.get(2) else {
+                eprintln!(
+                    "usage: quartz --generate-wan <model-directory> <prompt> [--negative-prompt <text>] [--width <pixels>] [--height <pixels>] [--frames <4k+1>] [--steps <count>] [--guidance <scale>] [--flow-shift <shift>] [--seed <u64>] [--output <directory>] [--overwrite]"
+                );
+                std::process::exit(2);
+            };
+            let Some(prompt) = args.get(3) else {
+                eprintln!("--generate-wan requires a prompt");
+                std::process::exit(2);
+            };
+            let parse = || -> anyhow::Result<_> {
+                let request = wan_pipeline::WanGenerationRequest {
+                    prompt: prompt.clone(),
+                    negative_prompt: cli_string(&args, "--negative-prompt", "")?,
+                    width: cli_number(&args, "--width", 64usize)?,
+                    height: cli_number(&args, "--height", 64usize)?,
+                    frames: cli_number(&args, "--frames", 5usize)?,
+                    steps: cli_number(&args, "--steps", 1u32)?,
+                    guidance_scale: cli_number(&args, "--guidance", 6.0f32)?,
+                    flow_shift: cli_number(&args, "--flow-shift", 8.0f32)?,
+                    seed: cli_number(&args, "--seed", 0u64)?,
+                };
+                let output_directory =
+                    std::path::PathBuf::from(cli_string(&args, "--output", "quartz-wan-frames")?);
+                let overwrite = args.iter().any(|argument| argument == "--overwrite");
+                let targets = (0..request.frames)
+                    .map(|frame| output_directory.join(format!("frame-{frame:04}.png")))
+                    .collect::<Vec<_>>();
+                if output_directory.exists() && !output_directory.is_dir() {
+                    anyhow::bail!(
+                        "Wan output path is not a directory: {}",
+                        output_directory.display()
+                    );
+                }
+                if !overwrite && let Some(existing) = targets.iter().find(|target| target.exists())
+                {
+                    anyhow::bail!(
+                        "Wan output frame already exists: {}; pass --overwrite to replace it",
+                        existing.display()
+                    );
+                }
+                let pack = wan::WanModelPack::open(root)?;
+                let profile = pack.profile();
+                wan_pipeline::validate_generation_request(&request, profile)?;
+
+                println!("Quartz Wan backend: Vulkan (no external inference runtime)");
+                println!(
+                    "Wan request: prompt_tokens=native-UMT5 size={}x{} frames={} fps={} steps={} guidance={} flow_shift={} seed={}",
+                    request.width,
+                    request.height,
+                    request.frames,
+                    profile.fps,
+                    request.steps,
+                    request.guidance_scale,
+                    request.flow_shift,
+                    request.seed,
+                );
+                let result = wan_pipeline::generate_vulkan_with_control(
+                    &pack,
+                    &request,
+                    |progress| {
+                        println!(
+                            "Wan progress: phase={} completed={} total={}",
+                            progress.phase.as_str(),
+                            progress.completed,
+                            progress.total
+                        );
+                        let _ = std::io::stdout().flush();
+                    },
+                    || false,
+                )?;
+
+                std::fs::create_dir_all(&output_directory).map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot create Wan output directory {}: {error}",
+                        output_directory.display()
+                    )
+                })?;
+                for (frame_index, target) in targets.iter().enumerate() {
+                    let frame = wan_pipeline::frame_for_png(&result.video, frame_index)?;
+                    let encoded = sd_pipeline::png(&frame)?;
+                    let temporary = output_directory.join(format!(
+                        ".frame-{frame_index:04}.png.tmp-{}",
+                        std::process::id()
+                    ));
+                    std::fs::write(&temporary, encoded).map_err(|error| {
+                        anyhow::anyhow!("cannot write {}: {error}", temporary.display())
+                    })?;
+                    std::fs::rename(&temporary, target).map_err(|error| {
+                        anyhow::anyhow!(
+                            "cannot publish Wan frame {} as {}: {error}",
+                            temporary.display(),
+                            target.display()
+                        )
+                    })?;
+                }
+                println!(
+                    "Wan output: {} PNG frames at {}",
+                    request.frames,
+                    output_directory.display()
+                );
+                println!(
+                    "Wan Vulkan: runtime_s={:.3} peak_resident={} peak_device_local={} host_uploads={} weight_uploads={} downloads={} uploaded_bytes={} downloaded_bytes={}",
+                    result.stats.runtime.as_secs_f64(),
+                    result.stats.peak_resident_bytes,
+                    result.stats.peak_device_local_bytes,
+                    result.stats.host_uploads,
+                    result.stats.weight_uploads,
+                    result.stats.downloads,
+                    result.stats.uploaded_bytes,
+                    result.stats.downloaded_bytes,
+                );
+                println!(
+                    "Wan VAE cache: peak_bytes={} current_bytes={} occupied_slots={} replaced_slots={} evicted_slots={} resident={} device_local={}",
+                    result.stats.cache.peak_bytes,
+                    result.stats.cache.current_bytes,
+                    result.stats.cache.occupied_slots,
+                    result.stats.cache.replaced_slots,
+                    result.stats.cache.evicted_slots,
+                    result.stats.cache.all_slots_resident,
+                    result.stats.cache.all_slots_device_local,
+                );
+                Ok(())
+            };
+            if let Err(error) = parse() {
+                eprintln!("Wan generation failed: {error:#}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            eprintln!("Wan generation requires a binary built with the vulkan feature");
             std::process::exit(2);
         }
     }

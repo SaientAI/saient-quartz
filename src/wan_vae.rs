@@ -293,14 +293,14 @@ impl FeatureCache {
 
 #[cfg(feature = "vulkan")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct DeviceFeatureCacheStats {
-    current_bytes: usize,
-    peak_bytes: usize,
-    occupied_slots: usize,
-    replaced_slots: usize,
-    evicted_slots: usize,
-    all_slots_resident: bool,
-    all_slots_device_local: bool,
+pub(crate) struct DeviceFeatureCacheStats {
+    pub current_bytes: usize,
+    pub peak_bytes: usize,
+    pub occupied_slots: usize,
+    pub replaced_slots: usize,
+    pub evicted_slots: usize,
+    pub all_slots_resident: bool,
+    pub all_slots_device_local: bool,
 }
 
 /// Device-owned counterpart of Wan's scalar feature cache. Cloning a slot
@@ -912,7 +912,7 @@ struct PreparedDecoderMiddle {
 }
 
 #[cfg(feature = "vulkan")]
-struct PreparedWanVae {
+pub(crate) struct PreparedWanVae {
     middle: PreparedDecoderMiddle,
     up_residuals: Vec<PreparedResidualBlock>,
     upsamples: [PreparedUpsample; 3],
@@ -984,7 +984,10 @@ impl WanVae {
     }
 
     #[cfg(feature = "vulkan")]
-    fn prepare_with_backend(&self, backend: &dyn TensorBackend) -> Result<PreparedWanVae> {
+    pub(crate) fn prepare_with_backend(
+        &self,
+        backend: &dyn TensorBackend,
+    ) -> Result<PreparedWanVae> {
         Ok(PreparedWanVae {
             middle: self.prepare_decoder_middle(backend)?,
             up_residuals: self
@@ -1079,7 +1082,7 @@ impl WanVae {
     }
 
     #[cfg(feature = "vulkan")]
-    fn decode_device_with_backend(
+    pub(crate) fn decode_device_with_backend(
         &self,
         latents: &DeviceTensor,
         backend: &dyn TensorBackend,
