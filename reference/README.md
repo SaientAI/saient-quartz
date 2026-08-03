@@ -100,8 +100,14 @@ FAILED: maximum absolute error 0.184276968 exceeds 0.029999999
 ```
 
 The structural assertions pass: correct output shape, exactly one device
-download, and every feature-cache slot resident. It is the `max_abs` budget
-that fails, by roughly 6x.
+download, and every feature-cache slot resident. Two of the three numerical
+budgets fail:
+
+| assertion | budget | observed | |
+| --- | ---: | ---: | --- |
+| cosine >= | 0.999 | 0.999007871 | passes, by 8e-6 |
+| max abs <= | 0.03 | 0.184276968 | **fails, ~6x** |
+| mean abs <= | 0.005 | 0.010395278 | **fails, ~2x** |
 
 What is known about the cause:
 
@@ -117,6 +123,21 @@ What is known about the cause:
   *uncorrelated* error by roughly 8-11x; it does not here, which is consistent
   with the conditional and unconditional branches carrying the same systematic
   arithmetic difference and largely cancelling in `-5*uncond + 6*cond`.
+
+### The same measurement in pixel space
+
+The velocity-space band above has a pixel-space equivalent, measured the same
+way — one binary, one set of weights, one seed, `--diffusion-fa` toggled:
+
+| | cosine | max abs | mean abs |
+| --- | ---: | ---: | ---: |
+| reference FA vs reference non-FA | 0.998562281 | 0.234375000 | 0.011999811 |
+| **Quartz native pipeline vs reference FA** | **0.999007871** | **0.184276968** | **0.010395278** |
+
+Quartz is closer to the reference than the reference is to itself, on every
+metric: higher cosine, smaller maximum error, smaller mean error. The failing
+`0.03` budget is roughly eight times tighter than the reference engine's own
+demonstrated reproducibility.
 
 **The tolerance has deliberately not been relaxed.** A `0.03` pixel budget is
 almost certainly below what the reference can reproduce against itself — the
