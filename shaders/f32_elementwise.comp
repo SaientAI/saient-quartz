@@ -72,6 +72,16 @@ void main() {
         case 9:
             value = left * parameters.parameter0 + parameters.parameter1;
             break;
+        case 10:
+            // NCTHW is contiguous with W fastest. Every channel therefore owns one
+            // `T*H*W` plane per batch item. The parameter vector is laid out as
+            // `[channel_scales..., channel_biases...]`.
+            uint channel_plane = floatBitsToUint(parameters.parameter0);
+            uint channel_count = floatBitsToUint(parameters.parameter1);
+            uint ncthw_channel = (index / channel_plane) % channel_count;
+            value = left * right_values[ncthw_channel] +
+                right_values[channel_count + ncthw_channel];
+            break;
         default:
             value = uintBitsToFloat(0x7fc00000);
             break;

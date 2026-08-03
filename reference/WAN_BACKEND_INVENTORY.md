@@ -334,3 +334,25 @@ exactly the preserved scalar-reference cosine. Weight preparation took
 cache residency was 944,286,720 bytes; RSS at comparison was 616,328 KiB. The
 run used one activation upload, 69 prepared-weight uploads, and one final
 download.
+
+## Resident DiT-to-VAE orchestration seam
+
+Quartz now owns the model semantics between the verified DiT, scheduler, and
+VAE graphs. Text classifier-free guidance is evaluated in resident storage as
+`uncond + guidance * (cond - uncond)`, the Euler flow step consumes that guided
+velocity without a host transfer, and the resulting `[16,T,H,W]` diffusion
+latent is metadata-reshaped to `[1,16,T,H,W]`. A resident NCTHW channel-affine
+kernel then applies Wan 2.1's 16 per-channel VAE standard deviations and means.
+
+The captured one-step reference provides both conditional and unconditional
+DiT outputs plus the exact VAE input. On the full latent shape
+`[1,16,2,30,52]`, the complete seam matched the capture at cosine `1.0`,
+maximum error `0.000000238`, and mean error `0.000000026`. The scalar path is
+bit-exact. The Vulkan path took `29.620 ms`, peaked at 1,397,888 logical Vulkan
+bytes, used three tensor uploads (sample and two captured velocities), one
+prepared parameter upload, and one final comparison download. No intermediate
+host reconstruction occurs.
+
+The channel-affine primitive also has a hand-checkable multi-batch,
+multi-channel, non-square `[2,3,2,2,3]` fixture so the NCTHW channel index cannot
+silently collapse into a last-axis broadcast.

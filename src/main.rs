@@ -30,6 +30,7 @@ mod umt5;
 #[cfg(feature = "vulkan")]
 mod vulkan;
 mod wan_dit;
+mod wan_pipeline;
 mod wan_rope;
 mod wan_scheduler;
 mod wan_vae;

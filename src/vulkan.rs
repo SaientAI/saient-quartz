@@ -310,6 +310,9 @@ pub(crate) struct PersistenceStats {
     pub peak_resident_device_local_bytes: u64,
     pub resident_device_local_allocation_bytes: u64,
     pub peak_resident_device_local_allocation_bytes: u64,
+    pub scratch_buffer_bytes: u64,
+    pub scratch_buffer_allocation_bytes: u64,
+    pub cached_model_mappings: usize,
 }
 
 pub struct BenchmarkResult {
@@ -474,6 +477,19 @@ pub(crate) fn persistence_stats() -> Result<PersistenceStats> {
             peak_resident_device_local_allocation_bytes: runtime
                 .stats
                 .peak_resident_device_local_allocation_bytes,
+            scratch_buffer_bytes: runtime
+                .buffers
+                .iter()
+                .flatten()
+                .map(|buffer| buffer.bytes as u64)
+                .sum(),
+            scratch_buffer_allocation_bytes: runtime
+                .buffers
+                .iter()
+                .flatten()
+                .map(|buffer| buffer.allocation_bytes)
+                .sum(),
+            cached_model_mappings: runtime.model_mappings.len(),
         })
     })
 }
@@ -1447,6 +1463,40 @@ pub(crate) fn resident_affine(
     }
     let elements = u32::try_from(input.elements).context("resident Vulkan affine exceeds u32")?;
     let id = with_runtime(|runtime| runtime.resident_affine(input.id(), elements, scale, bias))?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_ncthw_channel_affine(
+    input: &ResidentTensor,
+    parameters: &ResidentTensor,
+    channels: usize,
+    channel_plane: usize,
+) -> Result<ResidentTensor> {
+    if input.element_type != ResidentElementType::F32
+        || parameters.element_type != ResidentElementType::F32
+        || channels == 0
+        || channel_plane == 0
+        || parameters.elements != 2 * channels
+        || channels
+            .checked_mul(channel_plane)
+            .is_none_or(|sample_elements| input.elements % sample_elements != 0)
+    {
+        bail!("resident NCTHW channel affine storage or dimensions are invalid");
+    }
+    let id = with_runtime(|runtime| {
+        runtime.resident_ncthw_channel_affine(
+            input.id(),
+            parameters.id(),
+            u32::try_from(input.elements)
+                .context("resident NCTHW channel affine elements exceed u32")?,
+            u32::try_from(channels).context("resident NCTHW channel count exceeds u32")?,
+            u32::try_from(channel_plane).context("resident NCTHW channel plane exceeds u32")?,
+        )
+    })?;
     Ok(resident_tensor(
         id,
         input.elements,
@@ -3829,6 +3879,42 @@ impl VulkanRuntime {
             elements as usize,
             self.elementwise_pipeline,
             bytes_of(&[elements, 9, scale.to_bits(), bias.to_bits()]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_ncthw_channel_affine(
+        &mut self,
+        input_id: u64,
+        parameter_id: u64,
+        elements: u32,
+        channels: u32,
+        channel_plane: u32,
+    ) -> Result<u64> {
+        if elements == 0
+            || channels == 0
+            || channel_plane == 0
+            || channels
+                .checked_mul(channel_plane)
+                .is_none_or(|sample_elements| elements % sample_elements != 0)
+        {
+            bail!("resident NCTHW channel affine dimensions are invalid");
+        }
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        self.require_resident(
+            parameter_id,
+            2 * channels as usize,
+            ResidentElementType::F32,
+        )?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, parameter_id],
+            elements as usize,
+            self.elementwise_pipeline,
+            bytes_of(&[elements, 10, channel_plane, channels]),
             [elements.div_ceil(256), 1, 1],
             KernelKind::Elementwise,
         );
@@ -7131,6 +7217,12 @@ mod tests {
         let error = linear(&input, overflow_weights.mapped("w1").unwrap(), None).unwrap_err();
         assert!(error.to_string().contains("too small"), "{error}");
         disable_staged_weight_loading();
+
+        // The runtime normally retains model arenas across requests. These mappings
+        // belong to temporary test files, so keeping them alive past this test leaks
+        // both the mmap and its Vulkan allocation into every later test in the same
+        // process.
+        release_sd_resources().unwrap();
 
         let _ = std::fs::remove_file(&baseline_path);
         let _ = std::fs::remove_file(&staged_path);

@@ -256,6 +256,24 @@ pub(crate) trait TensorBackend: Send + Sync {
         }
     }
 
+    /// Create a metadata-only view with a different shape. Storage and backend ownership are
+    /// retained; no upload, download, or device copy occurs.
+    fn reshape_device(&self, input: &DeviceTensor, shape: Vec<usize>) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        if shape.contains(&0) || shape.iter().product::<usize>() != input.len() {
+            bail!(
+                "resident reshape {:?} does not preserve input shape {:?}",
+                shape,
+                input.shape()
+            );
+        }
+        Ok(DeviceTensor {
+            backend: input.backend,
+            shape,
+            storage: input.storage.clone(),
+        })
+    }
+
     fn ncthw_slice_time_device(
         &self,
         input: &DeviceTensor,
@@ -810,6 +828,45 @@ pub(crate) trait TensorBackend: Send + Sync {
             .map(|value| value * scale + bias)
             .collect();
         self.upload_tensor(&Tensor::new(input.shape().to_vec(), data)?)
+    }
+
+    /// Apply independently prepared scale and bias values across the channel axis of an NCTHW
+    /// tensor. `parameters` is `[scales[C], biases[C]]`; the layout is explicit so the operation
+    /// can remain resident without manufacturing a full broadcast tensor.
+    fn ncthw_channel_affine_device(
+        &self,
+        input: &DeviceTensor,
+        parameters: &PreparedVectorHandle,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        self.require_vector(parameters)?;
+        let [batch, channels, time, height, width]: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("channel affine input must be NCTHW")?;
+        if batch == 0 || channels == 0 || time == 0 || height == 0 || width == 0 {
+            bail!("channel affine NCTHW dimensions must be non-zero");
+        }
+        if parameters.length != 2 * channels {
+            bail!(
+                "channel affine parameter length {} must be twice the channel count {channels}",
+                parameters.length
+            );
+        }
+        let output_shape = input.shape().to_vec();
+        let input = input.storage.host()?;
+        let parameters = parameters.storage.host()?;
+        let channel_plane = time * height * width;
+        let data = input
+            .data()
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let channel = (index / channel_plane) % channels;
+                value * parameters.data()[channel] + parameters.data()[channels + channel]
+            })
+            .collect();
+        self.upload_tensor(&Tensor::new(output_shape, data)?)
     }
 
     fn clamp_device(
@@ -2262,6 +2319,44 @@ impl TensorBackend for VulkanBackend {
                 input_storage,
                 scale,
                 bias,
+            )?),
+        })
+    }
+
+    fn ncthw_channel_affine_device(
+        &self,
+        input: &DeviceTensor,
+        parameters: &PreparedVectorHandle,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        self.require_vector(parameters)?;
+        let [batch, channels, time, height, width]: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("resident Vulkan channel affine input must be NCTHW")?;
+        if batch == 0 || channels == 0 || time == 0 || height == 0 || width == 0 {
+            bail!("resident Vulkan channel affine dimensions must be non-zero");
+        }
+        if parameters.length != 2 * channels {
+            bail!(
+                "resident Vulkan channel affine parameter length {} must be twice the channel count {channels}",
+                parameters.length
+            );
+        }
+        let DeviceTensorStorage::Vulkan(input_storage) = &input.storage else {
+            bail!("Vulkan backend received non-Vulkan channel affine input");
+        };
+        let PreparedVectorStorage::Vulkan(parameter_storage) = &parameters.storage else {
+            bail!("Vulkan backend received non-Vulkan channel affine parameters");
+        };
+        Ok(DeviceTensor {
+            backend: BackendKind::Vulkan,
+            shape: input.shape.clone(),
+            storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_ncthw_channel_affine(
+                input_storage,
+                parameter_storage,
+                channels,
+                time * height * width,
             )?),
         })
     }
