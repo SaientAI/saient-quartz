@@ -1,0 +1,34 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float input_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer TimestepBuffer {
+    float timestep_values[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer ModulationBuffer {
+    float modulation_values[];
+};
+layout(set = 0, binding = 3, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Parameters {
+    uint elements;
+    uint width;
+} parameters;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= parameters.elements) {
+        return;
+    }
+    uint channel = index % parameters.width;
+    float timestep = timestep_values[channel];
+    float shift = modulation_values[channel];
+    float scale = modulation_values[parameters.width + channel];
+    output_values[index] = input_values[index] * (1.0 + timestep + scale) +
+        timestep + shift;
+}

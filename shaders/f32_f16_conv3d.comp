@@ -1,0 +1,86 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float input_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer {
+    float16_t weight_values[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer BiasBuffer {
+    float bias_values[];
+};
+layout(set = 0, binding = 3, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint batch;
+    uint input_channels;
+    uint input_time;
+    uint input_height;
+    uint input_width;
+    uint output_channels;
+    uint kernel_time;
+    uint kernel_height;
+    uint kernel_width;
+    uint padding_time_before;
+    uint padding_height_before;
+    uint padding_width_before;
+    uint output_time;
+    uint output_height;
+    uint output_width;
+} dimensions;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint output_elements = dimensions.batch * dimensions.output_channels *
+        dimensions.output_time * dimensions.output_height * dimensions.output_width;
+    if (index >= output_elements) {
+        return;
+    }
+
+    uint remaining = index;
+    uint output_w = remaining % dimensions.output_width;
+    remaining /= dimensions.output_width;
+    uint output_h = remaining % dimensions.output_height;
+    remaining /= dimensions.output_height;
+    uint output_t = remaining % dimensions.output_time;
+    remaining /= dimensions.output_time;
+    uint output_channel = remaining % dimensions.output_channels;
+    uint batch_index = remaining / dimensions.output_channels;
+
+    float sum = bias_values[output_channel];
+    for (uint input_channel = 0; input_channel < dimensions.input_channels; ++input_channel) {
+        for (uint kernel_t = 0; kernel_t < dimensions.kernel_time; ++kernel_t) {
+            int input_t = int(output_t + kernel_t) - int(dimensions.padding_time_before);
+            if (input_t < 0 || input_t >= int(dimensions.input_time)) {
+                continue;
+            }
+            for (uint kernel_h = 0; kernel_h < dimensions.kernel_height; ++kernel_h) {
+                int input_h = int(output_h + kernel_h) - int(dimensions.padding_height_before);
+                if (input_h < 0 || input_h >= int(dimensions.input_height)) {
+                    continue;
+                }
+                for (uint kernel_w = 0; kernel_w < dimensions.kernel_width; ++kernel_w) {
+                    int input_w = int(output_w + kernel_w) - int(dimensions.padding_width_before);
+                    if (input_w < 0 || input_w >= int(dimensions.input_width)) {
+                        continue;
+                    }
+                    uint input_index = ((batch_index * dimensions.input_channels + input_channel) *
+                        dimensions.input_time + uint(input_t)) * dimensions.input_height *
+                        dimensions.input_width + uint(input_h) * dimensions.input_width +
+                        uint(input_w);
+                    uint weight_index = (((output_channel * dimensions.input_channels +
+                        input_channel) * dimensions.kernel_time + kernel_t) *
+                        dimensions.kernel_height + kernel_h) * dimensions.kernel_width + kernel_w;
+                    sum += input_values[input_index] * float(weight_values[weight_index]);
+                }
+            }
+        }
+    }
+    output_values[index] = sum;
+}

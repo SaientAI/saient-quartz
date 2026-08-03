@@ -1,5 +1,6 @@
 // quartz — minimal GGUF transformer runtime
 
+mod backend;
 mod clip_tokenizer;
 #[cfg(feature = "cuda")]
 mod cuda;
@@ -7,6 +8,7 @@ mod dequant;
 mod gguf;
 mod iq2_tables; // IQ2 grid seed + sign tables (generated from ggml-quants.c)
 mod iq3_tables; // IQ3_S grid table (generated from ggml-common.h)
+mod parity;
 mod safetensors;
 mod sd15;
 mod sd_clip;
@@ -21,16 +23,16 @@ mod sdxl_pipeline;
 mod sdxl_scheduler;
 mod sdxl_unet;
 mod server;
-mod tensor;
 mod t5_tokenizer;
+mod tensor;
 mod tokenizer;
 mod umt5;
-mod wan_dit;
-mod wan_vae;
-mod wan_rope;
-mod wan_scheduler;
 #[cfg(feature = "vulkan")]
 mod vulkan;
+mod wan_dit;
+mod wan_rope;
+mod wan_scheduler;
+mod wan_vae;
 
 use rayon::prelude::*;
 use std::sync::Arc;

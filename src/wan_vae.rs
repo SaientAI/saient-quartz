@@ -8,7 +8,12 @@
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
-use crate::{safetensors::SafeTensorFile, sd_ops, tensor::Tensor};
+use crate::{
+    backend::{Conv3dWeightHandle, DeviceTensor, SCALAR_BACKEND, TensorBackend},
+    safetensors::SafeTensorFile,
+    sd_ops,
+    tensor::Tensor,
+};
 
 const RMS_EPSILON: f32 = 1e-12;
 const CACHE_TIME: usize = 2;
@@ -21,6 +26,10 @@ struct CausalConv3d {
     stride: [usize; 3],
     padding: [usize; 3],
     dilation: [usize; 3],
+}
+
+struct PreparedCausalConv3d {
+    weights: Conv3dWeightHandle,
 }
 
 impl CausalConv3d {
@@ -71,6 +80,36 @@ impl CausalConv3d {
             [0, self.padding[1], self.padding[2]],
             self.dilation,
             1,
+        )
+    }
+
+    fn prepare(&self, backend: &dyn TensorBackend) -> Result<PreparedCausalConv3d> {
+        if self.stride != [1, 1, 1] || self.dilation != [1, 1, 1] {
+            bail!("resident Wan causal Conv3D currently requires unit stride and dilation");
+        }
+        Ok(PreparedCausalConv3d {
+            weights: backend.prepare_conv3d(&self.weight, self.bias.as_ref())?,
+        })
+    }
+
+    fn forward_uncached_with_backend(
+        &self,
+        input: &DeviceTensor,
+        backend: &dyn TensorBackend,
+        prepared: &PreparedCausalConv3d,
+    ) -> Result<DeviceTensor> {
+        let padding_before = [
+            self.padding[0]
+                .checked_mul(2)
+                .context("resident causal temporal padding overflow")?,
+            self.padding[1],
+            self.padding[2],
+        ];
+        backend.conv3d_prepared_device(
+            input,
+            &prepared.weights,
+            padding_before,
+            [0, self.padding[1], self.padding[2]],
         )
     }
 }
@@ -228,7 +267,12 @@ impl ResidualBlock {
         })
     }
 
-    fn forward(&self, input: &Tensor, cache: &mut FeatureCache) -> Result<Tensor> {
+    fn forward(
+        &self,
+        input: &Tensor,
+        cache: &mut FeatureCache,
+        backend: &dyn TensorBackend,
+    ) -> Result<Tensor> {
         let residual = self
             .shortcut
             .as_ref()
@@ -238,7 +282,7 @@ impl ResidualBlock {
         let hidden = input.channel_rms_norm_3d(&self.norm1, RMS_EPSILON)?.silu();
         let hidden = cached_causal_conv(&self.conv1, &hidden, cache)?;
         let hidden = hidden.channel_rms_norm_3d(&self.norm2, RMS_EPSILON)?.silu();
-        cached_causal_conv(&self.conv2, &hidden, cache)?.add(&residual)
+        backend.add(&cached_causal_conv(&self.conv2, &hidden, cache)?, &residual)
     }
 }
 
@@ -257,7 +301,7 @@ impl SpatialAttention {
         })
     }
 
-    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+    fn forward(&self, input: &Tensor, backend: &dyn TensorBackend) -> Result<Tensor> {
         let [batch, channels, time, height, width] = ncthw(input)?;
         let positions = height
             .checked_mul(width)
@@ -316,7 +360,7 @@ impl SpatialAttention {
                 }
             });
         let attended = Tensor::new(vec![batch, channels, time, height, width], attended_ncthw)?;
-        self.projection.forward(&attended)?.add(input)
+        backend.add(&self.projection.forward(&attended)?, input)
     }
 }
 
@@ -414,7 +458,17 @@ impl WanVae {
 
     /// Decode VAE-space latents to clamped `[0,1]` RGB pixels.
     pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
-        self.decode_internal(latents, None)
+        self.decode_with_backend(latents, &SCALAR_BACKEND)
+    }
+
+    /// Decode through an explicit tensor backend. Model ordering, chunking,
+    /// and cache ownership remain identical to the scalar reference graph.
+    pub(crate) fn decode_with_backend(
+        &self,
+        latents: &Tensor,
+        backend: &dyn TensorBackend,
+    ) -> Result<Tensor> {
+        self.decode_internal(latents, backend, None)
     }
 
     /// Correctness harness that retains every major decoder activation. This
@@ -423,13 +477,14 @@ impl WanVae {
     #[allow(dead_code)]
     pub fn decode_with_trace(&self, latents: &Tensor) -> Result<(Tensor, Vec<(String, Tensor)>)> {
         let mut trace = Vec::new();
-        let output = self.decode_internal(latents, Some(&mut trace))?;
+        let output = self.decode_internal(latents, &SCALAR_BACKEND, Some(&mut trace))?;
         Ok((output, trace))
     }
 
     fn decode_internal(
         &self,
         latents: &Tensor,
+        backend: &dyn TensorBackend,
         mut trace: Option<&mut Vec<(String, Tensor)>>,
     ) -> Result<Tensor> {
         let [batch, channels, time, _, _] = ncthw(latents)?;
@@ -446,7 +501,7 @@ impl WanVae {
         for chunk_index in 0..time {
             cache.begin_chunk();
             let chunk = slice_time(&transformed, chunk_index, chunk_index + 1)?;
-            let chunk = self.forward_chunk(chunk, &mut cache, chunk_index, &mut trace)?;
+            let chunk = self.forward_chunk(chunk, &mut cache, chunk_index, backend, &mut trace)?;
             if cache.index != USED_CACHE_SLOTS {
                 bail!(
                     "Wan VAE chunk consumed {} cache slots, expected {USED_CACHE_SLOTS}",
@@ -469,21 +524,22 @@ impl WanVae {
         mut hidden: Tensor,
         cache: &mut FeatureCache,
         chunk_index: usize,
+        backend: &dyn TensorBackend,
         trace: &mut Option<&mut Vec<(String, Tensor)>>,
     ) -> Result<Tensor> {
         hidden = cached_causal_conv(&self.decoder_in, &hidden, cache)?;
         record(trace, &format!("chunk.{chunk_index}.decoder_in"), &hidden);
-        hidden = self.middle_0.forward(&hidden, cache)?;
+        hidden = self.middle_0.forward(&hidden, cache, backend)?;
         record(trace, &format!("chunk.{chunk_index}.middle.0"), &hidden);
-        hidden = self.middle_attention.forward(&hidden)?;
+        hidden = self.middle_attention.forward(&hidden, backend)?;
         record(trace, &format!("chunk.{chunk_index}.middle.1"), &hidden);
-        hidden = self.middle_2.forward(&hidden, cache)?;
+        hidden = self.middle_2.forward(&hidden, cache, backend)?;
         record(trace, &format!("chunk.{chunk_index}.middle.2"), &hidden);
 
         let mut residual_index = 0;
         for stage in 0..4 {
             for layer in 0..3 {
-                hidden = self.up_residuals[residual_index].forward(&hidden, cache)?;
+                hidden = self.up_residuals[residual_index].forward(&hidden, cache, backend)?;
                 residual_index += 1;
                 record(
                     trace,
@@ -662,6 +718,61 @@ fn record(trace: &mut Option<&mut Vec<(String, Tensor)>>, name: &str, tensor: &T
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::BackendKind;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct CountingBackend {
+        additions: AtomicUsize,
+    }
+
+    impl TensorBackend for CountingBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::ScalarCpu
+        }
+
+        fn name(&self) -> &'static str {
+            "counting-scalar"
+        }
+
+        fn add(&self, left: &Tensor, right: &Tensor) -> Result<Tensor> {
+            self.additions.fetch_add(1, Ordering::Relaxed);
+            SCALAR_BACKEND.add(left, right)
+        }
+
+        fn multiply(&self, left: &Tensor, right: &Tensor) -> Result<Tensor> {
+            SCALAR_BACKEND.multiply(left, right)
+        }
+
+        fn scale(&self, input: &Tensor, value: f32) -> Result<Tensor> {
+            SCALAR_BACKEND.scale(input, value)
+        }
+
+        fn silu(&self, input: &Tensor) -> Result<Tensor> {
+            SCALAR_BACKEND.silu(input)
+        }
+
+        fn gelu_tanh(&self, input: &Tensor) -> Result<Tensor> {
+            SCALAR_BACKEND.gelu_tanh(input)
+        }
+
+        fn clamp(&self, input: &Tensor, minimum: f32, maximum: f32) -> Result<Tensor> {
+            SCALAR_BACKEND.clamp(input, minimum, maximum)
+        }
+
+        fn channel_rms_norm_3d(
+            &self,
+            input: &Tensor,
+            weight: &Tensor,
+            epsilon: f32,
+        ) -> Result<Tensor> {
+            SCALAR_BACKEND.channel_rms_norm_3d(input, weight, epsilon)
+        }
+
+        fn linear(&self, input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+            SCALAR_BACKEND.linear(input, weight, bias)
+        }
+    }
 
     fn tensor(shape: &[usize], data: &[f32]) -> Tensor {
         Tensor::new(shape.to_vec(), data.to_vec()).unwrap()
@@ -742,12 +853,14 @@ mod tests {
             )),
         };
         let mut cache = FeatureCache::new();
+        let backend = CountingBackend::default();
         let output = block
-            .forward(&tensor(&[1, 1, 1, 1, 1], &[3.]), &mut cache)
+            .forward(&tensor(&[1, 1, 1, 1, 1], &[3.]), &mut cache, &backend)
             .unwrap();
         assert_eq!(output.shape(), &[1, 2, 1, 1, 1]);
         assert_eq!(output.data(), &[6.5, -2.]);
         assert_eq!(cache.index, 2);
+        assert_eq!(backend.additions.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -814,7 +927,7 @@ mod tests {
             ),
         };
         let input = tensor(&[1, 2, 1, 1, 2], &[1., 3., 2., 4.]);
-        let output = attention.forward(&input).unwrap();
+        let output = attention.forward(&input, &SCALAR_BACKEND).unwrap();
         assert_close(
             output.data(),
             &[1.7404919, 3.7404919, 3.198141, 5.198141],
@@ -912,6 +1025,92 @@ mod parity {
         assert!(
             maximum_error < 0.03,
             "{label} VAE maximum error {maximum_error:.7} exceeds tolerance"
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "loads the Wan VAE and validates the first real resident causal Conv3D"]
+    fn resident_vulkan_prelude_matches_scalar() {
+        use std::time::Instant;
+
+        use crate::{
+            backend::{TensorBackend, VULKAN_BACKEND},
+            parity::{ParityTolerance, compare_tensors},
+        };
+
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let vae_path = Path::new(VAE);
+        let input_path = Path::new(REFERENCE).join("vae_in_small.bin");
+        assert!(vae_path.exists());
+        assert!(input_path.exists());
+        let (captured_shape, input_values) = read_dump(&input_path).unwrap();
+        assert_eq!(captured_shape, [8, 8, 2, 16, 1]);
+        let input = Tensor::new(vec![1, 16, 2, 8, 8], input_values).unwrap();
+        let weights = SafeTensorFile::open(vae_path).unwrap();
+        let decoder = WanVae::load(&weights).unwrap();
+
+        let scalar_started = Instant::now();
+        let expected = decoder.pre.forward(&input, None).unwrap();
+        let scalar_runtime = scalar_started.elapsed();
+        let before = crate::vulkan::persistence_stats().unwrap();
+        let prepare_started = Instant::now();
+        let prepared = decoder.pre.prepare(&VULKAN_BACKEND).unwrap();
+        let prepare_runtime = prepare_started.elapsed();
+        let after_prepare = crate::vulkan::persistence_stats().unwrap();
+        let device_input = VULKAN_BACKEND.upload_tensor(&input).unwrap();
+        let execute_started = Instant::now();
+        let device_output = decoder
+            .pre
+            .forward_uncached_with_backend(&device_input, &VULKAN_BACKEND, &prepared)
+            .unwrap();
+        let execute_runtime = execute_started.elapsed();
+        let output = VULKAN_BACKEND.download_tensor(&device_output).unwrap();
+        let after = crate::vulkan::persistence_stats().unwrap();
+        let metrics = compare_tensors(&output, &expected).unwrap();
+        metrics
+            .require(ParityTolerance {
+                minimum_cosine_similarity: 0.999_999,
+                maximum_absolute_error: 2e-5,
+                maximum_mean_absolute_error: 2e-6,
+            })
+            .unwrap();
+        assert_eq!(output.shape(), expected.shape());
+        assert_eq!(
+            after_prepare.resident_weight_uploads - before.resident_weight_uploads,
+            1
+        );
+        assert_eq!(
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            1
+        );
+        assert_eq!(after.resident_downloads - before.resident_downloads, 1);
+        println!(
+            "Wan VAE real prelude Conv3D: input={:?} output={:?} cosine={:.9} max_abs={:.9} mean_abs={:.9} scalar_ms={:.3} prepare_ms={:.3} execute_ms={:.3} device_local_bytes={} peak_resident_bytes={}",
+            input.shape(),
+            output.shape(),
+            metrics.cosine_similarity,
+            metrics.maximum_absolute_error,
+            metrics.mean_absolute_error,
+            scalar_runtime.as_secs_f64() * 1_000.0,
+            prepare_runtime.as_secs_f64() * 1_000.0,
+            execute_runtime.as_secs_f64() * 1_000.0,
+            after_prepare.resident_device_local_bytes - before.resident_device_local_bytes,
+            after.peak_resident_allocated_bytes,
+        );
+        crate::vulkan::print_statistics();
+
+        drop(device_output);
+        drop(device_input);
+        drop(prepared);
+        let after_drop = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after_drop.resident_allocated_bytes,
+            before.resident_allocated_bytes
+        );
+        assert_eq!(
+            after_drop.resident_device_local_bytes,
+            before.resident_device_local_bytes
         );
     }
 

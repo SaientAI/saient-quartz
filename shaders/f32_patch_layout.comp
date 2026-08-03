@@ -1,0 +1,78 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float input_values[];
+};
+layout(set = 0, binding = 1, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Parameters {
+    uint operation;
+    uint elements;
+    uint channels;
+    uint time;
+    uint height;
+    uint width;
+    uint patch_time;
+    uint patch_height;
+    uint patch_width;
+    uint output_channels;
+} parameters;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= parameters.elements) {
+        return;
+    }
+
+    uint patch_volume = parameters.patch_time * parameters.patch_height *
+        parameters.patch_width;
+    uint token_time = parameters.time / parameters.patch_time;
+    uint token_height = parameters.height / parameters.patch_height;
+    uint token_width = parameters.width / parameters.patch_width;
+
+    if (parameters.operation == 0u) {
+        // [C,T,H,W] -> [tokens,C*patch_volume], channel-major within each patch.
+        uint feature_width = parameters.channels * patch_volume;
+        uint token = index / feature_width;
+        uint feature = index % feature_width;
+        uint channel = feature / patch_volume;
+        uint patch_index = feature % patch_volume;
+        uint patch_w = patch_index % parameters.patch_width;
+        uint patch_h = (patch_index / parameters.patch_width) % parameters.patch_height;
+        uint patch_t = patch_index /
+            (parameters.patch_width * parameters.patch_height);
+        uint token_w = token % token_width;
+        uint token_h = (token / token_width) % token_height;
+        uint token_t = token / (token_width * token_height);
+        uint source_t = token_t * parameters.patch_time + patch_t;
+        uint source_h = token_h * parameters.patch_height + patch_h;
+        uint source_w = token_w * parameters.patch_width + patch_w;
+        uint source = ((channel * parameters.time + source_t) * parameters.height +
+            source_h) * parameters.width + source_w;
+        output_values[index] = input_values[source];
+        return;
+    }
+
+    // [tokens,output_channels*patch_volume] -> [C,T,H,W]. The head emits
+    // patch-major/channel-minor values, matching Wan's reference reshape.
+    uint output_w = index % parameters.width;
+    uint output_h = (index / parameters.width) % parameters.height;
+    uint output_t = (index / (parameters.width * parameters.height)) % parameters.time;
+    uint channel = index / (parameters.width * parameters.height * parameters.time);
+    uint token_w = output_w / parameters.patch_width;
+    uint token_h = output_h / parameters.patch_height;
+    uint token_t = output_t / parameters.patch_time;
+    uint patch_w = output_w % parameters.patch_width;
+    uint patch_h = output_h % parameters.patch_height;
+    uint patch_t = output_t % parameters.patch_time;
+    uint token = (token_t * token_height + token_h) * token_width + token_w;
+    uint patch_index = (patch_t * parameters.patch_height + patch_h) *
+        parameters.patch_width + patch_w;
+    uint source = token * parameters.output_channels * patch_volume +
+        patch_index * parameters.output_channels + channel;
+    output_values[index] = input_values[source];
+}

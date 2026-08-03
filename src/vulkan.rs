@@ -39,8 +39,27 @@ const RESIDUAL_ADD_SHADER: &[u8] =
 const GEMM_HEADS_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fp16_gemm_heads.spv"));
 const MERGE_HEADS_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fp16_merge_heads.spv"));
 const GEGLU_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fp16_geglu.spv"));
+const ELEMENTWISE_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/f32_elementwise.spv"));
+const CHANNEL_RMSNORM_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/f32_channel_rmsnorm.spv"));
+const RESIDENT_LINEAR_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/f32_f16_linear.spv"));
+const LAYERNORM_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/f32_layernorm.spv"));
+const RMSNORM_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/f32_rmsnorm.spv"));
+const ROPE_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/f32_rope.spv"));
+const F32_ATTENTION_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/f32_attention.spv"));
+const PATCH_LAYOUT_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/f32_patch_layout.spv"));
+const WAN_HEAD_MODULATE_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/f32_wan_head_modulate.spv"));
+const RESIDENT_CONV3D_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/f32_f16_conv3d.spv"));
 static SD_ACCELERATION: AtomicBool = AtomicBool::new(false);
 static RUNTIME: OnceLock<Result<Mutex<VulkanRuntime>, String>> = OnceLock::new();
+#[cfg(test)]
+pub(crate) static PERSISTENCE_TEST_LOCK: Mutex<()> = Mutex::new(());
+const REQUIRED_WORKGROUP_INVOCATIONS: u32 = 256;
+const REQUIRED_SHARED_MEMORY: u32 = 4096 * 4 + 256 * 4;
 
 /// Staged weight loading: when a model's mapping key (the mmap base pointer,
 /// same identity used for `model_mappings`) has an entry here, that model's
@@ -152,16 +171,31 @@ struct KernelStats {
 
 #[derive(Clone, Copy, Default)]
 struct RuntimeStats {
+    elementwise: KernelStats,
+    norm: KernelStats,
     gemm: KernelStats,
     conv2d: KernelStats,
     attention: KernelStats,
     uploaded_bytes: u64,
     cached_weight_bytes: u64,
     peak_dispatch_bytes: u64,
+    resident_weight_uploads: u64,
+    resident_tensor_uploads: u64,
+    resident_downloads: u64,
+    resident_uploaded_bytes: u64,
+    resident_downloaded_bytes: u64,
+    resident_allocated_bytes: u64,
+    peak_resident_allocated_bytes: u64,
+    resident_device_local_bytes: u64,
+    peak_resident_device_local_bytes: u64,
+    resident_device_local_allocation_bytes: u64,
+    peak_resident_device_local_allocation_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
 enum KernelKind {
+    Elementwise,
+    Norm,
     Gemm,
     Conv2d,
     Attention,
@@ -189,6 +223,80 @@ impl DispatchInput<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResidentElementType {
+    F16,
+    F32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResidentClass {
+    Activation,
+    Weight,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BufferMemoryClass {
+    HostVisible,
+    DeviceLocal,
+}
+
+#[derive(Debug)]
+struct ResidentLease {
+    id: u64,
+}
+
+impl Drop for ResidentLease {
+    fn drop(&mut self) {
+        release_resident_buffer(self.id);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResidentTensor {
+    lease: Arc<ResidentLease>,
+    elements: usize,
+    element_type: ResidentElementType,
+}
+
+impl ResidentTensor {
+    fn id(&self) -> u64 {
+        self.lease.id
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResidentLinearWeights {
+    weight: ResidentTensor,
+    bias: ResidentTensor,
+    input_width: usize,
+    output_width: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResidentConv3dWeights {
+    weight: ResidentTensor,
+    bias: ResidentTensor,
+    input_channels: usize,
+    output_channels: usize,
+    kernel: [usize; 3],
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PersistenceStats {
+    pub resident_weight_uploads: u64,
+    pub resident_tensor_uploads: u64,
+    pub resident_downloads: u64,
+    pub resident_uploaded_bytes: u64,
+    pub resident_downloaded_bytes: u64,
+    pub resident_allocated_bytes: u64,
+    pub peak_resident_allocated_bytes: u64,
+    pub resident_device_local_bytes: u64,
+    pub peak_resident_device_local_bytes: u64,
+    pub resident_device_local_allocation_bytes: u64,
+    pub peak_resident_device_local_allocation_bytes: u64,
+}
+
 pub struct BenchmarkResult {
     device: String,
     rows: u32,
@@ -197,6 +305,67 @@ pub struct BenchmarkResult {
     dispatch_milliseconds: f64,
     wall_milliseconds: f64,
     max_error: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeviceProfile {
+    pub device_name: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub driver_version: u32,
+    pub api_version: u32,
+    pub queue_family: u32,
+    pub device_local_memory_bytes: u64,
+    pub available_device_memory_bytes: u64,
+    pub memory_budget_supported: bool,
+    pub max_storage_buffer_bytes: u64,
+    pub max_memory_allocation_bytes: u64,
+    pub max_workgroup_invocations: u32,
+    pub max_workgroup_size: [u32; 3],
+    pub max_workgroup_count: [u32; 3],
+    pub subgroup_size: u32,
+    pub fp16_supported: bool,
+    pub int8_supported: bool,
+    pub integer_dot_product_supported: bool,
+    pub cooperative_matrix_supported: bool,
+    pub storage_buffer_alignment: u64,
+    pub timestamp_supported: bool,
+    pub timestamp_period_nanoseconds: f32,
+    pub external_host_memory_supported: bool,
+}
+
+impl fmt::Display for DeviceProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Quartz Vulkan device: name={:?} vendor=0x{:04x} device=0x{:04x} driver={} api={}.{}.{} queue={} memory={} available={} budget_ext={} max_storage={} max_allocation={} workgroup_invocations={} workgroup_size={:?} workgroup_count={:?} subgroup={} fp16={} int8={} dot={} cooperative_matrix={} storage_alignment={} timestamps={} timestamp_period_ns={} external_host_memory={}",
+            self.device_name,
+            self.vendor_id,
+            self.device_id,
+            self.driver_version,
+            vk::api_version_major(self.api_version),
+            vk::api_version_minor(self.api_version),
+            vk::api_version_patch(self.api_version),
+            self.queue_family,
+            self.device_local_memory_bytes,
+            self.available_device_memory_bytes,
+            self.memory_budget_supported,
+            self.max_storage_buffer_bytes,
+            self.max_memory_allocation_bytes,
+            self.max_workgroup_invocations,
+            self.max_workgroup_size,
+            self.max_workgroup_count,
+            self.subgroup_size,
+            self.fp16_supported,
+            self.int8_supported,
+            self.integer_dot_product_supported,
+            self.cooperative_matrix_supported,
+            self.storage_buffer_alignment,
+            self.timestamp_supported,
+            self.timestamp_period_nanoseconds,
+            self.external_host_memory_supported,
+        )
+    }
 }
 
 impl fmt::Display for BenchmarkResult {
@@ -235,7 +404,13 @@ pub fn print_statistics() {
     };
     let stats = runtime.stats;
     println!(
-        "Vulkan profile: gemm={} calls/{:.3} dispatch/{:.3} wall ms conv={} calls/{:.3} dispatch/{:.3} wall ms attention={} calls/{:.3} dispatch/{:.3} wall ms uploaded={} bytes cached_weights={} bytes peak_dispatch={} bytes",
+        "Vulkan profile: elementwise={} calls/{:.3} dispatch/{:.3} wall ms norm={} calls/{:.3} dispatch/{:.3} wall ms gemm={} calls/{:.3} dispatch/{:.3} wall ms conv={} calls/{:.3} dispatch/{:.3} wall ms attention={} calls/{:.3} dispatch/{:.3} wall ms uploaded={} bytes cached_weights={} bytes peak_dispatch={} bytes resident_weight_uploads={} resident_tensor_uploads={} resident_downloads={} resident_uploaded={} bytes resident_downloaded={} bytes resident_allocated={} bytes peak_resident={} bytes resident_device_local={} bytes peak_device_local={} bytes resident_device_local_allocation={} bytes peak_device_local_allocation={} bytes",
+        stats.elementwise.calls,
+        stats.elementwise.dispatch_milliseconds,
+        stats.elementwise.wall_milliseconds,
+        stats.norm.calls,
+        stats.norm.dispatch_milliseconds,
+        stats.norm.wall_milliseconds,
         stats.gemm.calls,
         stats.gemm.dispatch_milliseconds,
         stats.gemm.wall_milliseconds,
@@ -248,7 +423,44 @@ pub fn print_statistics() {
         stats.uploaded_bytes,
         stats.cached_weight_bytes,
         stats.peak_dispatch_bytes,
+        stats.resident_weight_uploads,
+        stats.resident_tensor_uploads,
+        stats.resident_downloads,
+        stats.resident_uploaded_bytes,
+        stats.resident_downloaded_bytes,
+        stats.resident_allocated_bytes,
+        stats.peak_resident_allocated_bytes,
+        stats.resident_device_local_bytes,
+        stats.peak_resident_device_local_bytes,
+        stats.resident_device_local_allocation_bytes,
+        stats.peak_resident_device_local_allocation_bytes,
     );
+}
+
+pub fn device_profile() -> Result<DeviceProfile> {
+    with_runtime(|runtime| Ok(runtime.profile.clone()))
+}
+
+pub(crate) fn persistence_stats() -> Result<PersistenceStats> {
+    with_runtime(|runtime| {
+        Ok(PersistenceStats {
+            resident_weight_uploads: runtime.stats.resident_weight_uploads,
+            resident_tensor_uploads: runtime.stats.resident_tensor_uploads,
+            resident_downloads: runtime.stats.resident_downloads,
+            resident_uploaded_bytes: runtime.stats.resident_uploaded_bytes,
+            resident_downloaded_bytes: runtime.stats.resident_downloaded_bytes,
+            resident_allocated_bytes: runtime.stats.resident_allocated_bytes,
+            peak_resident_allocated_bytes: runtime.stats.peak_resident_allocated_bytes,
+            resident_device_local_bytes: runtime.stats.resident_device_local_bytes,
+            peak_resident_device_local_bytes: runtime.stats.peak_resident_device_local_bytes,
+            resident_device_local_allocation_bytes: runtime
+                .stats
+                .resident_device_local_allocation_bytes,
+            peak_resident_device_local_allocation_bytes: runtime
+                .stats
+                .peak_resident_device_local_allocation_bytes,
+        })
+    })
 }
 
 /// Release temporary activation buffers after an SD request while retaining
@@ -298,6 +510,896 @@ pub fn probe_external_host_memory(path: &str) -> Result<()> {
     let mapping = unsafe { MmapOptions::new().map(&file) }
         .with_context(|| format!("cannot map host-import probe {path}"))?;
     with_runtime(|runtime| runtime.probe_external_host_pointer(mapping.as_ptr(), mapping.len()))
+}
+
+/// Elementwise FP32 addition. This path never falls back to the CPU: callers
+/// receive a Vulkan initialization or dispatch error if it cannot execute.
+pub fn add(left: &Tensor, right: &Tensor) -> Result<Tensor> {
+    if left.shape() != right.shape() {
+        bail!(
+            "Vulkan add shape mismatch: {:?} vs {:?}",
+            left.shape(),
+            right.shape()
+        );
+    }
+    if left.len() == 0 {
+        return Ok(left.clone());
+    }
+    elementwise(left, right, 0, 0.0, 0.0)
+}
+
+pub fn multiply(left: &Tensor, right: &Tensor) -> Result<Tensor> {
+    if left.shape() != right.shape() {
+        bail!(
+            "Vulkan multiply shape mismatch: {:?} vs {:?}",
+            left.shape(),
+            right.shape()
+        );
+    }
+    elementwise(left, right, 1, 0.0, 0.0)
+}
+
+pub fn scale(input: &Tensor, value: f32) -> Result<Tensor> {
+    elementwise(input, input, 2, value, 0.0)
+}
+
+pub fn silu(input: &Tensor) -> Result<Tensor> {
+    elementwise(input, input, 3, 0.0, 0.0)
+}
+
+pub fn gelu_tanh(input: &Tensor) -> Result<Tensor> {
+    elementwise(input, input, 4, 0.0, 0.0)
+}
+
+pub fn clamp(input: &Tensor, minimum: f32, maximum: f32) -> Result<Tensor> {
+    if !minimum.is_finite() || !maximum.is_finite() || minimum > maximum {
+        bail!("Vulkan clamp bounds must be finite and ordered");
+    }
+    elementwise(input, input, 5, minimum, maximum)
+}
+
+fn elementwise(
+    left: &Tensor,
+    right: &Tensor,
+    operation: u32,
+    parameter0: f32,
+    parameter1: f32,
+) -> Result<Tensor> {
+    if left.len() == 0 {
+        return Ok(left.clone());
+    }
+    let elements = u32::try_from(left.len()).context("Vulkan element count exceeds u32")?;
+    let wall_started = Instant::now();
+    let (output, _) = with_runtime(|runtime| {
+        let result = runtime.elementwise(
+            bytes_of(left.data()),
+            bytes_of(right.data()),
+            elements,
+            operation,
+            parameter0,
+            parameter1,
+        );
+        runtime.stats.elementwise.wall_milliseconds +=
+            wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    })?;
+    Tensor::new(left.shape().to_vec(), output)
+}
+
+pub fn channel_rms_norm_3d(input: &Tensor, weight: &Tensor, epsilon: f32) -> Result<Tensor> {
+    let [batch, channels, time, height, width]: [usize; 5] = input
+        .shape()
+        .try_into()
+        .context("Vulkan channel RMSNorm input must be NCTHW")?;
+    if weight.shape() != [channels] {
+        bail!(
+            "Vulkan channel RMSNorm weight shape {:?} must be [{channels}]",
+            weight.shape()
+        );
+    }
+    if !epsilon.is_finite() || epsilon <= 0.0 {
+        bail!("Vulkan channel RMSNorm epsilon must be positive and finite");
+    }
+    let volume = time
+        .checked_mul(height)
+        .and_then(|value| value.checked_mul(width))
+        .context("Vulkan channel RMSNorm volume overflow")?;
+    let dimensions = [
+        u32::try_from(batch).context("Vulkan RMSNorm batch exceeds u32")?,
+        u32::try_from(channels).context("Vulkan RMSNorm channels exceed u32")?,
+        u32::try_from(volume).context("Vulkan RMSNorm volume exceeds u32")?,
+        epsilon.to_bits(),
+    ];
+    let wall_started = Instant::now();
+    let (output, _) = with_runtime(|runtime| {
+        let result = runtime.channel_rms_norm(
+            bytes_of(input.data()),
+            bytes_of(weight.data()),
+            dimensions,
+            input.len(),
+        );
+        runtime.stats.norm.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    })?;
+    Tensor::new(input.shape().to_vec(), output)
+}
+
+/// Dense model-facing linear layer executed by the FP16-storage Vulkan GEMM
+/// kernel. Narrowing is explicit; GEMM and optional bias addition run on the
+/// Vulkan queue, and the result returns as FP32.
+pub fn linear_tensor(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    if weight.shape().len() != 2 {
+        bail!("Vulkan linear weight must be rank two");
+    }
+    let outputs = weight.shape()[0];
+    let width = weight.shape()[1];
+    if width == 0 || width % 4 != 0 || input.shape().last().copied() != Some(width) {
+        bail!(
+            "Vulkan linear input width {:?} and weight width {width} must match and be divisible by four",
+            input.shape().last()
+        );
+    }
+    if let Some(bias) = bias
+        && bias.shape() != [outputs]
+    {
+        bail!(
+            "Vulkan linear bias shape {:?} must be [{outputs}]",
+            bias.shape()
+        );
+    }
+    let rows = input.len() / width;
+    let rows_u32 = u32::try_from(rows).context("Vulkan linear row count exceeds u32")?;
+    let outputs_u32 = u32::try_from(outputs).context("Vulkan linear output width exceeds u32")?;
+    let width_u32 = u32::try_from(width).context("Vulkan linear input width exceeds u32")?;
+    let input_f16 = input
+        .data()
+        .par_iter()
+        .copied()
+        .map(f32_to_f16)
+        .collect::<Vec<_>>();
+    let weight_f16 = weight
+        .data()
+        .par_iter()
+        .copied()
+        .map(f32_to_f16)
+        .collect::<Vec<_>>();
+    let (output, _) = with_runtime(|runtime| {
+        let (mut output, dispatch_milliseconds) = runtime.matmul(
+            bytes_of(&input_f16),
+            DispatchInput::Upload(bytes_of(&weight_f16)),
+            rows_u32,
+            outputs_u32,
+            width_u32,
+        )?;
+        if let Some(bias) = bias {
+            let wall_started = Instant::now();
+            (output, _) = runtime.bias_add(
+                bytes_of(&output),
+                bytes_of(bias.data()),
+                rows_u32
+                    .checked_mul(outputs_u32)
+                    .context("Vulkan linear output element count overflow")?,
+                outputs_u32,
+            )?;
+            runtime.stats.elementwise.wall_milliseconds +=
+                wall_started.elapsed().as_secs_f64() * 1_000.0;
+        }
+        Ok((output, dispatch_milliseconds))
+    })?;
+    let mut shape = input.shape().to_vec();
+    *shape
+        .last_mut()
+        .context("Vulkan linear input has no shape")? = outputs;
+    Tensor::new(shape, output)
+}
+
+fn resident_tensor(id: u64, elements: usize, element_type: ResidentElementType) -> ResidentTensor {
+    ResidentTensor {
+        lease: Arc::new(ResidentLease { id }),
+        elements,
+        element_type,
+    }
+}
+
+pub(crate) fn upload_resident_tensor(input: &Tensor) -> Result<ResidentTensor> {
+    if input.len() == 0 {
+        bail!("resident Vulkan tensors cannot be empty");
+    }
+    let id = with_runtime(|runtime| {
+        let id = runtime.upload_resident(
+            bytes_of(input.data()),
+            input.len(),
+            ResidentElementType::F32,
+            ResidentClass::Activation,
+        )?;
+        runtime.stats.resident_tensor_uploads += 1;
+        runtime.stats.resident_uploaded_bytes = runtime
+            .stats
+            .resident_uploaded_bytes
+            .saturating_add((input.len() * size_of::<f32>()) as u64);
+        Ok(id)
+    })?;
+    Ok(resident_tensor(id, input.len(), ResidentElementType::F32))
+}
+
+pub(crate) fn download_resident_tensor(input: &ResidentTensor, shape: &[usize]) -> Result<Tensor> {
+    if input.element_type != ResidentElementType::F32 {
+        bail!("only resident FP32 tensors can be downloaded as Quartz tensors");
+    }
+    let expected = shape.iter().try_fold(1usize, |elements, &dimension| {
+        elements.checked_mul(dimension)
+    });
+    if expected != Some(input.elements) {
+        bail!(
+            "resident tensor shape {:?} has {:?} elements, expected {}",
+            shape,
+            expected,
+            input.elements
+        );
+    }
+    let values = with_runtime(|runtime| runtime.download_resident(input.id(), input.elements))?;
+    Tensor::new(shape.to_vec(), values)
+}
+
+pub(crate) fn prepare_resident_linear(
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+) -> Result<ResidentLinearWeights> {
+    let [output_width, input_width]: [usize; 2] = weight
+        .shape()
+        .try_into()
+        .context("resident Vulkan linear weight must be rank two")?;
+    if input_width == 0 || input_width % 4 != 0 || output_width == 0 {
+        bail!("resident Vulkan linear dimensions must be non-zero and width divisible by four");
+    }
+    if let Some(bias) = bias
+        && bias.shape() != [output_width]
+    {
+        bail!(
+            "resident Vulkan linear bias shape {:?} must be [{output_width}]",
+            bias.shape()
+        );
+    }
+    let weight_f16 = weight
+        .data()
+        .par_iter()
+        .copied()
+        .map(f32_to_f16)
+        .collect::<Vec<_>>();
+    let zero_bias;
+    let bias_values = if let Some(bias) = bias {
+        bias.data()
+    } else {
+        zero_bias = vec![0.0; output_width];
+        &zero_bias
+    };
+    let (weight_id, bias_id) = with_runtime(|runtime| {
+        runtime.prepare_resident_linear(
+            bytes_of(&weight_f16),
+            weight.len(),
+            bytes_of(bias_values),
+            bias_values.len(),
+        )
+    })?;
+    Ok(ResidentLinearWeights {
+        weight: resident_tensor(weight_id, weight.len(), ResidentElementType::F16),
+        bias: resident_tensor(bias_id, bias_values.len(), ResidentElementType::F32),
+        input_width,
+        output_width,
+    })
+}
+
+pub(crate) fn prepare_resident_conv3d(
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+) -> Result<ResidentConv3dWeights> {
+    let [
+        output_channels,
+        input_channels,
+        kernel_time,
+        kernel_height,
+        kernel_width,
+    ]: [usize; 5] = weight
+        .shape()
+        .try_into()
+        .context("resident Vulkan Conv3D weight must be rank five")?;
+    if output_channels == 0
+        || input_channels == 0
+        || kernel_time == 0
+        || kernel_height == 0
+        || kernel_width == 0
+    {
+        bail!("resident Vulkan Conv3D weight dimensions must be non-zero");
+    }
+    if let Some(bias) = bias
+        && bias.shape() != [output_channels]
+    {
+        bail!(
+            "resident Vulkan Conv3D bias shape {:?} must be [{output_channels}]",
+            bias.shape()
+        );
+    }
+    let weight_f16 = weight
+        .data()
+        .par_iter()
+        .copied()
+        .map(f32_to_f16)
+        .collect::<Vec<_>>();
+    let zero_bias;
+    let bias_values = if let Some(bias) = bias {
+        bias.data()
+    } else {
+        zero_bias = vec![0.0; output_channels];
+        &zero_bias
+    };
+    let (weight_id, bias_id) = with_runtime(|runtime| {
+        runtime.prepare_resident_linear(
+            bytes_of(&weight_f16),
+            weight.len(),
+            bytes_of(bias_values),
+            bias_values.len(),
+        )
+    })?;
+    Ok(ResidentConv3dWeights {
+        weight: resident_tensor(weight_id, weight.len(), ResidentElementType::F16),
+        bias: resident_tensor(bias_id, bias_values.len(), ResidentElementType::F32),
+        input_channels,
+        output_channels,
+        kernel: [kernel_time, kernel_height, kernel_width],
+    })
+}
+
+pub(crate) fn resident_linear(
+    input: &ResidentTensor,
+    weights: &ResidentLinearWeights,
+) -> Result<ResidentTensor> {
+    if input.element_type != ResidentElementType::F32 {
+        bail!("resident Vulkan linear input must be FP32");
+    }
+    if input.elements % weights.input_width != 0 {
+        bail!("resident Vulkan linear input is not divisible into complete rows");
+    }
+    let rows = input.elements / weights.input_width;
+    let output_elements = rows
+        .checked_mul(weights.output_width)
+        .context("resident Vulkan linear output size overflow")?;
+    let id = with_runtime(|runtime| {
+        runtime.resident_linear(
+            input.id(),
+            weights.weight.id(),
+            weights.bias.id(),
+            u32::try_from(rows).context("resident Vulkan linear rows exceed u32")?,
+            u32::try_from(weights.output_width)
+                .context("resident Vulkan linear outputs exceed u32")?,
+            u32::try_from(weights.input_width)
+                .context("resident Vulkan linear width exceeds u32")?,
+        )
+    })?;
+    Ok(resident_tensor(
+        id,
+        output_elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_conv3d(
+    input: &ResidentTensor,
+    weights: &ResidentConv3dWeights,
+    input_shape: [usize; 5],
+    padding_before: [usize; 3],
+    padding_after: [usize; 3],
+) -> Result<ResidentTensor> {
+    let [batch, input_channels, input_time, input_height, input_width] = input_shape;
+    if input.element_type != ResidentElementType::F32
+        || input_channels != weights.input_channels
+        || input.elements != batch * input_channels * input_time * input_height * input_width
+    {
+        bail!("resident Vulkan Conv3D input storage does not match its dimensions");
+    }
+    let input_axes = [input_time, input_height, input_width];
+    let mut output_axes = [0; 3];
+    for axis in 0..3 {
+        let padded = input_axes[axis]
+            .checked_add(padding_before[axis])
+            .and_then(|value| value.checked_add(padding_after[axis]))
+            .context("resident Vulkan Conv3D padded dimension overflow")?;
+        if padded < weights.kernel[axis] {
+            bail!("resident Vulkan Conv3D kernel exceeds padded input");
+        }
+        output_axes[axis] = padded - weights.kernel[axis] + 1;
+    }
+    let output_elements = batch
+        .checked_mul(weights.output_channels)
+        .and_then(|value| value.checked_mul(output_axes[0]))
+        .and_then(|value| value.checked_mul(output_axes[1]))
+        .and_then(|value| value.checked_mul(output_axes[2]))
+        .context("resident Vulkan Conv3D output size overflow")?;
+    let dimensions = [
+        batch,
+        input_channels,
+        input_time,
+        input_height,
+        input_width,
+        weights.output_channels,
+        weights.kernel[0],
+        weights.kernel[1],
+        weights.kernel[2],
+        padding_before[0],
+        padding_before[1],
+        padding_before[2],
+        output_axes[0],
+        output_axes[1],
+        output_axes[2],
+    ]
+    .map(u32::try_from)
+    .into_iter()
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .context("resident Vulkan Conv3D dimensions exceed u32")?;
+    let id = with_runtime(|runtime| {
+        runtime.resident_conv3d(
+            input.id(),
+            weights.weight.id(),
+            weights.bias.id(),
+            dimensions
+                .as_slice()
+                .try_into()
+                .expect("15 Conv3D dimensions"),
+            output_elements,
+        )
+    })?;
+    Ok(resident_tensor(
+        id,
+        output_elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_silu(input: &ResidentTensor) -> Result<ResidentTensor> {
+    if input.element_type != ResidentElementType::F32 {
+        bail!("resident Vulkan SiLU input must be FP32");
+    }
+    let elements = u32::try_from(input.elements).context("resident Vulkan SiLU exceeds u32")?;
+    let id = with_runtime(|runtime| runtime.resident_silu(input.id(), elements))?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_gelu_tanh(input: &ResidentTensor) -> Result<ResidentTensor> {
+    if input.element_type != ResidentElementType::F32 {
+        bail!("resident Vulkan GELU input must be FP32");
+    }
+    let elements = u32::try_from(input.elements).context("resident Vulkan GELU exceeds u32")?;
+    let id = with_runtime(|runtime| runtime.resident_gelu_tanh(input.id(), elements))?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_scale(input: &ResidentTensor, value: f32) -> Result<ResidentTensor> {
+    if input.element_type != ResidentElementType::F32 || !value.is_finite() {
+        bail!("resident Vulkan scale requires FP32 input and a finite value");
+    }
+    let elements = u32::try_from(input.elements).context("resident Vulkan scale exceeds u32")?;
+    let id = with_runtime(|runtime| runtime.resident_scale(input.id(), elements, value))?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_patchify(
+    input: &ResidentTensor,
+    channels: usize,
+    time: usize,
+    height: usize,
+    width: usize,
+    patch: (usize, usize, usize),
+) -> Result<ResidentTensor> {
+    let (patch_time, patch_height, patch_width) = patch;
+    let elements = channels
+        .checked_mul(time)
+        .and_then(|value| value.checked_mul(height))
+        .and_then(|value| value.checked_mul(width))
+        .context("resident patchify element count overflow")?;
+    if input.element_type != ResidentElementType::F32 || input.elements != elements {
+        bail!("resident patchify input storage does not match its dimensions");
+    }
+    let id = with_runtime(|runtime| {
+        runtime.resident_patch_layout(
+            input.id(),
+            0,
+            u32::try_from(elements).context("resident patchify elements exceed u32")?,
+            u32::try_from(channels).context("resident patchify channels exceed u32")?,
+            u32::try_from(time).context("resident patchify time exceeds u32")?,
+            u32::try_from(height).context("resident patchify height exceeds u32")?,
+            u32::try_from(width).context("resident patchify width exceeds u32")?,
+            u32::try_from(patch_time).context("resident patchify patch time exceeds u32")?,
+            u32::try_from(patch_height).context("resident patchify patch height exceeds u32")?,
+            u32::try_from(patch_width).context("resident patchify patch width exceeds u32")?,
+            0,
+        )
+    })?;
+    Ok(resident_tensor(id, elements, ResidentElementType::F32))
+}
+
+pub(crate) fn resident_unpatchify(
+    input: &ResidentTensor,
+    output_channels: usize,
+    time: usize,
+    height: usize,
+    width: usize,
+    patch: (usize, usize, usize),
+) -> Result<ResidentTensor> {
+    let elements = output_channels
+        .checked_mul(time)
+        .and_then(|value| value.checked_mul(height))
+        .and_then(|value| value.checked_mul(width))
+        .context("resident unpatchify element count overflow")?;
+    if input.element_type != ResidentElementType::F32 || input.elements != elements {
+        bail!("resident unpatchify input storage does not match its output dimensions");
+    }
+    let (patch_time, patch_height, patch_width) = patch;
+    let id = with_runtime(|runtime| {
+        runtime.resident_patch_layout(
+            input.id(),
+            1,
+            u32::try_from(elements).context("resident unpatchify elements exceed u32")?,
+            0,
+            u32::try_from(time).context("resident unpatchify time exceeds u32")?,
+            u32::try_from(height).context("resident unpatchify height exceeds u32")?,
+            u32::try_from(width).context("resident unpatchify width exceeds u32")?,
+            u32::try_from(patch_time).context("resident unpatchify patch time exceeds u32")?,
+            u32::try_from(patch_height).context("resident unpatchify patch height exceeds u32")?,
+            u32::try_from(patch_width).context("resident unpatchify patch width exceeds u32")?,
+            u32::try_from(output_channels)
+                .context("resident unpatchify output channels exceed u32")?,
+        )
+    })?;
+    Ok(resident_tensor(id, elements, ResidentElementType::F32))
+}
+
+pub(crate) fn resident_wan_head_modulate(
+    input: &ResidentTensor,
+    timestep: &ResidentTensor,
+    modulation: &ResidentTensor,
+    width: usize,
+) -> Result<ResidentTensor> {
+    if input.element_type != ResidentElementType::F32
+        || timestep.element_type != ResidentElementType::F32
+        || modulation.element_type != ResidentElementType::F32
+        || width == 0
+        || input.elements % width != 0
+        || timestep.elements != width
+        || modulation.elements != 2 * width
+    {
+        bail!("resident Wan head modulation storage or dimensions are invalid");
+    }
+    let id = with_runtime(|runtime| {
+        runtime.resident_wan_head_modulate(
+            input.id(),
+            timestep.id(),
+            modulation.id(),
+            u32::try_from(input.elements).context("resident Wan head elements exceed u32")?,
+            u32::try_from(width).context("resident Wan head width exceeds u32")?,
+        )
+    })?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn prepare_resident_vector(vector: &Tensor) -> Result<ResidentTensor> {
+    let [elements]: [usize; 1] = vector
+        .shape()
+        .try_into()
+        .context("resident Vulkan vector must be rank one")?;
+    if elements == 0 {
+        bail!("resident Vulkan vector cannot be empty");
+    }
+    let id =
+        with_runtime(|runtime| runtime.prepare_resident_vector(bytes_of(vector.data()), elements))?;
+    Ok(resident_tensor(id, elements, ResidentElementType::F32))
+}
+
+pub(crate) fn resident_add_vector(
+    input: &ResidentTensor,
+    vector: &ResidentTensor,
+) -> Result<ResidentTensor> {
+    if input.elements != vector.elements {
+        bail!(
+            "resident Vulkan add-vector lengths differ: {} vs {}",
+            input.elements,
+            vector.elements
+        );
+    }
+    let elements =
+        u32::try_from(input.elements).context("resident add-vector length exceeds u32")?;
+    let id =
+        with_runtime(|runtime| runtime.resident_add_vector(input.id(), vector.id(), elements))?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_add(
+    left: &ResidentTensor,
+    right: &ResidentTensor,
+) -> Result<ResidentTensor> {
+    resident_add_vector(left, right)
+}
+
+pub(crate) fn resident_layer_norm(
+    input: &ResidentTensor,
+    affine: Option<(&ResidentTensor, &ResidentTensor)>,
+    width: usize,
+    epsilon: f32,
+) -> Result<ResidentTensor> {
+    if width == 0 || input.elements % width != 0 {
+        bail!("resident Vulkan LayerNorm input is not divisible into complete rows");
+    }
+    let rows = input.elements / width;
+    let affine_ids = affine.map(|(weight, bias)| (weight.id(), bias.id()));
+    let id = with_runtime(|runtime| {
+        runtime.resident_layer_norm(
+            input.id(),
+            affine_ids,
+            u32::try_from(rows).context("resident LayerNorm row count exceeds u32")?,
+            u32::try_from(width).context("resident LayerNorm width exceeds u32")?,
+            epsilon,
+        )
+    })?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_rms_norm(
+    input: &ResidentTensor,
+    weight: &ResidentTensor,
+    width: usize,
+    epsilon: f32,
+) -> Result<ResidentTensor> {
+    if width == 0 || input.elements % width != 0 {
+        bail!("resident Vulkan RMSNorm input is not divisible into complete rows");
+    }
+    if weight.elements != width {
+        bail!("resident Vulkan RMSNorm weight does not match the final axis");
+    }
+    let rows = input.elements / width;
+    let id = with_runtime(|runtime| {
+        runtime.resident_rms_norm(
+            input.id(),
+            weight.id(),
+            u32::try_from(rows).context("resident RMSNorm row count exceeds u32")?,
+            u32::try_from(width).context("resident RMSNorm width exceeds u32")?,
+            epsilon,
+        )
+    })?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_rope(
+    input: &ResidentTensor,
+    positions: &ResidentTensor,
+    rows: usize,
+    heads: usize,
+    head_dim: usize,
+) -> Result<ResidentTensor> {
+    let width = heads
+        .checked_mul(head_dim)
+        .context("resident RoPE width overflow")?;
+    let expected_input = rows
+        .checked_mul(width)
+        .context("resident RoPE input size overflow")?;
+    let expected_positions = rows
+        .checked_mul(head_dim / 2)
+        .and_then(|values| values.checked_mul(4))
+        .context("resident RoPE position size overflow")?;
+    if head_dim == 0 || head_dim % 2 != 0 || input.elements != expected_input {
+        bail!("resident Vulkan RoPE dimensions do not match the input");
+    }
+    if positions.elements != expected_positions {
+        bail!("resident Vulkan RoPE position tensor has the wrong size");
+    }
+    let id = with_runtime(|runtime| {
+        runtime.resident_rope(
+            input.id(),
+            positions.id(),
+            u32::try_from(rows).context("resident RoPE row count exceeds u32")?,
+            u32::try_from(heads).context("resident RoPE head count exceeds u32")?,
+            u32::try_from(head_dim).context("resident RoPE head dimension exceeds u32")?,
+        )
+    })?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_attention_scores(
+    query: &ResidentTensor,
+    key: &ResidentTensor,
+    queries: usize,
+    keys: usize,
+    heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Result<ResidentTensor> {
+    let width = heads
+        .checked_mul(head_dim)
+        .context("resident attention score width overflow")?;
+    if query.elements != queries.saturating_mul(width) || key.elements != keys.saturating_mul(width)
+    {
+        bail!("resident Vulkan attention score inputs have the wrong size");
+    }
+    let output_elements = heads
+        .checked_mul(queries)
+        .and_then(|values| values.checked_mul(keys))
+        .context("resident attention score size overflow")?;
+    let id = with_runtime(|runtime| {
+        runtime.resident_attention_scores(
+            query.id(),
+            key.id(),
+            u32::try_from(queries).context("resident attention queries exceed u32")?,
+            u32::try_from(keys).context("resident attention keys exceed u32")?,
+            u32::try_from(heads).context("resident attention heads exceed u32")?,
+            u32::try_from(head_dim).context("resident attention head dimension exceeds u32")?,
+            scale,
+        )
+    })?;
+    Ok(resident_tensor(
+        id,
+        output_elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_softmax(
+    input: &ResidentTensor,
+    rows: usize,
+    width: usize,
+) -> Result<ResidentTensor> {
+    if rows == 0 || width == 0 || input.elements != rows.saturating_mul(width) {
+        bail!("resident Vulkan softmax dimensions do not match the input");
+    }
+    let id = with_runtime(|runtime| {
+        runtime.resident_softmax(
+            input.id(),
+            u32::try_from(rows).context("resident softmax rows exceed u32")?,
+            u32::try_from(width).context("resident softmax width exceeds u32")?,
+        )
+    })?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_attention_values(
+    probabilities: &ResidentTensor,
+    value: &ResidentTensor,
+    queries: usize,
+    keys: usize,
+    heads: usize,
+    head_dim: usize,
+) -> Result<ResidentTensor> {
+    let width = heads
+        .checked_mul(head_dim)
+        .context("resident attention value width overflow")?;
+    let probability_elements = heads
+        .checked_mul(queries)
+        .and_then(|values| values.checked_mul(keys))
+        .context("resident attention probability size overflow")?;
+    if probabilities.elements != probability_elements
+        || value.elements != keys.saturating_mul(width)
+    {
+        bail!("resident Vulkan attention value inputs have the wrong size");
+    }
+    let output_elements = queries
+        .checked_mul(width)
+        .context("resident attention output size overflow")?;
+    let id = with_runtime(|runtime| {
+        runtime.resident_attention_values(
+            probabilities.id(),
+            value.id(),
+            u32::try_from(queries).context("resident attention queries exceed u32")?,
+            u32::try_from(keys).context("resident attention keys exceed u32")?,
+            u32::try_from(heads).context("resident attention heads exceed u32")?,
+            u32::try_from(head_dim).context("resident attention head dimension exceeds u32")?,
+        )
+    })?;
+    Ok(resident_tensor(
+        id,
+        output_elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_wan_modulate(
+    input: &ResidentTensor,
+    modulation: &ResidentTensor,
+    width: usize,
+    shift_chunk: usize,
+    scale_chunk: usize,
+) -> Result<ResidentTensor> {
+    if width == 0 || input.elements % width != 0 {
+        bail!("resident Wan modulation input is not divisible into complete rows");
+    }
+    let required_chunks = shift_chunk.max(scale_chunk) + 1;
+    if modulation.elements < required_chunks.saturating_mul(width) {
+        bail!("resident Wan modulation does not contain every requested chunk");
+    }
+    let id = with_runtime(|runtime| {
+        runtime.resident_wan_modulate(
+            input.id(),
+            modulation.id(),
+            u32::try_from(input.elements).context("resident modulation length exceeds u32")?,
+            u32::try_from(width).context("resident modulation width exceeds u32")?,
+            u32::try_from(shift_chunk).context("resident shift chunk exceeds u32")?,
+            u32::try_from(scale_chunk).context("resident scale chunk exceeds u32")?,
+        )
+    })?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_multiply_vector_chunk(
+    input: &ResidentTensor,
+    vector: &ResidentTensor,
+    width: usize,
+    chunk: usize,
+) -> Result<ResidentTensor> {
+    if width == 0 || input.elements % width != 0 {
+        bail!("resident vector multiply input is not divisible into complete rows");
+    }
+    if vector.elements < (chunk + 1).saturating_mul(width) {
+        bail!("resident vector multiply tensor does not contain the requested chunk");
+    }
+    let id = with_runtime(|runtime| {
+        runtime.resident_multiply_vector_chunk(
+            input.id(),
+            vector.id(),
+            u32::try_from(input.elements).context("resident vector multiply length exceeds u32")?,
+            u32::try_from(width).context("resident vector multiply width exceeds u32")?,
+            u32::try_from(chunk).context("resident vector multiply chunk exceeds u32")?,
+        )
+    })?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+fn release_resident_buffer(id: u64) {
+    let Some(Ok(runtime)) = RUNTIME.get() else {
+        return;
+    };
+    let Ok(mut runtime) = runtime.lock() else {
+        return;
+    };
+    runtime.release_resident(id);
 }
 
 /// Linear projection from an f32 CPU tensor through mapped FP16 weights.
@@ -886,6 +1988,119 @@ fn with_runtime<T>(operation: impl FnOnce(&mut VulkanRuntime) -> Result<T>) -> R
     operation(&mut runtime)
 }
 
+fn select_physical_device(
+    instance: &ash::Instance,
+) -> Result<(vk::PhysicalDevice, vk::PhysicalDeviceProperties, u32)> {
+    let physical_devices = unsafe { instance.enumerate_physical_devices() }
+        .map_err(|error| anyhow!("cannot enumerate Vulkan devices: {error:?}"))?;
+    if physical_devices.is_empty() {
+        bail!("no Vulkan physical device");
+    }
+    let requested = std::env::var("QUARTZ_VULKAN_DEVICE").ok();
+    let requested_index = requested
+        .as_deref()
+        .and_then(|value| value.parse::<usize>().ok());
+    let requested_name = requested.as_deref().map(str::to_ascii_lowercase);
+    let mut candidates = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    for (index, physical) in physical_devices.into_iter().enumerate() {
+        let properties = unsafe { instance.get_physical_device_properties(physical) };
+        let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let selected_by_override = requested.is_none()
+            || requested_index == Some(index)
+            || requested_name
+                .as_ref()
+                .is_some_and(|wanted| name.to_ascii_lowercase().contains(wanted));
+        if !selected_by_override {
+            diagnostics.push(format!("[{index}] {name:?}: not selected by override"));
+            continue;
+        }
+
+        let queue_families =
+            unsafe { instance.get_physical_device_queue_family_properties(physical) };
+        let queue_family = queue_families
+            .iter()
+            .enumerate()
+            .filter(|(_, family)| family.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            .min_by_key(|(_, family)| {
+                u8::from(family.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            })
+            .map(|(index, _)| index as u32);
+        let Some(queue_family) = queue_family else {
+            diagnostics.push(format!("[{index}] {name:?}: no compute queue"));
+            continue;
+        };
+
+        let mut storage_support = vk::PhysicalDevice16BitStorageFeatures::default();
+        let mut float_support = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+        let mut features = vk::PhysicalDeviceFeatures2::builder()
+            .push_next(&mut storage_support)
+            .push_next(&mut float_support)
+            .build();
+        unsafe { instance.get_physical_device_features2(physical, &mut features) };
+        if storage_support.storage_buffer16_bit_access == 0 || float_support.shader_float16 == 0 {
+            diagnostics.push(format!("[{index}] {name:?}: no FP16 arithmetic/storage"));
+            continue;
+        }
+        if properties.limits.max_compute_work_group_invocations < REQUIRED_WORKGROUP_INVOCATIONS
+            || properties.limits.max_compute_work_group_size[0] < REQUIRED_WORKGROUP_INVOCATIONS
+            || properties.limits.max_compute_shared_memory_size < REQUIRED_SHARED_MEMORY
+        {
+            diagnostics.push(format!("[{index}] {name:?}: insufficient compute limits"));
+            continue;
+        }
+
+        let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
+        let device_local_bytes = memory_properties.memory_heaps
+            [..memory_properties.memory_heap_count as usize]
+            .iter()
+            .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|heap| heap.size)
+            .sum::<u64>();
+        let device_type_priority = match properties.device_type {
+            vk::PhysicalDeviceType::DISCRETE_GPU => 4u8,
+            vk::PhysicalDeviceType::INTEGRATED_GPU => 3,
+            vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+            vk::PhysicalDeviceType::CPU => 1,
+            _ => 0,
+        };
+        diagnostics.push(format!(
+            "[{index}] {name:?}: usable type={} local_memory={device_local_bytes}",
+            properties.device_type.as_raw()
+        ));
+        candidates.push((
+            (device_type_priority, device_local_bytes, usize::MAX - index),
+            physical,
+            properties,
+            queue_family,
+        ));
+    }
+
+    let Some((_, physical, properties, queue_family)) =
+        candidates.into_iter().max_by_key(|candidate| candidate.0)
+    else {
+        let override_description = requested
+            .map(|value| format!(" matching QUARTZ_VULKAN_DEVICE={value:?}"))
+            .unwrap_or_default();
+        bail!(
+            "no usable Vulkan compute device{override_description}; candidates: {}",
+            diagnostics.join("; ")
+        );
+    };
+    Ok((physical, properties, queue_family))
+}
+
+struct ResidentBuffer {
+    buffer: Buffer,
+    logical_bytes: usize,
+    elements: usize,
+    element_type: ResidentElementType,
+    class: ResidentClass,
+}
+
 struct VulkanRuntime {
     _entry: Entry,
     instance: ash::Instance,
@@ -904,11 +2119,24 @@ struct VulkanRuntime {
     gemm_heads_pipeline: vk::Pipeline,
     merge_heads_pipeline: vk::Pipeline,
     geglu_pipeline: vk::Pipeline,
+    elementwise_pipeline: vk::Pipeline,
+    channel_rmsnorm_pipeline: vk::Pipeline,
+    resident_linear_pipeline: vk::Pipeline,
+    layernorm_pipeline: vk::Pipeline,
+    rmsnorm_pipeline: vk::Pipeline,
+    rope_pipeline: vk::Pipeline,
+    f32_attention_pipeline: vk::Pipeline,
+    patch_layout_pipeline: vk::Pipeline,
+    wan_head_modulate_pipeline: vk::Pipeline,
+    resident_conv3d_pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
     command_pool: vk::CommandPool,
     device_name: String,
+    profile: DeviceProfile,
     stats: RuntimeStats,
     buffers: [Option<Buffer>; 8],
+    resident_buffers: HashMap<u64, ResidentBuffer>,
+    next_resident_id: u64,
     external_host: Option<vk::ExtExternalMemoryHostFn>,
     external_host_alignment: u64,
     storage_buffer_alignment: u64,
@@ -930,35 +2158,12 @@ impl VulkanRuntime {
             .map_err(|error| anyhow!("vkCreateInstance failed: {error:?}"))?;
 
         let setup = (|| -> Result<_> {
-            let physical_devices = unsafe { instance.enumerate_physical_devices() }
-                .map_err(|error| anyhow!("cannot enumerate Vulkan devices: {error:?}"))?;
-            let physical = *physical_devices
-                .first()
-                .context("no Vulkan physical device")?;
-            let properties = unsafe { instance.get_physical_device_properties(physical) };
+            let (physical, properties, queue_family) = select_physical_device(&instance)?;
             let device_name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
-            const REQUIRED_WORKGROUP_INVOCATIONS: u32 = 256;
-            const REQUIRED_SHARED_MEMORY: u32 = 4096 * 4 + 256 * 4;
-            if properties.limits.max_compute_work_group_invocations < REQUIRED_WORKGROUP_INVOCATIONS
-                || properties.limits.max_compute_work_group_size[0] < REQUIRED_WORKGROUP_INVOCATIONS
-                || properties.limits.max_compute_shared_memory_size < REQUIRED_SHARED_MEMORY
-            {
-                bail!(
-                    "Vulkan device {device_name:?} is below the Quartz SD compute limits: workgroup_invocations={} workgroup_x={} shared_memory={} (need 256, 256, {REQUIRED_SHARED_MEMORY})",
-                    properties.limits.max_compute_work_group_invocations,
-                    properties.limits.max_compute_work_group_size[0],
-                    properties.limits.max_compute_shared_memory_size,
-                );
-            }
             let queue_families =
                 unsafe { instance.get_physical_device_queue_family_properties(physical) };
-            let queue_family = queue_families
-                .iter()
-                .position(|family| family.queue_flags.contains(vk::QueueFlags::COMPUTE))
-                .context("Vulkan device has no compute queue")?
-                as u32;
 
             let mut storage_support = vk::PhysicalDevice16BitStorageFeatures::default();
             let mut float_support = vk::PhysicalDeviceShaderFloat16Int8Features::default();
@@ -985,6 +2190,12 @@ impl VulkanRuntime {
                 .build();
             let extensions = unsafe { instance.enumerate_device_extension_properties(physical) }
                 .map_err(|error| anyhow!("cannot enumerate Vulkan device extensions: {error:?}"))?;
+            let has_extension = |wanted: &[u8]| {
+                extensions.iter().any(|extension| {
+                    let name = unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) };
+                    name.to_bytes() == wanted
+                })
+            };
             let external_host_supported = extensions.iter().any(|extension| {
                 let name = unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) };
                 name == vk::ExtExternalMemoryHostFn::name()
@@ -997,14 +2208,88 @@ impl VulkanRuntime {
                     .build();
                 unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
             }
-            if std::env::var("QUARTZ_DEBUG_ARENA_SIZE").is_ok() {
-                let mut maintenance3 = vk::PhysicalDeviceMaintenance3Properties::default();
-                let mut properties2 = vk::PhysicalDeviceProperties2::builder()
-                    .push_next(&mut maintenance3)
+
+            let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+            let mut maintenance3 = vk::PhysicalDeviceMaintenance3Properties::default();
+            let mut properties2 = vk::PhysicalDeviceProperties2::builder()
+                .push_next(&mut subgroup)
+                .push_next(&mut maintenance3)
+                .build();
+            unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
+
+            let dot_extension = has_extension(b"VK_KHR_shader_integer_dot_product");
+            let dot_core = properties.api_version >= vk::API_VERSION_1_3;
+            let integer_dot_product_supported = if dot_core || dot_extension {
+                let mut dot_support = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+                let mut dot_features = vk::PhysicalDeviceFeatures2::builder()
+                    .push_next(&mut dot_support)
                     .build();
-                unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
-                let memory_properties =
-                    unsafe { instance.get_physical_device_memory_properties(physical) };
+                unsafe { instance.get_physical_device_features2(physical, &mut dot_features) };
+                dot_support.shader_integer_dot_product != 0
+            } else {
+                false
+            };
+            let cooperative_matrix_supported = has_extension(b"VK_KHR_cooperative_matrix")
+                || has_extension(b"VK_NV_cooperative_matrix");
+
+            let memory_properties =
+                unsafe { instance.get_physical_device_memory_properties(physical) };
+            let memory_budget_supported = has_extension(b"VK_EXT_memory_budget");
+            let mut memory_budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+            if memory_budget_supported {
+                let mut memory_properties2 = vk::PhysicalDeviceMemoryProperties2::builder()
+                    .push_next(&mut memory_budget)
+                    .build();
+                unsafe {
+                    instance
+                        .get_physical_device_memory_properties2(physical, &mut memory_properties2)
+                };
+            }
+            let mut device_local_memory_bytes = 0u64;
+            let mut available_device_memory_bytes = 0u64;
+            for index in 0..memory_properties.memory_heap_count as usize {
+                let heap = memory_properties.memory_heaps[index];
+                if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                    device_local_memory_bytes = device_local_memory_bytes.saturating_add(heap.size);
+                    let available = if memory_budget_supported {
+                        memory_budget.heap_budget[index]
+                            .saturating_sub(memory_budget.heap_usage[index])
+                    } else {
+                        heap.size
+                    };
+                    available_device_memory_bytes =
+                        available_device_memory_bytes.saturating_add(available);
+                }
+            }
+            let timestamp_supported =
+                queue_families[queue_family as usize].timestamp_valid_bits > 0;
+            let profile = DeviceProfile {
+                device_name: device_name.clone(),
+                vendor_id: properties.vendor_id,
+                device_id: properties.device_id,
+                driver_version: properties.driver_version,
+                api_version: properties.api_version,
+                queue_family,
+                device_local_memory_bytes,
+                available_device_memory_bytes,
+                memory_budget_supported,
+                max_storage_buffer_bytes: properties.limits.max_storage_buffer_range as u64,
+                max_memory_allocation_bytes: maintenance3.max_memory_allocation_size,
+                max_workgroup_invocations: properties.limits.max_compute_work_group_invocations,
+                max_workgroup_size: properties.limits.max_compute_work_group_size,
+                max_workgroup_count: properties.limits.max_compute_work_group_count,
+                subgroup_size: subgroup.subgroup_size,
+                fp16_supported: float_support.shader_float16 != 0
+                    && storage_support.storage_buffer16_bit_access != 0,
+                int8_supported: float_support.shader_int8 != 0,
+                integer_dot_product_supported,
+                cooperative_matrix_supported,
+                storage_buffer_alignment: properties.limits.min_storage_buffer_offset_alignment,
+                timestamp_supported,
+                timestamp_period_nanoseconds: properties.limits.timestamp_period,
+                external_host_memory_supported: external_host_supported,
+            };
+            if std::env::var("QUARTZ_DEBUG_ARENA_SIZE").is_ok() {
                 eprintln!(
                     "Quartz Vulkan: maxMemoryAllocationSize={} bytes",
                     maintenance3.max_memory_allocation_size
@@ -1034,7 +2319,7 @@ impl VulkanRuntime {
                 physical,
                 device,
                 queue_family,
-                device_name,
+                profile,
                 external_host_supported,
                 external_host_properties.min_imported_host_pointer_alignment,
                 properties.limits.min_storage_buffer_offset_alignment,
@@ -1044,7 +2329,7 @@ impl VulkanRuntime {
             physical,
             device,
             queue_family,
-            device_name,
+            mut profile,
             external_host_supported,
             external_host_alignment,
             storage_buffer_alignment,
@@ -1058,6 +2343,8 @@ impl VulkanRuntime {
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let external_host_supported =
             external_host_supported && std::env::var("QUARTZ_VULKAN_NO_HOST_IMPORT").is_err();
+        profile.external_host_memory_supported = external_host_supported;
+        let device_name = profile.device_name.clone();
         let external_host = external_host_supported.then(|| {
             vk::ExtExternalMemoryHostFn::load(|name| {
                 unsafe { instance.get_device_proc_addr(device.handle(), name.as_ptr()) }
@@ -1082,17 +2369,31 @@ impl VulkanRuntime {
             gemm_heads_pipeline: vk::Pipeline::null(),
             merge_heads_pipeline: vk::Pipeline::null(),
             geglu_pipeline: vk::Pipeline::null(),
+            elementwise_pipeline: vk::Pipeline::null(),
+            channel_rmsnorm_pipeline: vk::Pipeline::null(),
+            resident_linear_pipeline: vk::Pipeline::null(),
+            layernorm_pipeline: vk::Pipeline::null(),
+            rmsnorm_pipeline: vk::Pipeline::null(),
+            rope_pipeline: vk::Pipeline::null(),
+            f32_attention_pipeline: vk::Pipeline::null(),
+            patch_layout_pipeline: vk::Pipeline::null(),
+            wan_head_modulate_pipeline: vk::Pipeline::null(),
+            resident_conv3d_pipeline: vk::Pipeline::null(),
             descriptor_pool: vk::DescriptorPool::null(),
             command_pool: vk::CommandPool::null(),
             device_name,
+            profile,
             stats: RuntimeStats::default(),
             buffers: std::array::from_fn(|_| None),
+            resident_buffers: HashMap::new(),
+            next_resident_id: 1,
             external_host,
             external_host_alignment,
             storage_buffer_alignment,
             model_mappings: HashMap::new(),
         };
         runtime.initialize_resources()?;
+        eprintln!("{}", runtime.profile);
         Ok(runtime)
     }
 
@@ -1202,6 +2503,16 @@ impl VulkanRuntime {
         self.gemm_heads_pipeline = self.create_pipeline(GEMM_HEADS_SHADER)?;
         self.merge_heads_pipeline = self.create_pipeline(MERGE_HEADS_SHADER)?;
         self.geglu_pipeline = self.create_pipeline(GEGLU_SHADER)?;
+        self.elementwise_pipeline = self.create_pipeline(ELEMENTWISE_SHADER)?;
+        self.channel_rmsnorm_pipeline = self.create_pipeline(CHANNEL_RMSNORM_SHADER)?;
+        self.resident_linear_pipeline = self.create_pipeline(RESIDENT_LINEAR_SHADER)?;
+        self.layernorm_pipeline = self.create_pipeline(LAYERNORM_SHADER)?;
+        self.rmsnorm_pipeline = self.create_pipeline(RMSNORM_SHADER)?;
+        self.rope_pipeline = self.create_pipeline(ROPE_SHADER)?;
+        self.f32_attention_pipeline = self.create_pipeline(F32_ATTENTION_SHADER)?;
+        self.patch_layout_pipeline = self.create_pipeline(PATCH_LAYOUT_SHADER)?;
+        self.wan_head_modulate_pipeline = self.create_pipeline(WAN_HEAD_MODULATE_SHADER)?;
+        self.resident_conv3d_pipeline = self.create_pipeline(RESIDENT_CONV3D_SHADER)?;
 
         let pool_size = [vk::DescriptorPoolSize::builder()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
@@ -1273,6 +2584,1071 @@ impl VulkanRuntime {
         );
         self.stats.gemm.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
         result
+    }
+
+    fn elementwise(
+        &mut self,
+        left: &[u8],
+        right: &[u8],
+        elements: u32,
+        operation: u32,
+        parameter0: f32,
+        parameter1: f32,
+    ) -> Result<(Vec<f32>, f64)> {
+        let expected_bytes = (elements as usize)
+            .checked_mul(size_of::<f32>())
+            .context("Vulkan elementwise byte length overflow")?;
+        if elements == 0 || left.len() != expected_bytes || right.len() != expected_bytes {
+            bail!("Vulkan elementwise payload length does not match its dimensions");
+        }
+        self.dispatch(
+            &[DispatchInput::Upload(left), DispatchInput::Upload(right)],
+            elements as usize,
+            self.elementwise_pipeline,
+            bytes_of(&[
+                elements,
+                operation,
+                parameter0.to_bits(),
+                parameter1.to_bits(),
+            ]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+            None,
+        )
+    }
+
+    fn channel_rms_norm(
+        &mut self,
+        input: &[u8],
+        weight: &[u8],
+        dimensions: [u32; 4],
+        output_len: usize,
+    ) -> Result<(Vec<f32>, f64)> {
+        let locations = dimensions[0]
+            .checked_mul(dimensions[2])
+            .context("Vulkan RMSNorm location count overflow")?;
+        self.dispatch(
+            &[DispatchInput::Upload(input), DispatchInput::Upload(weight)],
+            output_len,
+            self.channel_rmsnorm_pipeline,
+            bytes_of(&dimensions),
+            [locations, 1, 1],
+            KernelKind::Norm,
+            None,
+        )
+    }
+
+    fn bias_add(
+        &mut self,
+        input: &[u8],
+        bias: &[u8],
+        elements: u32,
+        width: u32,
+    ) -> Result<(Vec<f32>, f64)> {
+        let input_bytes = elements as usize * size_of::<f32>();
+        let bias_bytes = width as usize * size_of::<f32>();
+        if elements == 0 || width == 0 || input.len() != input_bytes || bias.len() != bias_bytes {
+            bail!("Vulkan bias-add payload length does not match its dimensions");
+        }
+        self.dispatch(
+            &[DispatchInput::Upload(input), DispatchInput::Upload(bias)],
+            elements as usize,
+            self.elementwise_pipeline,
+            bytes_of(&[elements, 6, width, 0]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+            None,
+        )
+    }
+
+    fn upload_resident(
+        &mut self,
+        bytes: &[u8],
+        elements: usize,
+        element_type: ResidentElementType,
+        class: ResidentClass,
+    ) -> Result<u64> {
+        let expected_bytes = elements
+            .checked_mul(match element_type {
+                ResidentElementType::F16 => size_of::<u16>(),
+                ResidentElementType::F32 => size_of::<f32>(),
+            })
+            .context("resident Vulkan upload size overflow")?;
+        if elements == 0 || bytes.len() != expected_bytes {
+            bail!("resident Vulkan upload payload does not match its element type");
+        }
+        let buffer = Buffer::new(&self.instance, self.physical, &self.device, bytes.len())?;
+        buffer.write_bytes(bytes)?;
+        self.stats.uploaded_bytes = self.stats.uploaded_bytes.saturating_add(bytes.len() as u64);
+        Ok(self.insert_resident(buffer, bytes.len(), elements, element_type, class))
+    }
+
+    fn stage_device_local_buffers(&mut self, payloads: &[&[u8]]) -> Result<Vec<Buffer>> {
+        if payloads.is_empty() || payloads.iter().any(|payload| payload.is_empty()) {
+            bail!("device-local staging requires at least one non-empty payload");
+        }
+        if payloads.iter().any(|payload| payload.len() % 4 != 0) {
+            bail!("device-local staging payloads must be four-byte aligned");
+        }
+        let staging_bytes = payloads
+            .iter()
+            .try_fold(0usize, |total, payload| total.checked_add(payload.len()));
+        let staging_bytes = staging_bytes.context("device-local staging size overflow")?;
+        let staging =
+            Buffer::new_staging(&self.instance, self.physical, &self.device, staging_bytes)?;
+        let mut destinations = Vec::with_capacity(payloads.len());
+        let mut offsets = Vec::with_capacity(payloads.len());
+        let mut offset = 0usize;
+        for payload in payloads {
+            staging.write_bytes_at(offset, payload)?;
+            destinations.push(Buffer::new_device_local_storage(
+                &self.instance,
+                self.physical,
+                &self.device,
+                payload.len(),
+            )?);
+            offsets.push(offset);
+            offset += payload.len();
+        }
+
+        unsafe {
+            self.device
+                .reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty())
+                .map_err(|error| {
+                    anyhow!("resident staging command-pool reset failed: {error:?}")
+                })?;
+        }
+        let command_info = vk::CommandBufferAllocateInfo::builder()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let command = unsafe { self.device.allocate_command_buffers(&command_info) }
+            .map_err(|error| anyhow!("resident staging command allocation failed: {error:?}"))?[0];
+        let begin_info = vk::CommandBufferBeginInfo::builder()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            self.device
+                .begin_command_buffer(command, &begin_info)
+                .map_err(|error| anyhow!("resident staging command begin failed: {error:?}"))?;
+            for ((payload, destination), &source_offset) in
+                payloads.iter().zip(&destinations).zip(&offsets)
+            {
+                self.device.cmd_copy_buffer(
+                    command,
+                    staging.buffer,
+                    destination.buffer,
+                    &[vk::BufferCopy {
+                        src_offset: source_offset as u64,
+                        dst_offset: 0,
+                        size: payload.len() as u64,
+                    }],
+                );
+            }
+            let barriers = payloads
+                .iter()
+                .zip(&destinations)
+                .map(|(payload, destination)| {
+                    vk::BufferMemoryBarrier::builder()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(destination.buffer)
+                        .offset(0)
+                        .size(payload.len() as u64)
+                        .build()
+                })
+                .collect::<Vec<_>>();
+            self.device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barriers,
+                &[],
+            );
+            self.device
+                .end_command_buffer(command)
+                .map_err(|error| anyhow!("resident staging command end failed: {error:?}"))?;
+        }
+        let commands = [command];
+        let submit = [vk::SubmitInfo::builder().command_buffers(&commands).build()];
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit, vk::Fence::null())
+                .map_err(|error| anyhow!("resident staging queue submit failed: {error:?}"))?;
+            self.device
+                .queue_wait_idle(self.queue)
+                .map_err(|error| anyhow!("resident staging queue wait failed: {error:?}"))?;
+        }
+        Ok(destinations)
+    }
+
+    fn prepare_resident_linear(
+        &mut self,
+        weight: &[u8],
+        weight_elements: usize,
+        bias: &[u8],
+        bias_elements: usize,
+    ) -> Result<(u64, u64)> {
+        if weight_elements == 0
+            || weight.len() != weight_elements.saturating_mul(size_of::<u16>())
+            || bias_elements == 0
+            || bias.len() != bias_elements.saturating_mul(size_of::<f32>())
+        {
+            bail!("resident linear payload does not match its element counts");
+        }
+        let mut buffers = self.stage_device_local_buffers(&[weight, bias])?;
+        let bias_buffer = buffers.pop().expect("two staged buffers were requested");
+        let weight_buffer = buffers.pop().expect("two staged buffers were requested");
+
+        let weight_id = self.insert_resident(
+            weight_buffer,
+            weight.len(),
+            weight_elements,
+            ResidentElementType::F16,
+            ResidentClass::Weight,
+        );
+        let bias_id = self.insert_resident(
+            bias_buffer,
+            bias.len(),
+            bias_elements,
+            ResidentElementType::F32,
+            ResidentClass::Weight,
+        );
+        let uploaded = weight.len().saturating_add(bias.len()) as u64;
+        self.stats.uploaded_bytes = self.stats.uploaded_bytes.saturating_add(uploaded);
+        self.stats.resident_weight_uploads += 1;
+        self.stats.resident_uploaded_bytes =
+            self.stats.resident_uploaded_bytes.saturating_add(uploaded);
+        self.stats.cached_weight_bytes = self.stats.cached_weight_bytes.saturating_add(uploaded);
+        Ok((weight_id, bias_id))
+    }
+
+    fn prepare_resident_vector(&mut self, vector: &[u8], elements: usize) -> Result<u64> {
+        if elements == 0 || vector.len() != elements.saturating_mul(size_of::<f32>()) {
+            bail!("resident vector payload does not match its element count");
+        }
+        let mut buffers = self.stage_device_local_buffers(&[vector])?;
+        let buffer = buffers.pop().expect("one staged buffer was requested");
+        let id = self.insert_resident(
+            buffer,
+            vector.len(),
+            elements,
+            ResidentElementType::F32,
+            ResidentClass::Weight,
+        );
+        let uploaded = vector.len() as u64;
+        self.stats.uploaded_bytes = self.stats.uploaded_bytes.saturating_add(uploaded);
+        self.stats.resident_weight_uploads += 1;
+        self.stats.resident_uploaded_bytes =
+            self.stats.resident_uploaded_bytes.saturating_add(uploaded);
+        self.stats.cached_weight_bytes = self.stats.cached_weight_bytes.saturating_add(uploaded);
+        Ok(id)
+    }
+
+    fn resident_linear(
+        &mut self,
+        input_id: u64,
+        weight_id: u64,
+        bias_id: u64,
+        rows: u32,
+        outputs: u32,
+        width: u32,
+    ) -> Result<u64> {
+        if rows == 0 || outputs == 0 || width == 0 || width % 4 != 0 {
+            bail!("resident Vulkan GEMM dimensions must be non-zero and width divisible by four");
+        }
+        self.require_resident(
+            input_id,
+            rows as usize * width as usize,
+            ResidentElementType::F32,
+        )?;
+        self.require_resident(
+            weight_id,
+            outputs as usize * width as usize,
+            ResidentElementType::F16,
+        )?;
+        self.require_resident(bias_id, outputs as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, weight_id, bias_id],
+            rows as usize * outputs as usize,
+            self.resident_linear_pipeline,
+            bytes_of(&[rows, outputs, width, 0]),
+            [outputs.div_ceil(32), rows.div_ceil(8), 1],
+            KernelKind::Gemm,
+        );
+        self.stats.gemm.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_conv3d(
+        &mut self,
+        input_id: u64,
+        weight_id: u64,
+        bias_id: u64,
+        dimensions: &[u32; 15],
+        output_elements: usize,
+    ) -> Result<u64> {
+        let [
+            batch,
+            input_channels,
+            input_time,
+            input_height,
+            input_width,
+            output_channels,
+            kernel_time,
+            kernel_height,
+            kernel_width,
+            _,
+            _,
+            _,
+            output_time,
+            output_height,
+            output_width,
+        ] = *dimensions;
+        if [
+            batch,
+            input_channels,
+            input_time,
+            input_height,
+            input_width,
+            output_channels,
+            kernel_time,
+            kernel_height,
+            kernel_width,
+            output_time,
+            output_height,
+            output_width,
+        ]
+        .contains(&0)
+        {
+            bail!("resident Vulkan Conv3D dimensions must be non-zero");
+        }
+        let input_elements = batch as usize
+            * input_channels as usize
+            * input_time as usize
+            * input_height as usize
+            * input_width as usize;
+        let weight_elements = output_channels as usize
+            * input_channels as usize
+            * kernel_time as usize
+            * kernel_height as usize
+            * kernel_width as usize;
+        let expected_output = batch as usize
+            * output_channels as usize
+            * output_time as usize
+            * output_height as usize
+            * output_width as usize;
+        if output_elements != expected_output {
+            bail!("resident Vulkan Conv3D output element count is inconsistent");
+        }
+        self.require_resident(input_id, input_elements, ResidentElementType::F32)?;
+        self.require_resident(weight_id, weight_elements, ResidentElementType::F16)?;
+        self.require_resident(bias_id, output_channels as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, weight_id, bias_id],
+            output_elements,
+            self.resident_conv3d_pipeline,
+            bytes_of(dimensions),
+            [
+                u32::try_from(output_elements)
+                    .context("resident Vulkan Conv3D output exceeds u32")?
+                    .div_ceil(256),
+                1,
+                1,
+            ],
+            KernelKind::Conv2d,
+        );
+        self.stats.conv2d.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_silu(&mut self, input_id: u64, elements: u32) -> Result<u64> {
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, input_id],
+            elements as usize,
+            self.elementwise_pipeline,
+            bytes_of(&[elements, 3, 0, 0]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_gelu_tanh(&mut self, input_id: u64, elements: u32) -> Result<u64> {
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, input_id],
+            elements as usize,
+            self.elementwise_pipeline,
+            bytes_of(&[elements, 4, 0, 0]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_scale(&mut self, input_id: u64, elements: u32, value: f32) -> Result<u64> {
+        if !value.is_finite() {
+            bail!("resident Vulkan scale must be finite");
+        }
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, input_id],
+            elements as usize,
+            self.elementwise_pipeline,
+            bytes_of(&[elements, 2, value.to_bits(), 0]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resident_patch_layout(
+        &mut self,
+        input_id: u64,
+        operation: u32,
+        elements: u32,
+        channels: u32,
+        time: u32,
+        height: u32,
+        width: u32,
+        patch_time: u32,
+        patch_height: u32,
+        patch_width: u32,
+        output_channels: u32,
+    ) -> Result<u64> {
+        if operation > 1
+            || elements == 0
+            || time == 0
+            || height == 0
+            || width == 0
+            || patch_time == 0
+            || patch_height == 0
+            || patch_width == 0
+            || time % patch_time != 0
+            || height % patch_height != 0
+            || width % patch_width != 0
+            || (operation == 0 && channels == 0)
+            || (operation == 1 && output_channels == 0)
+        {
+            bail!("resident patch-layout dimensions or operation are invalid");
+        }
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id],
+            elements as usize,
+            self.patch_layout_pipeline,
+            bytes_of(&[
+                operation,
+                elements,
+                channels,
+                time,
+                height,
+                width,
+                patch_time,
+                patch_height,
+                patch_width,
+                output_channels,
+            ]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_wan_head_modulate(
+        &mut self,
+        input_id: u64,
+        timestep_id: u64,
+        modulation_id: u64,
+        elements: u32,
+        width: u32,
+    ) -> Result<u64> {
+        if elements == 0 || width == 0 || elements % width != 0 {
+            bail!("resident Wan head modulation dimensions are invalid");
+        }
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        self.require_resident(timestep_id, width as usize, ResidentElementType::F32)?;
+        self.require_resident(modulation_id, 2 * width as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, timestep_id, modulation_id],
+            elements as usize,
+            self.wan_head_modulate_pipeline,
+            bytes_of(&[elements, width]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_add_vector(&mut self, input_id: u64, vector_id: u64, elements: u32) -> Result<u64> {
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        self.require_resident(vector_id, elements as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, vector_id],
+            elements as usize,
+            self.elementwise_pipeline,
+            bytes_of(&[elements, 0, 0, 0]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_layer_norm(
+        &mut self,
+        input_id: u64,
+        affine_ids: Option<(u64, u64)>,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+    ) -> Result<u64> {
+        let elements = rows
+            .checked_mul(width)
+            .context("resident LayerNorm element count overflow")?;
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        let (weight_id, bias_id, affine) = if let Some((weight_id, bias_id)) = affine_ids {
+            self.require_resident(weight_id, width as usize, ResidentElementType::F32)?;
+            self.require_resident(bias_id, width as usize, ResidentElementType::F32)?;
+            (weight_id, bias_id, 1)
+        } else {
+            (input_id, input_id, 0)
+        };
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, weight_id, bias_id],
+            elements as usize,
+            self.layernorm_pipeline,
+            bytes_of(&[rows, width, epsilon.to_bits(), affine]),
+            [rows, 1, 1],
+            KernelKind::Norm,
+        );
+        self.stats.norm.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_rms_norm(
+        &mut self,
+        input_id: u64,
+        weight_id: u64,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+    ) -> Result<u64> {
+        let elements = rows
+            .checked_mul(width)
+            .context("resident RMSNorm element count overflow")?;
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        self.require_resident(weight_id, width as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, weight_id],
+            elements as usize,
+            self.rmsnorm_pipeline,
+            bytes_of(&[rows, width, epsilon.to_bits(), 0]),
+            [rows, 1, 1],
+            KernelKind::Norm,
+        );
+        self.stats.norm.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_rope(
+        &mut self,
+        input_id: u64,
+        position_id: u64,
+        rows: u32,
+        heads: u32,
+        head_dim: u32,
+    ) -> Result<u64> {
+        if rows == 0 || heads == 0 || head_dim == 0 || head_dim % 2 != 0 {
+            bail!("resident RoPE dimensions must be non-zero with an even head dimension");
+        }
+        let width = heads
+            .checked_mul(head_dim)
+            .context("resident RoPE width overflow")?;
+        let elements = rows
+            .checked_mul(width)
+            .context("resident RoPE element count overflow")?;
+        let position_elements = rows
+            .checked_mul(head_dim / 2)
+            .and_then(|values| values.checked_mul(4))
+            .context("resident RoPE position count overflow")?;
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        self.require_resident(
+            position_id,
+            position_elements as usize,
+            ResidentElementType::F32,
+        )?;
+        let pair_count = elements / 2;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, position_id],
+            elements as usize,
+            self.rope_pipeline,
+            bytes_of(&[rows, heads, head_dim, 0]),
+            [pair_count.div_ceil(256), 1, 1],
+            KernelKind::Attention,
+        );
+        self.stats.attention.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_attention_scores(
+        &mut self,
+        query_id: u64,
+        key_id: u64,
+        queries: u32,
+        keys: u32,
+        heads: u32,
+        head_dim: u32,
+        scale: f32,
+    ) -> Result<u64> {
+        if queries == 0 || keys == 0 || heads == 0 || head_dim == 0 || !scale.is_finite() {
+            bail!("resident attention score dimensions and scale must be valid");
+        }
+        let width = heads
+            .checked_mul(head_dim)
+            .context("resident attention score width overflow")?;
+        self.require_resident(
+            query_id,
+            queries as usize * width as usize,
+            ResidentElementType::F32,
+        )?;
+        self.require_resident(
+            key_id,
+            keys as usize * width as usize,
+            ResidentElementType::F32,
+        )?;
+        let output_elements = heads
+            .checked_mul(queries)
+            .and_then(|values| values.checked_mul(keys))
+            .context("resident attention score count overflow")?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[query_id, key_id],
+            output_elements as usize,
+            self.f32_attention_pipeline,
+            bytes_of(&[0, queries, keys, heads, head_dim, scale.to_bits(), 0, 0]),
+            [output_elements.div_ceil(256), 1, 1],
+            KernelKind::Attention,
+        );
+        self.stats.attention.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_softmax(&mut self, input_id: u64, rows: u32, width: u32) -> Result<u64> {
+        if rows == 0 || width == 0 {
+            bail!("resident softmax dimensions must be non-zero");
+        }
+        let elements = rows
+            .checked_mul(width)
+            .context("resident softmax element count overflow")?;
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, input_id],
+            elements as usize,
+            self.f32_attention_pipeline,
+            bytes_of(&[1, rows, width, 1, 1, 0, 0, 0]),
+            [rows, 1, 1],
+            KernelKind::Attention,
+        );
+        self.stats.attention.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_attention_values(
+        &mut self,
+        probability_id: u64,
+        value_id: u64,
+        queries: u32,
+        keys: u32,
+        heads: u32,
+        head_dim: u32,
+    ) -> Result<u64> {
+        if queries == 0 || keys == 0 || heads == 0 || head_dim == 0 {
+            bail!("resident attention value dimensions must be non-zero");
+        }
+        let width = heads
+            .checked_mul(head_dim)
+            .context("resident attention value width overflow")?;
+        let probability_elements = heads
+            .checked_mul(queries)
+            .and_then(|values| values.checked_mul(keys))
+            .context("resident attention probability count overflow")?;
+        let output_elements = queries
+            .checked_mul(width)
+            .context("resident attention output count overflow")?;
+        self.require_resident(
+            probability_id,
+            probability_elements as usize,
+            ResidentElementType::F32,
+        )?;
+        self.require_resident(
+            value_id,
+            keys as usize * width as usize,
+            ResidentElementType::F32,
+        )?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[probability_id, value_id],
+            output_elements as usize,
+            self.f32_attention_pipeline,
+            bytes_of(&[2, queries, keys, heads, head_dim, 0, 0, 0]),
+            [output_elements.div_ceil(256), 1, 1],
+            KernelKind::Attention,
+        );
+        self.stats.attention.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_wan_modulate(
+        &mut self,
+        input_id: u64,
+        modulation_id: u64,
+        elements: u32,
+        width: u32,
+        shift_chunk: u32,
+        scale_chunk: u32,
+    ) -> Result<u64> {
+        if width == 0 || elements == 0 || elements % width != 0 {
+            bail!("resident Wan modulation dimensions are invalid");
+        }
+        if shift_chunk > u16::MAX.into() || scale_chunk > u16::MAX.into() {
+            bail!("resident Wan modulation chunk index exceeds u16");
+        }
+        let required_chunks = shift_chunk.max(scale_chunk) + 1;
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        let modulation = self
+            .resident_buffers
+            .get(&modulation_id)
+            .with_context(|| format!("unknown resident Vulkan buffer {modulation_id}"))?;
+        if modulation.element_type != ResidentElementType::F32
+            || modulation.elements < required_chunks as usize * width as usize
+        {
+            bail!("resident Wan modulation buffer is too small or has the wrong type");
+        }
+        let packed_chunks = shift_chunk | (scale_chunk << 16);
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, modulation_id],
+            elements as usize,
+            self.elementwise_pipeline,
+            bytes_of(&[elements, 7, width, packed_chunks]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_multiply_vector_chunk(
+        &mut self,
+        input_id: u64,
+        vector_id: u64,
+        elements: u32,
+        width: u32,
+        chunk: u32,
+    ) -> Result<u64> {
+        if elements == 0 || width == 0 || elements % width != 0 {
+            bail!("resident vector multiply dimensions are invalid");
+        }
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        let vector = self
+            .resident_buffers
+            .get(&vector_id)
+            .with_context(|| format!("unknown resident Vulkan buffer {vector_id}"))?;
+        let required_values = (chunk as usize + 1).saturating_mul(width as usize);
+        if vector.element_type != ResidentElementType::F32 || vector.elements < required_values {
+            bail!("resident vector multiply buffer is too small or has the wrong type");
+        }
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, vector_id],
+            elements as usize,
+            self.elementwise_pipeline,
+            bytes_of(&[elements, 8, width, chunk]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn require_resident(
+        &self,
+        id: u64,
+        elements: usize,
+        element_type: ResidentElementType,
+    ) -> Result<()> {
+        let resident = self
+            .resident_buffers
+            .get(&id)
+            .with_context(|| format!("unknown resident Vulkan buffer {id}"))?;
+        if resident.elements != elements || resident.element_type != element_type {
+            bail!(
+                "resident Vulkan buffer {id} has {:?}/{} elements, expected {:?}/{elements}",
+                resident.element_type,
+                resident.elements,
+                element_type
+            );
+        }
+        Ok(())
+    }
+
+    fn download_resident(&mut self, id: u64, elements: usize) -> Result<Vec<f32>> {
+        self.require_resident(id, elements, ResidentElementType::F32)?;
+        let values = self
+            .resident_buffers
+            .get(&id)
+            .expect("resident buffer was just validated")
+            .buffer
+            .read_f32(elements)?;
+        let bytes = elements * size_of::<f32>();
+        self.stats.resident_downloads += 1;
+        self.stats.resident_downloaded_bytes = self
+            .stats
+            .resident_downloaded_bytes
+            .saturating_add(bytes as u64);
+        Ok(values)
+    }
+
+    fn insert_resident(
+        &mut self,
+        buffer: Buffer,
+        logical_bytes: usize,
+        elements: usize,
+        element_type: ResidentElementType,
+        class: ResidentClass,
+    ) -> u64 {
+        let id = self.next_resident_id;
+        self.next_resident_id = self
+            .next_resident_id
+            .checked_add(1)
+            .expect("resident Vulkan buffer identifier space exhausted");
+        self.stats.resident_allocated_bytes = self
+            .stats
+            .resident_allocated_bytes
+            .saturating_add(logical_bytes as u64);
+        self.stats.peak_resident_allocated_bytes = self
+            .stats
+            .peak_resident_allocated_bytes
+            .max(self.stats.resident_allocated_bytes);
+        if buffer.memory_class == BufferMemoryClass::DeviceLocal {
+            self.stats.resident_device_local_bytes = self
+                .stats
+                .resident_device_local_bytes
+                .saturating_add(logical_bytes as u64);
+            self.stats.peak_resident_device_local_bytes = self
+                .stats
+                .peak_resident_device_local_bytes
+                .max(self.stats.resident_device_local_bytes);
+            self.stats.resident_device_local_allocation_bytes = self
+                .stats
+                .resident_device_local_allocation_bytes
+                .saturating_add(buffer.allocation_bytes);
+            self.stats.peak_resident_device_local_allocation_bytes = self
+                .stats
+                .peak_resident_device_local_allocation_bytes
+                .max(self.stats.resident_device_local_allocation_bytes);
+        }
+        let previous = self.resident_buffers.insert(
+            id,
+            ResidentBuffer {
+                buffer,
+                logical_bytes,
+                elements,
+                element_type,
+                class,
+            },
+        );
+        debug_assert!(previous.is_none());
+        id
+    }
+
+    fn release_resident(&mut self, id: u64) {
+        let Some(resident) = self.resident_buffers.remove(&id) else {
+            return;
+        };
+        self.stats.resident_allocated_bytes = self
+            .stats
+            .resident_allocated_bytes
+            .saturating_sub(resident.logical_bytes as u64);
+        if resident.buffer.memory_class == BufferMemoryClass::DeviceLocal {
+            self.stats.resident_device_local_bytes = self
+                .stats
+                .resident_device_local_bytes
+                .saturating_sub(resident.logical_bytes as u64);
+            self.stats.resident_device_local_allocation_bytes = self
+                .stats
+                .resident_device_local_allocation_bytes
+                .saturating_sub(resident.buffer.allocation_bytes);
+        }
+        if resident.class == ResidentClass::Weight {
+            self.stats.cached_weight_bytes = self
+                .stats
+                .cached_weight_bytes
+                .saturating_sub(resident.logical_bytes as u64);
+        }
+    }
+
+    fn dispatch_resident(
+        &mut self,
+        input_ids: &[u64],
+        output_len: usize,
+        pipeline: vk::Pipeline,
+        push_constants: &[u8],
+        groups: [u32; 3],
+        kind: KernelKind,
+    ) -> Result<u64> {
+        if input_ids.is_empty() || input_ids.len() > 3 {
+            bail!("resident Vulkan dispatch requires between one and three inputs");
+        }
+        if output_len == 0 || groups.contains(&0) {
+            bail!("resident Vulkan dispatch dimensions must be non-zero");
+        }
+        if push_constants.len() > 64 || push_constants.len() % 4 != 0 {
+            bail!("invalid resident Vulkan push-constant payload");
+        }
+
+        unsafe {
+            self.device
+                .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
+                .map_err(|error| anyhow!("descriptor pool reset failed: {error:?}"))?;
+            self.device
+                .reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty())
+                .map_err(|error| anyhow!("command pool reset failed: {error:?}"))?;
+        }
+
+        let mut input_descriptors = Vec::with_capacity(input_ids.len());
+        let mut unique_input_bytes = 0usize;
+        let mut seen_ids = Vec::with_capacity(input_ids.len());
+        for &id in input_ids {
+            let resident = self
+                .resident_buffers
+                .get(&id)
+                .with_context(|| format!("unknown resident Vulkan buffer {id}"))?;
+            input_descriptors.push(resident.buffer.descriptor(resident.logical_bytes));
+            if !seen_ids.contains(&id) {
+                seen_ids.push(id);
+                unique_input_bytes = unique_input_bytes.saturating_add(resident.logical_bytes);
+            }
+        }
+
+        let output_bytes = output_len
+            .checked_mul(size_of::<f32>())
+            .context("resident Vulkan output byte size overflow")?;
+        let output = Buffer::new(&self.instance, self.physical, &self.device, output_bytes)?;
+        let layouts = [self.set_layout];
+        let set_info = vk::DescriptorSetAllocateInfo::builder()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&layouts);
+        let descriptor_set = unsafe { self.device.allocate_descriptor_sets(&set_info) }
+            .map_err(|error| anyhow!("resident descriptor allocation failed: {error:?}"))?[0];
+        let mut buffer_infos = input_descriptors
+            .iter()
+            .copied()
+            .map(|descriptor| [descriptor])
+            .collect::<Vec<_>>();
+        buffer_infos.push([output.descriptor(output_bytes)]);
+        let writes = (0..buffer_infos.len())
+            .map(|binding| {
+                vk::WriteDescriptorSet::builder()
+                    .dst_set(descriptor_set)
+                    .dst_binding(binding as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&buffer_infos[binding])
+                    .build()
+            })
+            .collect::<Vec<_>>();
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+
+        let command_info = vk::CommandBufferAllocateInfo::builder()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let command = unsafe { self.device.allocate_command_buffers(&command_info) }
+            .map_err(|error| anyhow!("resident command allocation failed: {error:?}"))?[0];
+        unsafe {
+            self.device
+                .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+                .map_err(|error| anyhow!("resident command begin failed: {error:?}"))?;
+            self.device
+                .cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                command,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            self.device.cmd_push_constants(
+                command,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                push_constants,
+            );
+            self.device
+                .cmd_dispatch(command, groups[0], groups[1], groups[2]);
+            self.device
+                .end_command_buffer(command)
+                .map_err(|error| anyhow!("resident command end failed: {error:?}"))?;
+        }
+
+        let commands = [command];
+        let submit = [vk::SubmitInfo::builder().command_buffers(&commands).build()];
+        let started = Instant::now();
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit, vk::Fence::null())
+                .map_err(|error| anyhow!("resident queue submit failed: {error:?}"))?;
+            self.device
+                .queue_wait_idle(self.queue)
+                .map_err(|error| anyhow!("resident queue wait failed: {error:?}"))?;
+        }
+        let milliseconds = started.elapsed().as_secs_f64() * 1_000.0;
+        self.stats.peak_dispatch_bytes = self
+            .stats
+            .peak_dispatch_bytes
+            .max(unique_input_bytes.saturating_add(output_bytes) as u64);
+        let kernel = match kind {
+            KernelKind::Elementwise => &mut self.stats.elementwise,
+            KernelKind::Norm => &mut self.stats.norm,
+            KernelKind::Gemm => &mut self.stats.gemm,
+            KernelKind::Conv2d => &mut self.stats.conv2d,
+            KernelKind::Attention => &mut self.stats.attention,
+        };
+        kernel.calls += 1;
+        kernel.dispatch_milliseconds += milliseconds;
+        Ok(self.insert_resident(
+            output,
+            output_bytes,
+            output_len,
+            ResidentElementType::F32,
+            ResidentClass::Activation,
+        ))
     }
 
     fn conv2d(
@@ -2883,6 +5259,8 @@ impl VulkanRuntime {
             .saturating_add(uploaded_bytes as u64);
         self.stats.peak_dispatch_bytes = self.stats.peak_dispatch_bytes.max(dispatch_bytes);
         let kernel = match kind {
+            KernelKind::Elementwise => &mut self.stats.elementwise,
+            KernelKind::Norm => &mut self.stats.norm,
             KernelKind::Gemm => &mut self.stats.gemm,
             KernelKind::Conv2d => &mut self.stats.conv2d,
             KernelKind::Attention => &mut self.stats.attention,
@@ -2978,6 +5356,7 @@ impl Drop for VulkanRuntime {
         unsafe {
             let _ = self.device.device_wait_idle();
             self.model_mappings.clear();
+            self.resident_buffers.clear();
             for buffer in &mut self.buffers {
                 drop(buffer.take());
             }
@@ -3014,6 +5393,43 @@ impl Drop for VulkanRuntime {
             }
             if self.geglu_pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.geglu_pipeline, None);
+            }
+            if self.elementwise_pipeline != vk::Pipeline::null() {
+                self.device
+                    .destroy_pipeline(self.elementwise_pipeline, None);
+            }
+            if self.channel_rmsnorm_pipeline != vk::Pipeline::null() {
+                self.device
+                    .destroy_pipeline(self.channel_rmsnorm_pipeline, None);
+            }
+            if self.resident_linear_pipeline != vk::Pipeline::null() {
+                self.device
+                    .destroy_pipeline(self.resident_linear_pipeline, None);
+            }
+            if self.layernorm_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.layernorm_pipeline, None);
+            }
+            if self.rmsnorm_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.rmsnorm_pipeline, None);
+            }
+            if self.rope_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.rope_pipeline, None);
+            }
+            if self.f32_attention_pipeline != vk::Pipeline::null() {
+                self.device
+                    .destroy_pipeline(self.f32_attention_pipeline, None);
+            }
+            if self.patch_layout_pipeline != vk::Pipeline::null() {
+                self.device
+                    .destroy_pipeline(self.patch_layout_pipeline, None);
+            }
+            if self.wan_head_modulate_pipeline != vk::Pipeline::null() {
+                self.device
+                    .destroy_pipeline(self.wan_head_modulate_pipeline, None);
+            }
+            if self.resident_conv3d_pipeline != vk::Pipeline::null() {
+                self.device
+                    .destroy_pipeline(self.resident_conv3d_pipeline, None);
             }
             if self.gemm_pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.gemm_pipeline, None);
@@ -3326,8 +5742,10 @@ struct Buffer {
     device: ash::Device,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
-    mapped_address: usize,
+    mapped_address: Option<usize>,
     bytes: usize,
+    allocation_bytes: u64,
+    memory_class: BufferMemoryClass,
 }
 
 fn memory_heap_size(properties: &vk::PhysicalDeviceMemoryProperties, memory_type: u32) -> u64 {
@@ -3342,39 +5760,97 @@ impl Buffer {
         device: &ash::Device,
         bytes: usize,
     ) -> Result<Self> {
+        Self::new_with_options(
+            instance,
+            physical,
+            device,
+            bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            BufferMemoryClass::HostVisible,
+        )
+    }
+
+    fn new_staging(
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
+        device: &ash::Device,
+        bytes: usize,
+    ) -> Result<Self> {
+        Self::new_with_options(
+            instance,
+            physical,
+            device,
+            bytes,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            BufferMemoryClass::HostVisible,
+        )
+    }
+
+    fn new_device_local_storage(
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
+        device: &ash::Device,
+        bytes: usize,
+    ) -> Result<Self> {
+        Self::new_with_options(
+            instance,
+            physical,
+            device,
+            bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemoryClass::DeviceLocal,
+        )
+    }
+
+    fn new_with_options(
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
+        device: &ash::Device,
+        bytes: usize,
+        usage: vk::BufferUsageFlags,
+        memory_class: BufferMemoryClass,
+    ) -> Result<Self> {
         if bytes == 0 {
             bail!("Vulkan buffers cannot be empty");
         }
         let info = vk::BufferCreateInfo::builder()
             .size(bytes as u64)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = unsafe { device.create_buffer(&info, None) }
             .map_err(|error| anyhow!("buffer creation failed: {error:?}"))?;
         let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
         let properties = unsafe { instance.get_physical_device_memory_properties(physical) };
+        let required_flags = match memory_class {
+            BufferMemoryClass::HostVisible => {
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+            }
+            BufferMemoryClass::DeviceLocal => vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        };
         let memory_type = (0..properties.memory_type_count)
             .filter(|index| requirements.memory_type_bits & (1 << index) != 0)
             .filter(|index| {
                 properties.memory_types[*index as usize]
                     .property_flags
-                    .contains(
-                        vk::MemoryPropertyFlags::HOST_VISIBLE
-                            | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    )
+                    .contains(required_flags)
             })
             .filter(|index| memory_heap_size(&properties, *index) >= requirements.size)
             .max_by_key(|index| {
-                (
-                    memory_heap_size(&properties, *index),
-                    properties.memory_types[*index as usize]
-                        .property_flags
-                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL),
-                )
+                let flags = properties.memory_types[*index as usize].property_flags;
+                match memory_class {
+                    BufferMemoryClass::HostVisible => (
+                        memory_heap_size(&properties, *index),
+                        flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) as u64,
+                    ),
+                    BufferMemoryClass::DeviceLocal => (
+                        (!flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)) as u64,
+                        memory_heap_size(&properties, *index),
+                    ),
+                }
             });
         let Some(memory_type) = memory_type else {
             unsafe { device.destroy_buffer(buffer, None) };
-            bail!("no host-visible coherent Vulkan memory type");
+            bail!("no {memory_class:?} Vulkan memory type supports the requested buffer");
         };
         let allocation = vk::MemoryAllocateInfo::builder()
             .allocation_size(requirements.size)
@@ -3393,24 +5869,31 @@ impl Buffer {
             }
             bail!("buffer bind failed: {error:?}");
         }
-        let mapped = match unsafe {
-            device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-        } {
-            Ok(mapped) => mapped,
-            Err(error) => {
-                unsafe {
-                    device.free_memory(memory, None);
-                    device.destroy_buffer(buffer, None);
+        let mapped_address = match memory_class {
+            BufferMemoryClass::HostVisible => {
+                match unsafe {
+                    device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                } {
+                    Ok(mapped) => Some(mapped as usize),
+                    Err(error) => {
+                        unsafe {
+                            device.free_memory(memory, None);
+                            device.destroy_buffer(buffer, None);
+                        }
+                        bail!("persistent buffer map failed: {error:?}");
+                    }
                 }
-                bail!("persistent buffer map failed: {error:?}");
             }
+            BufferMemoryClass::DeviceLocal => None,
         };
         Ok(Self {
             device: device.clone(),
             buffer,
             memory,
-            mapped_address: mapped as usize,
+            mapped_address,
             bytes,
+            allocation_bytes: requirements.size,
+            memory_class,
         })
     }
 
@@ -3425,10 +5908,13 @@ impl Buffer {
         if end > self.bytes {
             bail!("Vulkan upload exceeds buffer allocation");
         }
+        let mapped_address = self
+            .mapped_address
+            .context("cannot write directly to device-local Vulkan memory")?;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                (self.mapped_address as *mut u8).add(offset),
+                (mapped_address as *mut u8).add(offset),
                 bytes.len(),
             )
         };
@@ -3439,9 +5925,11 @@ impl Buffer {
         if length * size_of::<f32>() > self.bytes {
             bail!("Vulkan read exceeds buffer allocation");
         }
+        let mapped_address = self
+            .mapped_address
+            .context("cannot read device-local Vulkan memory without staging")?;
         let values =
-            unsafe { std::slice::from_raw_parts(self.mapped_address as *const f32, length) }
-                .to_vec();
+            unsafe { std::slice::from_raw_parts(mapped_address as *const f32, length) }.to_vec();
         Ok(values)
     }
 
@@ -3472,7 +5960,9 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         unsafe {
-            self.device.unmap_memory(self.memory);
+            if self.mapped_address.is_some() {
+                self.device.unmap_memory(self.memory);
+            }
             self.device.destroy_buffer(self.buffer, None);
             self.device.free_memory(self.memory, None);
         }
@@ -3551,6 +6041,29 @@ mod tests {
         for value in [-2.0, -0.5, 0.0, 0.25, 1.0, 65_504.0] {
             assert_eq!(crate::dequant::f16_to_f32(f32_to_f16(value)), value);
         }
+    }
+
+    #[test]
+    fn reports_selected_device_capabilities() {
+        let profile = match device_profile() {
+            Ok(profile) => profile,
+            Err(error) if std::env::var_os("QUARTZ_REQUIRE_VULKAN").is_none() => {
+                eprintln!("skipping Vulkan device profile: {error:#}");
+                return;
+            }
+            Err(error) => panic!("required Vulkan device profile failed: {error:#}"),
+        };
+        eprintln!("{profile}");
+        assert!(!profile.device_name.is_empty());
+        assert!(profile.device_local_memory_bytes > 0);
+        assert!(profile.available_device_memory_bytes > 0);
+        assert!(profile.max_storage_buffer_bytes > 0);
+        assert!(profile.max_memory_allocation_bytes > 0);
+        assert!(profile.max_workgroup_invocations >= 256);
+        assert!(profile.max_workgroup_size[0] >= 256);
+        assert!(profile.subgroup_size > 0);
+        assert!(profile.fp16_supported);
+        assert!(profile.storage_buffer_alignment > 0);
     }
 
     #[test]

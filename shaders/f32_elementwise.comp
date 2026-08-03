@@ -1,0 +1,77 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer LeftBuffer {
+    float left_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer RightBuffer {
+    float right_values[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Parameters {
+    uint elements;
+    uint operation;
+    float parameter0;
+    float parameter1;
+} parameters;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= parameters.elements) {
+        return;
+    }
+
+    float left = left_values[index];
+    float right = right_values[index];
+    float value;
+    switch (parameters.operation) {
+        case 0:
+            value = left + right;
+            break;
+        case 1:
+            value = left * right;
+            break;
+        case 2:
+            value = left * parameters.parameter0;
+            break;
+        case 3:
+            value = left / (1.0 + exp(-left));
+            break;
+        case 4:
+            value = 0.5 * left *
+                (1.0 + tanh(0.7978845608 *
+                (left + 0.044715 * left * left * left)));
+            break;
+        case 5:
+            value = clamp(left, parameters.parameter0, parameters.parameter1);
+            break;
+        case 6:
+            value = left + right_values[
+                index % floatBitsToUint(parameters.parameter0)];
+            break;
+        case 7:
+            uint width = floatBitsToUint(parameters.parameter0);
+            uint chunks = floatBitsToUint(parameters.parameter1);
+            uint shift_chunk = chunks & 0xffffu;
+            uint scale_chunk = chunks >> 16;
+            uint channel = index % width;
+            float shift = right_values[shift_chunk * width + channel];
+            float scale = right_values[scale_chunk * width + channel];
+            value = left * (1.0 + scale) + shift;
+            break;
+        case 8:
+            uint vector_width = floatBitsToUint(parameters.parameter0);
+            uint vector_chunk = floatBitsToUint(parameters.parameter1);
+            value = left * right_values[
+                vector_chunk * vector_width + index % vector_width];
+            break;
+        default:
+            value = uintBitsToFloat(0x7fc00000);
+            break;
+    }
+    output_values[index] = value;
+}

@@ -1,0 +1,125 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer LeftBuffer {
+    float left_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer RightBuffer {
+    float right_values[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint operation;
+    uint queries;
+    uint keys;
+    uint heads;
+    uint head_dim;
+    float scale;
+    uint padding0;
+    uint padding1;
+} dimensions;
+
+shared float partial[256];
+
+void attention_scores() {
+    uint index = gl_GlobalInvocationID.x;
+    uint scores_per_head = dimensions.queries * dimensions.keys;
+    uint total_scores = dimensions.heads * scores_per_head;
+    if (index >= total_scores) {
+        return;
+    }
+    uint head = index / scores_per_head;
+    uint remainder = index % scores_per_head;
+    uint query = remainder / dimensions.keys;
+    uint key = remainder % dimensions.keys;
+    uint width = dimensions.heads * dimensions.head_dim;
+    uint query_offset = query * width + head * dimensions.head_dim;
+    uint key_offset = key * width + head * dimensions.head_dim;
+    float score = 0.0;
+    for (uint channel = 0; channel < dimensions.head_dim; ++channel) {
+        score += left_values[query_offset + channel] *
+            right_values[key_offset + channel];
+    }
+    output_values[index] = score * dimensions.scale;
+}
+
+void attention_softmax() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint rows = dimensions.heads * dimensions.queries;
+    if (row >= rows) {
+        return;
+    }
+    uint row_offset = row * dimensions.keys;
+
+    float maximum = -1.0 / 0.0;
+    for (uint key = lane; key < dimensions.keys; key += 256) {
+        maximum = max(maximum, left_values[row_offset + key]);
+    }
+    partial[lane] = maximum;
+    barrier();
+    for (uint offset = 128; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            partial[lane] = max(partial[lane], partial[lane + offset]);
+        }
+        barrier();
+    }
+    maximum = partial[0];
+
+    float sum = 0.0;
+    for (uint key = lane; key < dimensions.keys; key += 256) {
+        sum += exp(left_values[row_offset + key] - maximum);
+    }
+    partial[lane] = sum;
+    barrier();
+    for (uint offset = 128; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            partial[lane] += partial[lane + offset];
+        }
+        barrier();
+    }
+    float inverse_sum = 1.0 / partial[0];
+    for (uint key = lane; key < dimensions.keys; key += 256) {
+        output_values[row_offset + key] =
+            exp(left_values[row_offset + key] - maximum) * inverse_sum;
+    }
+}
+
+void attention_values() {
+    uint index = gl_GlobalInvocationID.x;
+    uint width = dimensions.heads * dimensions.head_dim;
+    uint total_values = dimensions.queries * width;
+    if (index >= total_values) {
+        return;
+    }
+    uint query = index / width;
+    uint row_channel = index % width;
+    uint head = row_channel / dimensions.head_dim;
+    uint channel = row_channel % dimensions.head_dim;
+    uint probability_offset =
+        head * dimensions.queries * dimensions.keys + query * dimensions.keys;
+    float value = 0.0;
+    for (uint key = 0; key < dimensions.keys; ++key) {
+        uint value_offset = key * width + head * dimensions.head_dim + channel;
+        value += left_values[probability_offset + key] * right_values[value_offset];
+    }
+    output_values[index] = value;
+}
+
+void main() {
+    switch (dimensions.operation) {
+        case 0:
+            attention_scores();
+            break;
+        case 1:
+            attention_softmax();
+            break;
+        case 2:
+            attention_values();
+            break;
+    }
+}

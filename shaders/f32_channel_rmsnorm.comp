@@ -1,0 +1,58 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float input_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer {
+    float weights[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint batch;
+    uint channels;
+    uint volume;
+    float epsilon;
+} dimensions;
+
+shared float partial_square_sum[256];
+
+void main() {
+    uint location = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint total_locations = dimensions.batch * dimensions.volume;
+    if (location >= total_locations) {
+        return;
+    }
+    uint sample_index = location / dimensions.volume;
+    uint position = location % dimensions.volume;
+
+    float square_sum = 0.0;
+    for (uint channel = lane; channel < dimensions.channels; channel += 256) {
+        uint index = (sample_index * dimensions.channels + channel) *
+            dimensions.volume + position;
+        float value = input_values[index];
+        square_sum += value * value;
+    }
+    partial_square_sum[lane] = square_sum;
+    barrier();
+
+    for (uint offset = 128; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            partial_square_sum[lane] += partial_square_sum[lane + offset];
+        }
+        barrier();
+    }
+    float inverse_rms = inversesqrt(
+        partial_square_sum[0] / float(dimensions.channels) + dimensions.epsilon);
+
+    for (uint channel = lane; channel < dimensions.channels; channel += 256) {
+        uint index = (sample_index * dimensions.channels + channel) *
+            dimensions.volume + position;
+        output_values[index] = input_values[index] * inverse_rms * weights[channel];
+    }
+}

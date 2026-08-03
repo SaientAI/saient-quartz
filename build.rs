@@ -34,8 +34,14 @@ fn build_cuda() {
         // nvcc -lib produces kernels.lib directly (no separate archiver / -fPIC on MSVC).
         let lib = out.join("kernels.lib");
         let st = std::process::Command::new(&nvcc)
-            .args(["-O3", &format!("-arch={arch}"), "-lib",
-                   "src/cuda_kernels.cu", "-o", lib.to_str().unwrap()])
+            .args([
+                "-O3",
+                &format!("-arch={arch}"),
+                "-lib",
+                "src/cuda_kernels.cu",
+                "-o",
+                lib.to_str().unwrap(),
+            ])
             .status()
             .unwrap_or_else(|_| panic!("nvcc not found at {}", nvcc));
         assert!(st.success(), "nvcc failed");
@@ -44,8 +50,16 @@ fn build_cuda() {
         let obj = out.join("kernels.o");
         let lib = out.join("libkernels.a");
         let st = std::process::Command::new(&nvcc)
-            .args(["-O3", &format!("-arch={arch}"), "--compiler-options", "-fPIC",
-                   "-c", "src/cuda_kernels.cu", "-o", obj.to_str().unwrap()])
+            .args([
+                "-O3",
+                &format!("-arch={arch}"),
+                "--compiler-options",
+                "-fPIC",
+                "-c",
+                "src/cuda_kernels.cu",
+                "-o",
+                obj.to_str().unwrap(),
+            ])
             .status()
             .unwrap_or_else(|_| panic!("nvcc not found at {}", nvcc));
         assert!(st.success(), "nvcc failed");
@@ -76,6 +90,16 @@ fn build_vulkan_shader() {
     println!("cargo:rerun-if-changed=shaders/fp16_gemm_heads.comp");
     println!("cargo:rerun-if-changed=shaders/fp16_merge_heads.comp");
     println!("cargo:rerun-if-changed=shaders/fp16_geglu.comp");
+    println!("cargo:rerun-if-changed=shaders/f32_elementwise.comp");
+    println!("cargo:rerun-if-changed=shaders/f32_channel_rmsnorm.comp");
+    println!("cargo:rerun-if-changed=shaders/f32_f16_linear.comp");
+    println!("cargo:rerun-if-changed=shaders/f32_layernorm.comp");
+    println!("cargo:rerun-if-changed=shaders/f32_rmsnorm.comp");
+    println!("cargo:rerun-if-changed=shaders/f32_rope.comp");
+    println!("cargo:rerun-if-changed=shaders/f32_attention.comp");
+    println!("cargo:rerun-if-changed=shaders/f32_patch_layout.comp");
+    println!("cargo:rerun-if-changed=shaders/f32_wan_head_modulate.comp");
+    println!("cargo:rerun-if-changed=shaders/f32_f16_conv3d.comp");
     let glslc = find_glslc().unwrap_or_else(|| {
         panic!("Vulkan feature requires GLSLC or an Android NDK containing shader-tools/glslc")
     });
@@ -89,13 +113,26 @@ fn build_vulkan_shader() {
             "shaders/fp16_groupnorm_silu.comp",
             "fp16_groupnorm_silu.spv",
         ),
-        (
-            "shaders/fp16_residual_add.comp",
-            "fp16_residual_add.spv",
-        ),
+        ("shaders/fp16_residual_add.comp", "fp16_residual_add.spv"),
         ("shaders/fp16_gemm_heads.comp", "fp16_gemm_heads.spv"),
         ("shaders/fp16_merge_heads.comp", "fp16_merge_heads.spv"),
         ("shaders/fp16_geglu.comp", "fp16_geglu.spv"),
+        ("shaders/f32_elementwise.comp", "f32_elementwise.spv"),
+        (
+            "shaders/f32_channel_rmsnorm.comp",
+            "f32_channel_rmsnorm.spv",
+        ),
+        ("shaders/f32_f16_linear.comp", "f32_f16_linear.spv"),
+        ("shaders/f32_layernorm.comp", "f32_layernorm.spv"),
+        ("shaders/f32_rmsnorm.comp", "f32_rmsnorm.spv"),
+        ("shaders/f32_rope.comp", "f32_rope.spv"),
+        ("shaders/f32_attention.comp", "f32_attention.spv"),
+        ("shaders/f32_patch_layout.comp", "f32_patch_layout.spv"),
+        (
+            "shaders/f32_wan_head_modulate.comp",
+            "f32_wan_head_modulate.spv",
+        ),
+        ("shaders/f32_f16_conv3d.comp", "f32_f16_conv3d.spv"),
     ] {
         let status = Command::new(&glslc)
             .args(["--target-env=vulkan1.1", "-O", source, "-o"])

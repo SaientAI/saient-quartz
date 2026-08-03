@@ -1,0 +1,63 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Resident Wan linear path. Activations and bias remain FP32 while weights use
+// FP16 storage. The output is left in a Vulkan buffer for the following layer.
+layout(local_size_x = 4, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float input_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer {
+    f16vec4 weight_values[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer BiasBuffer {
+    float bias_values[];
+};
+layout(set = 0, binding = 3, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint rows;
+    uint outputs;
+    uint width;
+    uint unused0;
+} dimensions;
+
+void main() {
+    uint output_index = gl_GlobalInvocationID.x * 8;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= dimensions.rows || output_index >= dimensions.outputs) {
+        return;
+    }
+
+    float sums[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    uint packed_width = dimensions.width / 4;
+    uint input_base = row * dimensions.width;
+    for (uint column = 0; column < packed_width; ++column) {
+        uint input_column = column * 4;
+        vec4 input_value = vec4(
+            input_values[input_base + input_column],
+            input_values[input_base + input_column + 1],
+            input_values[input_base + input_column + 2],
+            input_values[input_base + input_column + 3]);
+        for (uint lane = 0; lane < 8; ++lane) {
+            uint output_lane = output_index + lane;
+            if (output_lane < dimensions.outputs) {
+                sums[lane] += dot(
+                    input_value,
+                    vec4(weight_values[output_lane * packed_width + column]));
+            }
+        }
+    }
+
+    for (uint lane = 0; lane < 8; ++lane) {
+        uint output_lane = output_index + lane;
+        if (output_lane < dimensions.outputs) {
+            output_values[row * dimensions.outputs + output_lane] =
+                sums[lane] + bias_values[output_lane];
+        }
+    }
+}

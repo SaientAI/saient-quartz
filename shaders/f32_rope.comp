@@ -1,0 +1,47 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float input_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer PositionBuffer {
+    float position_values[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Dimensions {
+    uint rows;
+    uint heads;
+    uint head_dim;
+    uint padding;
+} dimensions;
+
+void main() {
+    uint pair_index = gl_GlobalInvocationID.x;
+    uint pairs = dimensions.head_dim / 2;
+    uint pairs_per_row = dimensions.heads * pairs;
+    uint total_pairs = dimensions.rows * pairs_per_row;
+    if (pair_index >= total_pairs) {
+        return;
+    }
+
+    uint row = pair_index / pairs_per_row;
+    uint row_pair = pair_index % pairs_per_row;
+    uint head = row_pair / pairs;
+    uint pair = row_pair % pairs;
+    uint width = dimensions.heads * dimensions.head_dim;
+    uint input_offset = row * width + head * dimensions.head_dim + pair * 2;
+    uint position_offset = (row * pairs + pair) * 4;
+
+    float first = input_values[input_offset];
+    float second = input_values[input_offset + 1];
+    output_values[input_offset] =
+        position_values[position_offset] * first +
+        position_values[position_offset + 1] * second;
+    output_values[input_offset + 1] =
+        position_values[position_offset + 2] * first +
+        position_values[position_offset + 3] * second;
+}
