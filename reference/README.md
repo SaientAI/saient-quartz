@@ -39,11 +39,39 @@ Dump format `SQD1`: magic `"SQD1"`, `u32` ndim, `i64` dims, then f32 data.
 
 | Stage | Status | Verified by |
 |---|---|---|
-| Flow-matching sigma schedule | **done** | `src/wan_scheduler.rs` tests, exact against dumped sigmas |
-| T5 tokenizer | reference captured | `t5_ids_*.txt` below |
-| UMT5-XXL encoder | reference captured | `cond_crossattn` fingerprint below |
-| Wan DiT | not started | needs per-step latent dumps |
-| 3D causal VAE | not started | needs pre-decode latent dump |
+| Flow-matching sigma schedule | **verified** | `src/wan_scheduler.rs` tests, exact against dumped sigmas |
+| T5 tokenizer | **verified** | exact token IDs in `t5_ids_*.txt` |
+| UMT5-XXL encoder | **verified** | cosine similarity 0.99918 against `cond_crossattn` |
+| Wan DiT | **verified** | cosine similarity 0.99995 against the captured velocity |
+| 3D causal VAE | **verified** | small and full decoder parity tests described below |
+
+## 3D causal VAE decoder
+
+The complete graph, NCTHW tensor layouts, 32 used feature-cache slots, and
+temporal-upsample branches are documented in [`WAN_VAE.md`](WAN_VAE.md).
+
+| Case | Input | Output | Cosine | Max abs | Mean abs | Rust release runtime |
+|---|---:|---:|---:|---:|---:|---:|
+| Small | `[1,16,2,8,8]` | `[1,3,5,64,64]` | 0.999992503 | 0.0027391 | 0.0004328 | 130.39 s |
+| Full | `[1,16,2,30,52]` | `[1,3,5,240,416]` | 0.999999012 | 0.0043769 | 0.0003166 | 3675.93 s |
+
+The full capture was regenerated with the command in this document and the
+VAE model whose SHA-256 is
+`2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b`.
+The committed SQD1 artifacts are:
+
+- `vae_in_full.bin`:
+  `323ccd735929cdb160e1c11c5583223b6ea12aa223e7c81ae9b96d1a5adf3aa9`
+- `vae_out_full.bin`:
+  `30a070aa52d0e398afdb5e38812349d5cade553f5e3f4b0bdc0b9e9fdf2d60ea`
+
+Run the parity checks explicitly (they are ignored by the routine suite due
+to their cost):
+
+```bash
+cargo test --release wan_vae::parity::small_decode_matches_reference -- --ignored --nocapture
+cargo test --release wan_vae::parity::full_decode_matches_reference -- --ignored --nocapture
+```
 
 ### Sigmas — matching (steps=8, shift=8)
 
@@ -111,15 +139,10 @@ The Quartz implementation must read embedding rows **directly from the
 quantised weights** from the first commit. Do not "make it work first and
 optimise later" here — that path ends at an OOM on an 8 GB phone.
 
-## Suggested order
+## Implementation order
 
-1. ~~Scheduler~~ — done.
-2. **T5 SentencePiece unigram tokenizer** — self-contained, exact-match
-   testable against `t5_ids_*.txt`, no model execution needed.
-3. **UMT5 encoder** — clears the whole conditioning half, which is where
-   the ghost-subject bug lived. Reuses GGUF loading, dequant and the
-   attention/RMSNorm machinery from the LLM path.
-4. **Wan DiT** — largest piece; diff block-by-block against per-step
-   latents (needs a new dump hook in the sampler loop).
-5. **3D causal VAE** — most new kernel work (conv3d, temporal causality),
-   but the only stage whose output you can actually eyeball.
+1. ~~Scheduler~~ — verified.
+2. ~~T5 SentencePiece unigram tokenizer~~ — verified.
+3. ~~UMT5 encoder~~ — verified.
+4. ~~Wan DiT~~ — verified.
+5. ~~3D causal VAE~~ — verified in the small and full cases above.

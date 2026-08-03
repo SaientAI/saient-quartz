@@ -158,12 +158,8 @@ mod tests {
 
     #[test]
     fn matches_reference_pe_dump() {
-        let p = Path::new("/tmp/saient_ref/wan_pe.bin");
-        if !p.exists() {
-            eprintln!("skipping: {p:?} not present (regenerate with SAIENT_DUMP=1)");
-            return;
-        }
-        let b = std::fs::read(p).unwrap();
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("reference/dit/wan_pe.bin");
+        let b = std::fs::read(&p).unwrap();
         assert_eq!(&b[..4], b"SQD1");
         let nd = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
         let dims: Vec<i64> = (0..nd)

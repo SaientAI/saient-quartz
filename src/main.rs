@@ -26,6 +26,7 @@ mod t5_tokenizer;
 mod tokenizer;
 mod umt5;
 mod wan_dit;
+mod wan_vae;
 mod wan_rope;
 mod wan_scheduler;
 #[cfg(feature = "vulkan")]

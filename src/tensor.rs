@@ -197,6 +197,48 @@ impl Tensor {
         Self::new(vec![batch, channels, height, width], data)
     }
 
+    /// Wan video-VAE RMS normalization across the channel axis of NCTHW data.
+    /// Each `(N,T,H,W)` location is normalized independently and then scaled
+    /// by its channel's learned weight.
+    pub fn channel_rms_norm_3d(&self, weight: &Self, epsilon: f32) -> Result<Self> {
+        let [batch, channels, time, height, width] = ncthw(&self.shape)?;
+        if weight.shape != [channels] {
+            bail!(
+                "channel RMSNorm weight shape {:?} must be [{channels}]",
+                weight.shape
+            );
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            bail!("channel RMSNorm epsilon must be positive and finite");
+        }
+        let volume = time
+            .checked_mul(height)
+            .and_then(|value| value.checked_mul(width))
+            .context("channel RMSNorm volume overflow")?;
+        let inverse_rms: Vec<f32> = (0..batch * volume)
+            .into_par_iter()
+            .map(|location| {
+                let sample = location / volume;
+                let position = location % volume;
+                let mut square_sum = 0.0f32;
+                for channel in 0..channels {
+                    let value = self.data[(sample * channels + channel) * volume + position];
+                    square_sum += value * value;
+                }
+                1.0 / (square_sum / channels as f32 + epsilon).sqrt()
+            })
+            .collect();
+        let mut data = self.data.clone();
+        data.par_iter_mut().enumerate().for_each(|(index, value)| {
+            let sample_channel = index / volume;
+            let sample = sample_channel / channels;
+            let channel = sample_channel % channels;
+            let position = index % volume;
+            *value *= inverse_rms[sample * volume + position] * weight.data[channel];
+        });
+        Self::new(self.shape.clone(), data)
+    }
+
     /// NCHW convolution with OIHW weights and symmetric zero padding.
     pub fn conv2d(
         &self,
@@ -320,6 +362,176 @@ impl Tensor {
                 }
             });
         Self::new(vec![batch, out_channels, out_height, out_width], data)
+    }
+
+    /// NCTHW convolution with OICTHW weights and explicit asymmetric padding.
+    ///
+    /// Padding arrays are ordered `[time, height, width]`. Keeping the before
+    /// and after values separate is required by causal video convolutions and
+    /// maps directly to a future GPU kernel's input-coordinate calculation.
+    pub fn conv3d(
+        &self,
+        weight: &Self,
+        bias: Option<&Self>,
+        stride: [usize; 3],
+        padding_before: [usize; 3],
+        padding_after: [usize; 3],
+        dilation: [usize; 3],
+        groups: usize,
+    ) -> Result<Self> {
+        let [batch, in_channels, in_time, in_height, in_width] = ncthw(&self.shape)?;
+        if weight.shape.len() != 5 {
+            bail!("conv3d weight must be rank 5, got {:?}", weight.shape);
+        }
+        let out_channels = weight.shape[0];
+        let weight_in_channels = weight.shape[1];
+        let kernel_time = weight.shape[2];
+        let kernel_height = weight.shape[3];
+        let kernel_width = weight.shape[4];
+        if groups == 0 || in_channels % groups != 0 || out_channels % groups != 0 {
+            bail!(
+                "conv3d group count {groups} is incompatible with {in_channels} input and {out_channels} output channels"
+            );
+        }
+        if weight_in_channels != in_channels / groups {
+            bail!(
+                "conv3d weight has {weight_in_channels} input channels per group, expected {}",
+                in_channels / groups
+            );
+        }
+        if stride.contains(&0)
+            || dilation.contains(&0)
+            || kernel_time == 0
+            || kernel_height == 0
+            || kernel_width == 0
+        {
+            bail!("conv3d stride, dilation, and kernel dimensions must be non-zero");
+        }
+        if let Some(bias) = bias {
+            if bias.shape != [out_channels] {
+                bail!(
+                    "conv3d bias shape {:?} must be [{out_channels}]",
+                    bias.shape
+                );
+            }
+        }
+
+        let effective_kernel = [kernel_time, kernel_height, kernel_width]
+            .into_iter()
+            .zip(dilation)
+            .map(|(kernel, dilation)| {
+                dilation
+                    .checked_mul(kernel - 1)
+                    .and_then(|value| value.checked_add(1))
+                    .context("conv3d effective kernel overflow")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let input_dims = [in_time, in_height, in_width];
+        let mut output_dims = [0usize; 3];
+        for axis in 0..3 {
+            let padded = input_dims[axis]
+                .checked_add(padding_before[axis])
+                .and_then(|value| value.checked_add(padding_after[axis]))
+                .context("conv3d padded dimension overflow")?;
+            if padded < effective_kernel[axis] {
+                bail!("conv3d effective kernel is larger than the padded input on axis {axis}");
+            }
+            output_dims[axis] = (padded - effective_kernel[axis]) / stride[axis] + 1;
+        }
+        let [out_time, out_height, out_width] = output_dims;
+        let output_plane = out_height
+            .checked_mul(out_width)
+            .context("conv3d output plane overflow")?;
+        let output_volume = out_time
+            .checked_mul(output_plane)
+            .context("conv3d output volume overflow")?;
+        let input_plane = in_height
+            .checked_mul(in_width)
+            .context("conv3d input plane overflow")?;
+        let input_volume = in_time
+            .checked_mul(input_plane)
+            .context("conv3d input volume overflow")?;
+        let kernel_plane = kernel_height
+            .checked_mul(kernel_width)
+            .context("conv3d kernel plane overflow")?;
+        let kernel_volume = kernel_time
+            .checked_mul(kernel_plane)
+            .context("conv3d kernel volume overflow")?;
+        let input_channels_per_group = in_channels / groups;
+        let output_channels_per_group = out_channels / groups;
+        let output_len = batch
+            .checked_mul(out_channels)
+            .and_then(|value| value.checked_mul(output_volume))
+            .context("conv3d output size overflow")?;
+        let mut data = vec![0.0f32; output_len];
+
+        data.par_chunks_mut(output_plane)
+            .enumerate()
+            .for_each(|(plane_index, output)| {
+                let out_t = plane_index % out_time;
+                let sample_channel = plane_index / out_time;
+                let sample = sample_channel / out_channels;
+                let out_channel = sample_channel % out_channels;
+                let group = out_channel / output_channels_per_group;
+                let input_channel_start = group * input_channels_per_group;
+
+                for out_y in 0..out_height {
+                    for out_x in 0..out_width {
+                        let mut sum = bias.map_or(0.0, |b| b.data[out_channel]);
+                        for local_in_channel in 0..input_channels_per_group {
+                            let in_channel = input_channel_start + local_in_channel;
+                            let input_base = (sample * in_channels + in_channel) * input_volume;
+                            let weight_base = (out_channel * input_channels_per_group
+                                + local_in_channel)
+                                * kernel_volume;
+                            for kernel_t in 0..kernel_time {
+                                let padded_t = out_t * stride[0] + kernel_t * dilation[0];
+                                if padded_t < padding_before[0] {
+                                    continue;
+                                }
+                                let in_t = padded_t - padding_before[0];
+                                if in_t >= in_time {
+                                    continue;
+                                }
+                                for kernel_y in 0..kernel_height {
+                                    let padded_y = out_y * stride[1] + kernel_y * dilation[1];
+                                    if padded_y < padding_before[1] {
+                                        continue;
+                                    }
+                                    let in_y = padded_y - padding_before[1];
+                                    if in_y >= in_height {
+                                        continue;
+                                    }
+                                    for kernel_x in 0..kernel_width {
+                                        let padded_x = out_x * stride[2] + kernel_x * dilation[2];
+                                        if padded_x < padding_before[2] {
+                                            continue;
+                                        }
+                                        let in_x = padded_x - padding_before[2];
+                                        if in_x >= in_width {
+                                            continue;
+                                        }
+                                        let input_index = input_base
+                                            + in_t * input_plane
+                                            + in_y * in_width
+                                            + in_x;
+                                        let weight_index = weight_base
+                                            + kernel_t * kernel_plane
+                                            + kernel_y * kernel_width
+                                            + kernel_x;
+                                        sum += self.data[input_index] * weight.data[weight_index];
+                                    }
+                                }
+                            }
+                        }
+                        output[out_y * out_width + out_x] = sum;
+                    }
+                }
+            });
+        Self::new(
+            vec![batch, out_channels, out_time, out_height, out_width],
+            data,
+        )
     }
 
     pub fn upsample_nearest2d(&self, scale: [usize; 2]) -> Result<Self> {
@@ -504,6 +716,12 @@ fn nchw(shape: &[usize]) -> Result<[usize; 4]> {
         .map_err(|_| anyhow::anyhow!("expected rank-4 NCHW tensor, got {shape:?}"))
 }
 
+fn ncthw(shape: &[usize]) -> Result<[usize; 5]> {
+    shape
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("expected rank-5 NCTHW tensor, got {shape:?}"))
+}
+
 fn softmax(values: &mut [f32]) {
     let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;
@@ -577,6 +795,41 @@ mod tests {
     }
 
     #[test]
+    fn conv3d_handles_asymmetric_temporal_padding() {
+        let input = tensor(&[1, 1, 2, 1, 1], &[2., 3.]);
+        let weight = tensor(&[1, 1, 3, 1, 1], &[1., 10., 100.]);
+        let bias = tensor(&[1], &[0.5]);
+        let output = input
+            .conv3d(
+                &weight,
+                Some(&bias),
+                [1, 1, 1],
+                [2, 0, 0],
+                [0, 0, 0],
+                [1, 1, 1],
+                1,
+            )
+            .unwrap();
+        assert_eq!(output.shape(), &[1, 1, 2, 1, 1]);
+        assert_close(output.data(), &[200.5, 320.5], 1e-6);
+    }
+
+    #[test]
+    fn causal_conv3d_prefix_is_independent_of_future_frames() {
+        let prefix = tensor(&[1, 1, 1, 1, 1], &[2.]);
+        let sequence = tensor(&[1, 1, 2, 1, 1], &[2., 999.]);
+        let weight = tensor(&[1, 1, 3, 1, 1], &[1., 10., 100.]);
+        let prefix_output = prefix
+            .conv3d(&weight, None, [1, 1, 1], [2, 0, 0], [0, 0, 0], [1, 1, 1], 1)
+            .unwrap();
+        let sequence_output = sequence
+            .conv3d(&weight, None, [1, 1, 1], [2, 0, 0], [0, 0, 0], [1, 1, 1], 1)
+            .unwrap();
+        assert_eq!(prefix_output.data()[0], sequence_output.data()[0]);
+        assert_eq!(sequence_output.data()[0], 200.0);
+    }
+
+    #[test]
     fn group_norm_normalizes_each_group() {
         let input = tensor(&[1, 2, 1, 2], &[1., 3., 10., 14.]);
         let weight = tensor(&[2], &[1., 1.]);
@@ -586,6 +839,19 @@ mod tests {
             output.data(),
             &[-0.999995, 0.999995, -0.999999, 0.999999],
             2e-5,
+        );
+    }
+
+    #[test]
+    fn channel_rms_norm_3d_normalizes_across_channels() {
+        let input = tensor(&[1, 2, 1, 1, 2], &[3., 0., 4., 5.]);
+        let weight = tensor(&[2], &[2., 0.5]);
+        let output = input.channel_rms_norm_3d(&weight, 1e-12).unwrap();
+        assert_eq!(output.shape(), &[1, 2, 1, 1, 2]);
+        assert_close(
+            output.data(),
+            &[1.6970563, 0.0, 0.56568545, 0.70710677],
+            1e-6,
         );
     }
 
