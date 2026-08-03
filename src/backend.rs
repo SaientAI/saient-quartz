@@ -45,6 +45,36 @@ impl DeviceTensor {
     pub(crate) fn shape(&self) -> &[usize] {
         &self.shape
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.shape.iter().product()
+    }
+
+    pub(crate) fn byte_len(&self) -> usize {
+        self.len() * std::mem::size_of::<f32>()
+    }
+
+    pub(crate) fn backend_kind(&self) -> BackendKind {
+        self.backend
+    }
+
+    pub(crate) fn remains_resident(&self) -> bool {
+        match &self.storage {
+            DeviceTensorStorage::Host(_) => false,
+            #[cfg(feature = "vulkan")]
+            DeviceTensorStorage::Vulkan(_) => true,
+        }
+    }
+
+    pub(crate) fn is_device_local(&self) -> Result<bool> {
+        match &self.storage {
+            DeviceTensorStorage::Host(_) => Ok(false),
+            #[cfg(feature = "vulkan")]
+            DeviceTensorStorage::Vulkan(storage) => {
+                crate::vulkan::resident_tensor_is_device_local(storage)
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -162,6 +192,169 @@ pub(crate) trait TensorBackend: Send + Sync {
                 bail!("non-Vulkan backend cannot download Vulkan storage")
             }
         }
+    }
+
+    fn ncthw_slice_time_device(
+        &self,
+        input: &DeviceTensor,
+        start: usize,
+        count: usize,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        let [batch, channels, time, height, width]: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("temporal slice input must be NCTHW")?;
+        if count == 0 {
+            bail!("temporal slice cannot select zero frames");
+        }
+        let end = start
+            .checked_add(count)
+            .context("temporal slice range overflow")?;
+        if end > time {
+            bail!("temporal slice {start}..{end} exceeds input time {time}");
+        }
+        let input = input.storage.host()?;
+        let plane = height * width;
+        let mut data = Vec::with_capacity(batch * channels * count * plane);
+        for sample in 0..batch {
+            for channel in 0..channels {
+                let source = ((sample * channels + channel) * time + start) * plane;
+                data.extend_from_slice(&input.data()[source..source + count * plane]);
+            }
+        }
+        self.upload_tensor(&Tensor::new(
+            vec![batch, channels, count, height, width],
+            data,
+        )?)
+    }
+
+    fn ncthw_concat_time_device(&self, inputs: &[&DeviceTensor]) -> Result<DeviceTensor> {
+        let first = inputs
+            .first()
+            .context("temporal concat requires at least one tensor")?;
+        self.require_tensor(first)?;
+        let [batch, channels, _, height, width]: [usize; 5] = first
+            .shape()
+            .try_into()
+            .context("temporal concat input must be NCTHW")?;
+        let mut total_time = 0usize;
+        for input in inputs {
+            self.require_tensor(input)?;
+            let [
+                input_batch,
+                input_channels,
+                input_time,
+                input_height,
+                input_width,
+            ]: [usize; 5] = input
+                .shape()
+                .try_into()
+                .context("temporal concat input must be NCTHW")?;
+            if [input_batch, input_channels, input_height, input_width]
+                != [batch, channels, height, width]
+            {
+                bail!(
+                    "temporal concat non-time dimensions differ: {:?} vs {:?}",
+                    first.shape(),
+                    input.shape()
+                );
+            }
+            total_time = total_time
+                .checked_add(input_time)
+                .context("temporal concat length overflow")?;
+        }
+        let plane = height * width;
+        let mut data = Vec::with_capacity(batch * channels * total_time * plane);
+        for sample in 0..batch {
+            for channel in 0..channels {
+                for input in inputs {
+                    let input_time = input.shape()[2];
+                    let input = input.storage.host()?;
+                    let source = (sample * channels + channel) * input_time * plane;
+                    data.extend_from_slice(&input.data()[source..source + input_time * plane]);
+                }
+            }
+        }
+        self.upload_tensor(&Tensor::new(
+            vec![batch, channels, total_time, height, width],
+            data,
+        )?)
+    }
+
+    fn ncthw_prepend_zero_time_device(
+        &self,
+        input: &DeviceTensor,
+        count: usize,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        if count == 0 {
+            return Ok(input.clone());
+        }
+        let [batch, channels, time, height, width]: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("zero-time prepend input must be NCTHW")?;
+        let output_time = time
+            .checked_add(count)
+            .context("zero-time prepend length overflow")?;
+        let plane = height * width;
+        let input = input.storage.host()?;
+        let mut data = vec![0.0; batch * channels * output_time * plane];
+        for sample in 0..batch {
+            for channel in 0..channels {
+                let source = (sample * channels + channel) * time * plane;
+                let destination = ((sample * channels + channel) * output_time + count) * plane;
+                data[destination..destination + time * plane]
+                    .copy_from_slice(&input.data()[source..source + time * plane]);
+            }
+        }
+        self.upload_tensor(&Tensor::new(
+            vec![batch, channels, output_time, height, width],
+            data,
+        )?)
+    }
+
+    fn ncthw_channels_to_time_device(&self, input: &DeviceTensor) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        let [batch, doubled_channels, time, height, width]: [usize; 5] =
+            input
+                .shape()
+                .try_into()
+                .context("channel-to-time input must be NCTHW")?;
+        if doubled_channels % 2 != 0 {
+            bail!("Wan channel-to-time shuffle needs an even channel count");
+        }
+        let channels = doubled_channels / 2;
+        let output_time = time
+            .checked_mul(2)
+            .context("channel-to-time length overflow")?;
+        let plane = height * width;
+        let input = input.storage.host()?;
+        let mut data = vec![0.0; input.len()];
+        for sample in 0..batch {
+            for channel in 0..channels {
+                for input_time in 0..time {
+                    for half in 0..2 {
+                        // Exact Wan mapping:
+                        // input[n, half*C+c, t, h, w] -> output[n, c, 2*t+half, h, w].
+                        let input_channel = half * channels + channel;
+                        let source = ((sample * doubled_channels + input_channel) * time
+                            + input_time)
+                            * plane;
+                        let destination =
+                            ((sample * channels + channel) * output_time + input_time * 2 + half)
+                                * plane;
+                        data[destination..destination + plane]
+                            .copy_from_slice(&input.data()[source..source + plane]);
+                    }
+                }
+            }
+        }
+        self.upload_tensor(&Tensor::new(
+            vec![batch, channels, output_time, height, width],
+            data,
+        )?)
     }
 
     /// Prepare one dense projection. Matrix and optional bias ownership are
@@ -1079,6 +1272,177 @@ impl TensorBackend for VulkanBackend {
         crate::vulkan::download_resident_tensor(storage, &input.shape)
     }
 
+    fn ncthw_slice_time_device(
+        &self,
+        input: &DeviceTensor,
+        start: usize,
+        count: usize,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        let input_shape: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("Vulkan temporal slice input must be NCTHW")?;
+        if count == 0 {
+            bail!("Vulkan temporal slice cannot select zero frames");
+        }
+        let end = start
+            .checked_add(count)
+            .context("Vulkan temporal slice range overflow")?;
+        if end > input_shape[2] {
+            bail!(
+                "Vulkan temporal slice {start}..{end} exceeds input time {}",
+                input_shape[2]
+            );
+        }
+        let DeviceTensorStorage::Vulkan(storage) = &input.storage else {
+            bail!("Vulkan temporal slice received non-Vulkan storage");
+        };
+        Ok(DeviceTensor {
+            backend: BackendKind::Vulkan,
+            shape: vec![
+                input_shape[0],
+                input_shape[1],
+                count,
+                input_shape[3],
+                input_shape[4],
+            ],
+            storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_ncthw_slice_time(
+                storage,
+                input_shape,
+                start,
+                count,
+            )?),
+        })
+    }
+
+    fn ncthw_concat_time_device(&self, inputs: &[&DeviceTensor]) -> Result<DeviceTensor> {
+        let first = inputs
+            .first()
+            .context("Vulkan temporal concat requires at least one tensor")?;
+        self.require_tensor(first)?;
+        let mut output = (*first).clone();
+        for right in &inputs[1..] {
+            self.require_tensor(right)?;
+            let left_shape: [usize; 5] = output
+                .shape()
+                .try_into()
+                .context("Vulkan temporal concat input must be NCTHW")?;
+            let right_shape: [usize; 5] = right
+                .shape()
+                .try_into()
+                .context("Vulkan temporal concat input must be NCTHW")?;
+            if [left_shape[0], left_shape[1], left_shape[3], left_shape[4]]
+                != [
+                    right_shape[0],
+                    right_shape[1],
+                    right_shape[3],
+                    right_shape[4],
+                ]
+            {
+                bail!(
+                    "Vulkan temporal concat non-time dimensions differ: {:?} vs {:?}",
+                    output.shape(),
+                    right.shape()
+                );
+            }
+            let output_time = left_shape[2]
+                .checked_add(right_shape[2])
+                .context("Vulkan temporal concat length overflow")?;
+            let DeviceTensorStorage::Vulkan(left_storage) = &output.storage else {
+                bail!("Vulkan temporal concat received non-Vulkan left storage");
+            };
+            let DeviceTensorStorage::Vulkan(right_storage) = &right.storage else {
+                bail!("Vulkan temporal concat received non-Vulkan right storage");
+            };
+            let storage = crate::vulkan::resident_ncthw_concat_time(
+                left_storage,
+                right_storage,
+                left_shape,
+                right_shape[2],
+            )?;
+            output = DeviceTensor {
+                backend: BackendKind::Vulkan,
+                shape: vec![
+                    left_shape[0],
+                    left_shape[1],
+                    output_time,
+                    left_shape[3],
+                    left_shape[4],
+                ],
+                storage: DeviceTensorStorage::Vulkan(storage),
+            };
+        }
+        Ok(output)
+    }
+
+    fn ncthw_prepend_zero_time_device(
+        &self,
+        input: &DeviceTensor,
+        count: usize,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        if count == 0 {
+            return Ok(input.clone());
+        }
+        let input_shape: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("Vulkan zero-time prepend input must be NCTHW")?;
+        let output_time = input_shape[2]
+            .checked_add(count)
+            .context("Vulkan zero-time prepend length overflow")?;
+        let DeviceTensorStorage::Vulkan(storage) = &input.storage else {
+            bail!("Vulkan zero-time prepend received non-Vulkan storage");
+        };
+        Ok(DeviceTensor {
+            backend: BackendKind::Vulkan,
+            shape: vec![
+                input_shape[0],
+                input_shape[1],
+                output_time,
+                input_shape[3],
+                input_shape[4],
+            ],
+            storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_ncthw_prepend_zero_time(
+                storage,
+                input_shape,
+                count,
+            )?),
+        })
+    }
+
+    fn ncthw_channels_to_time_device(&self, input: &DeviceTensor) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        let input_shape: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("Vulkan channel-to-time input must be NCTHW")?;
+        if input_shape[1] % 2 != 0 {
+            bail!("Vulkan Wan channel-to-time shuffle needs an even channel count");
+        }
+        let output_time = input_shape[2]
+            .checked_mul(2)
+            .context("Vulkan channel-to-time output length overflow")?;
+        let DeviceTensorStorage::Vulkan(storage) = &input.storage else {
+            bail!("Vulkan channel-to-time received non-Vulkan storage");
+        };
+        Ok(DeviceTensor {
+            backend: BackendKind::Vulkan,
+            shape: vec![
+                input_shape[0],
+                input_shape[1] / 2,
+                output_time,
+                input_shape[3],
+                input_shape[4],
+            ],
+            storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_ncthw_channels_to_time(
+                storage,
+                input_shape,
+            )?),
+        })
+    }
+
     fn prepare_linear(&self, weight: &Tensor, bias: Option<&Tensor>) -> Result<LinearWeightHandle> {
         let [output_width, input_width]: [usize; 2] = weight
             .shape()
@@ -1893,6 +2257,237 @@ mod tests {
         let device_output = SCALAR_BACKEND.download_tensor(&device_output).unwrap();
         assert_eq!(device_output.shape(), &[2, 3]);
         assert!(device_output.data().iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn scalar_ncthw_temporal_primitives_preserve_exact_layout() {
+        let input = Tensor::new(
+            vec![2, 3, 5, 2, 3],
+            (0..180).map(|index| index as f32 - 90.0).collect(),
+        )
+        .unwrap();
+        let device = SCALAR_BACKEND.upload_tensor(&input).unwrap();
+        for (start, count) in [(0, 1), (4, 1), (1, 3), (0, 5)] {
+            let output = SCALAR_BACKEND
+                .ncthw_slice_time_device(&device, start, count)
+                .unwrap();
+            assert_eq!(output.shape(), &[2, 3, count, 2, 3]);
+        }
+        assert!(
+            SCALAR_BACKEND
+                .ncthw_slice_time_device(&device, 0, 0)
+                .is_err()
+        );
+        assert!(
+            SCALAR_BACKEND
+                .ncthw_slice_time_device(&device, 5, 1)
+                .is_err()
+        );
+
+        let first = SCALAR_BACKEND
+            .ncthw_slice_time_device(&device, 0, 1)
+            .unwrap();
+        let middle = SCALAR_BACKEND
+            .ncthw_slice_time_device(&device, 1, 2)
+            .unwrap();
+        let last = SCALAR_BACKEND
+            .ncthw_slice_time_device(&device, 3, 2)
+            .unwrap();
+        let concatenated = SCALAR_BACKEND
+            .ncthw_concat_time_device(&[&first, &middle, &last])
+            .unwrap();
+        assert_eq!(
+            SCALAR_BACKEND.download_tensor(&concatenated).unwrap(),
+            input
+        );
+
+        let prepended = SCALAR_BACKEND
+            .ncthw_prepend_zero_time_device(&middle, 2)
+            .unwrap();
+        let prepended = SCALAR_BACKEND.download_tensor(&prepended).unwrap();
+        assert_eq!(prepended.shape(), &[2, 3, 4, 2, 3]);
+        let plane = 2 * 3;
+        for sample in 0..2 {
+            for channel in 0..3 {
+                let base = (sample * 3 + channel) * 4 * plane;
+                assert_eq!(&prepended.data()[base..base + 2 * plane], &[0.0; 12]);
+                let source = (sample * 3 + channel) * 2 * plane;
+                let middle = SCALAR_BACKEND.download_tensor(&middle).unwrap();
+                assert_eq!(
+                    &prepended.data()[base + 2 * plane..base + 4 * plane],
+                    &middle.data()[source..source + 2 * plane]
+                );
+            }
+        }
+
+        let shuffle_input = Tensor::new(
+            vec![2, 4, 2, 2, 3],
+            (0..96).map(|index| index as f32 + 0.25).collect(),
+        )
+        .unwrap();
+        let shuffle_device = SCALAR_BACKEND.upload_tensor(&shuffle_input).unwrap();
+        let shuffled = SCALAR_BACKEND
+            .ncthw_channels_to_time_device(&shuffle_device)
+            .unwrap();
+        let shuffled = SCALAR_BACKEND.download_tensor(&shuffled).unwrap();
+        assert_eq!(shuffled.shape(), &[2, 2, 4, 2, 3]);
+        for sample in 0..2 {
+            for channel in 0..2 {
+                for input_time in 0..2 {
+                    for channel_half in 0..2 {
+                        for spatial in 0..6 {
+                            let source =
+                                (((sample * 4 + channel_half * 2 + channel) * 2 + input_time) * 6)
+                                    + spatial;
+                            let destination =
+                                (((sample * 2 + channel) * 4 + input_time * 2 + channel_half) * 6)
+                                    + spatial;
+                            assert_eq!(shuffled.data()[destination], shuffle_input.data()[source]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_resident_ncthw_temporal_primitives_match_scalar_exactly() {
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let before = match crate::vulkan::persistence_stats() {
+            Ok(stats) => stats,
+            Err(error) if std::env::var_os("QUARTZ_REQUIRE_VULKAN").is_none() => {
+                eprintln!("skipping resident NCTHW temporal parity: {error:#}");
+                return;
+            }
+            Err(error) => panic!("required resident NCTHW temporal parity failed: {error:#}"),
+        };
+
+        let input = Tensor::new(
+            vec![2, 3, 5, 2, 3],
+            (0..180).map(|index| index as f32 - 90.0).collect(),
+        )
+        .unwrap();
+        let scalar_input = SCALAR_BACKEND.upload_tensor(&input).unwrap();
+        let device_input = VULKAN_BACKEND.upload_tensor(&input).unwrap();
+        let mut resident_outputs = Vec::new();
+        for (start, count) in [(0, 1), (4, 1), (1, 3), (0, 5)] {
+            let expected = SCALAR_BACKEND
+                .ncthw_slice_time_device(&scalar_input, start, count)
+                .and_then(|tensor| SCALAR_BACKEND.download_tensor(&tensor))
+                .unwrap();
+            let output = VULKAN_BACKEND
+                .ncthw_slice_time_device(&device_input, start, count)
+                .unwrap();
+            assert!(output.remains_resident());
+            assert!(!output.is_device_local().unwrap());
+            assert_eq!(VULKAN_BACKEND.download_tensor(&output).unwrap(), expected);
+            resident_outputs.push(output);
+        }
+        assert!(
+            VULKAN_BACKEND
+                .ncthw_slice_time_device(&device_input, 0, 0)
+                .is_err()
+        );
+        assert!(
+            VULKAN_BACKEND
+                .ncthw_slice_time_device(&device_input, 5, 1)
+                .is_err()
+        );
+
+        let first = VULKAN_BACKEND
+            .ncthw_slice_time_device(&device_input, 0, 1)
+            .unwrap();
+        let middle = VULKAN_BACKEND
+            .ncthw_slice_time_device(&device_input, 1, 2)
+            .unwrap();
+        let last = VULKAN_BACKEND
+            .ncthw_slice_time_device(&device_input, 3, 2)
+            .unwrap();
+        let concatenated = VULKAN_BACKEND
+            .ncthw_concat_time_device(&[&first, &middle, &last])
+            .unwrap();
+        assert_eq!(
+            VULKAN_BACKEND.download_tensor(&concatenated).unwrap(),
+            input
+        );
+
+        let expected_prepend = SCALAR_BACKEND
+            .ncthw_slice_time_device(&scalar_input, 1, 2)
+            .and_then(|tensor| SCALAR_BACKEND.ncthw_prepend_zero_time_device(&tensor, 2))
+            .and_then(|tensor| SCALAR_BACKEND.download_tensor(&tensor))
+            .unwrap();
+        let prepended = VULKAN_BACKEND
+            .ncthw_prepend_zero_time_device(&middle, 2)
+            .unwrap();
+        let prepended_host = VULKAN_BACKEND.download_tensor(&prepended).unwrap();
+        assert_eq!(prepended_host, expected_prepend);
+        for channel_plane in prepended_host.data().chunks_exact(4 * 2 * 3) {
+            assert_eq!(&channel_plane[..2 * 2 * 3], &[0.0; 12]);
+        }
+
+        let shuffle_input = Tensor::new(
+            vec![2, 4, 2, 2, 3],
+            (0..96).map(|index| index as f32 + 0.25).collect(),
+        )
+        .unwrap();
+        let scalar_shuffle = SCALAR_BACKEND.upload_tensor(&shuffle_input).unwrap();
+        let expected_shuffle = SCALAR_BACKEND
+            .ncthw_channels_to_time_device(&scalar_shuffle)
+            .and_then(|tensor| SCALAR_BACKEND.download_tensor(&tensor))
+            .unwrap();
+        let device_shuffle = VULKAN_BACKEND.upload_tensor(&shuffle_input).unwrap();
+        let shuffled = VULKAN_BACKEND
+            .ncthw_channels_to_time_device(&device_shuffle)
+            .unwrap();
+        let shuffled_host = VULKAN_BACKEND.download_tensor(&shuffled).unwrap();
+        assert_eq!(shuffled_host, expected_shuffle);
+        assert_eq!(shuffled_host.shape(), &[2, 2, 4, 2, 3]);
+
+        let mismatched = Tensor::zeros(vec![1, 3, 1, 2, 3]).unwrap();
+        let mismatched = VULKAN_BACKEND.upload_tensor(&mismatched).unwrap();
+        assert!(
+            VULKAN_BACKEND
+                .ncthw_concat_time_device(&[&first, &mismatched])
+                .is_err()
+        );
+
+        let after = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            3
+        );
+        assert_eq!(after.resident_downloads - before.resident_downloads, 7);
+        println!(
+            "resident NCTHW temporal primitives: slice_input={:?} slice_cases={:?} concat_inputs=3 prepend=2 shuffle_input={:?} shuffle_output={:?} host_uploads={} downloads={} cached_device_local={}",
+            input.shape(),
+            [(0, 1), (4, 1), (1, 3), (0, 5)],
+            shuffle_input.shape(),
+            shuffled_host.shape(),
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            after.resident_downloads - before.resident_downloads,
+            shuffled.is_device_local().unwrap(),
+        );
+
+        drop(mismatched);
+        drop(shuffled);
+        drop(device_shuffle);
+        drop(prepended);
+        drop(concatenated);
+        drop(last);
+        drop(middle);
+        drop(first);
+        drop(resident_outputs);
+        drop(device_input);
+        let after_drop = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after_drop.resident_allocated_bytes,
+            before.resident_allocated_bytes
+        );
+        assert_eq!(
+            after_drop.resident_device_local_bytes,
+            before.resident_device_local_bytes
+        );
     }
 
     #[cfg(feature = "vulkan")]

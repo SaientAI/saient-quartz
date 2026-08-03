@@ -100,6 +100,7 @@ fn build_vulkan_shader() {
     println!("cargo:rerun-if-changed=shaders/f32_patch_layout.comp");
     println!("cargo:rerun-if-changed=shaders/f32_wan_head_modulate.comp");
     println!("cargo:rerun-if-changed=shaders/f32_f16_conv3d.comp");
+    println!("cargo:rerun-if-changed=shaders/f32_ncthw_temporal.comp");
     let glslc = find_glslc().unwrap_or_else(|| {
         panic!("Vulkan feature requires GLSLC or an Android NDK containing shader-tools/glslc")
     });
@@ -133,6 +134,7 @@ fn build_vulkan_shader() {
             "f32_wan_head_modulate.spv",
         ),
         ("shaders/f32_f16_conv3d.comp", "f32_f16_conv3d.spv"),
+        ("shaders/f32_ncthw_temporal.comp", "f32_ncthw_temporal.spv"),
     ] {
         let status = Command::new(&glslc)
             .args(["--target-env=vulkan1.1", "-O", source, "-o"])

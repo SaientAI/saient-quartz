@@ -1,0 +1,125 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Input0Buffer {
+    float input0_values[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer Input1Buffer {
+    float input1_values[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Parameters {
+    uint operation;
+    uint elements;
+    uint batch;
+    uint output_channels;
+    uint output_time;
+    uint height;
+    uint width;
+    uint input0_channels;
+    uint input0_time;
+    uint input1_time;
+    uint parameter0;
+} parameters;
+
+uint ncthw_index(
+    uint sample_index,
+    uint channel,
+    uint time,
+    uint channels,
+    uint time_length
+) {
+    return ((sample_index * channels + channel) * time_length + time) *
+        parameters.height * parameters.width;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= parameters.elements) {
+        return;
+    }
+
+    uint plane = parameters.height * parameters.width;
+    uint spatial = index % plane;
+    uint output_plane = index / plane;
+    uint output_t = output_plane % parameters.output_time;
+    uint sample_channel = output_plane / parameters.output_time;
+    uint output_channel = sample_channel % parameters.output_channels;
+    uint sample_index = sample_channel / parameters.output_channels;
+
+    if (parameters.operation == 0u) {
+        // Temporal slice: output t=0 is input t=parameter0.
+        uint input_t = output_t + parameters.parameter0;
+        uint source = ncthw_index(
+            sample_index,
+            output_channel,
+            input_t,
+            parameters.input0_channels,
+            parameters.input0_time
+        ) + spatial;
+        output_values[index] = input0_values[source];
+        return;
+    }
+
+    if (parameters.operation == 1u) {
+        // Temporal concatenate: all input0 frames precede all input1 frames.
+        if (output_t < parameters.input0_time) {
+            uint source = ncthw_index(
+                sample_index,
+                output_channel,
+                output_t,
+                parameters.input0_channels,
+                parameters.input0_time
+            ) + spatial;
+            output_values[index] = input0_values[source];
+        } else {
+            uint input_t = output_t - parameters.input0_time;
+            uint source = ncthw_index(
+                sample_index,
+                output_channel,
+                input_t,
+                parameters.input0_channels,
+                parameters.input1_time
+            ) + spatial;
+            output_values[index] = input1_values[source];
+        }
+        return;
+    }
+
+    if (parameters.operation == 2u) {
+        // Causal zero prepend: no trailing frame is synthesized.
+        if (output_t < parameters.parameter0) {
+            output_values[index] = 0.0;
+        } else {
+            uint input_t = output_t - parameters.parameter0;
+            uint source = ncthw_index(
+                sample_index,
+                output_channel,
+                input_t,
+                parameters.input0_channels,
+                parameters.input0_time
+            ) + spatial;
+            output_values[index] = input0_values[source];
+        }
+        return;
+    }
+
+    // Wan temporal channel-to-time shuffle. Input channels are split into two
+    // contiguous halves. Input [n, half*out_c+c, t, h, w] maps to output
+    // [n, c, 2*t+half, h, w]. This is not spatial pixel shuffle.
+    uint input_t = output_t / 2u;
+    uint channel_half = output_t % 2u;
+    uint input_channel = channel_half * parameters.output_channels + output_channel;
+    uint source = ncthw_index(
+        sample_index,
+        input_channel,
+        input_t,
+        parameters.input0_channels,
+        parameters.input0_time
+    ) + spatial;
+    output_values[index] = input0_values[source];
+}

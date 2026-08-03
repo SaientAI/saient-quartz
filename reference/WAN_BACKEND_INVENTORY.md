@@ -192,5 +192,38 @@ Conv3D accepts explicit padding-before and padding-after arrays; the causal
 test `[1,2,3,4,5]` with `[3,2,3,3,3]` weights and temporal padding `2/0`
 matched scalar exactly. The first real VAE prelude convolution on captured
 `[1,16,2,8,8]` input matched at cosine `1.0`, maximum error `4.77e-7`, and mean
-error `4.7e-8`. Device-resident temporal slice/concat is the next required
-primitive before the 32-slot feature cache can move without host transfers.
+error `4.7e-8`.
+
+## Resident VAE temporal-cache milestone
+
+The backend now owns four FP32 NCTHW layout operations without host
+reconstruction: temporal slice, ordered temporal concatenation, causal
+zero-time prepend, and Wan's channel-to-time shuffle. The shuffle mapping is
+fixed as
+
+`input[n, half*C+c, t, h, w] -> output[n, c, 2*t+half, h, w]`.
+
+Exact-equality fixtures cover first/last/middle/full slices of
+`[2,3,5,2,3]`, a three-input concatenation, a two-frame zero prefix, and a
+multi-batch `[2,4,2,2,3] -> [2,2,4,2,3]` shuffle. That focused Vulkan test
+performed three host uploads (the source, shuffle source, and one deliberately
+mismatched validation tensor) and seven deliberate comparison downloads; no
+operation downloaded and reconstructed an intermediate tensor.
+
+`DeviceFeatureCache` has exactly 32 independently replaceable slots. It
+validates NCTHW shape, Vulkan ownership, matching non-temporal axes, and the
+two-frame prefix limit. It reports logical current/peak bytes, occupancy,
+replacement/eviction counts, resident ownership, and memory class. Reset drops
+every slot and returns the active index to zero, so a new decode cannot retain
+stale feature tensors. Vulkan activation outputs currently remain resident in
+host-visible/coherent allocations; cache reporting therefore says
+`all_slots_resident=true` and `all_slots_device_local=false` until the future
+activation arena changes their memory class.
+
+The accepted cached Conv3D fixture uses input `[1,2,5,2,3]`, weight
+`[3,2,3,3,3]`, output `[1,3,5,2,3]`, causal padding-before `[2,1,1]`,
+padding-after `[0,1,1]`, unit stride/dilation, and chunks `1+2+2`. Incremental
+Vulkan execution matched one-shot scalar with cosine `1.0`, maximum error `0`,
+and mean error `0`. The focused execution took `4.983 ms`, retained a 96-byte
+two-frame cache prefix, and held 1,392 logical Vulkan bytes at comparison. It
+used one activation upload, one prepared-weight upload, and one final download.

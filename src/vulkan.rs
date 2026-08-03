@@ -54,6 +54,8 @@ const WAN_HEAD_MODULATE_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/f32_wan_head_modulate.spv"));
 const RESIDENT_CONV3D_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/f32_f16_conv3d.spv"));
+const NCTHW_TEMPORAL_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/f32_ncthw_temporal.spv"));
 static SD_ACCELERATION: AtomicBool = AtomicBool::new(false);
 static RUNTIME: OnceLock<Result<Mutex<VulkanRuntime>, String>> = OnceLock::new();
 #[cfg(test)]
@@ -741,6 +743,10 @@ pub(crate) fn download_resident_tensor(input: &ResidentTensor, shape: &[usize]) 
     Tensor::new(shape.to_vec(), values)
 }
 
+pub(crate) fn resident_tensor_is_device_local(input: &ResidentTensor) -> Result<bool> {
+    with_runtime(|runtime| runtime.resident_is_device_local(input.id()))
+}
+
 pub(crate) fn prepare_resident_linear(
     weight: &Tensor,
     bias: Option<&Tensor>,
@@ -952,6 +958,200 @@ pub(crate) fn resident_conv3d(
         output_elements,
         ResidentElementType::F32,
     ))
+}
+
+fn resident_ncthw_temporal(
+    input0: &ResidentTensor,
+    input1: &ResidentTensor,
+    input0_shape: [usize; 5],
+    input1_time: usize,
+    output_shape: [usize; 5],
+    operation: usize,
+    parameter0: usize,
+) -> Result<ResidentTensor> {
+    let [batch, input0_channels, input0_time, height, width] = input0_shape;
+    let [
+        output_batch,
+        output_channels,
+        output_time,
+        output_height,
+        output_width,
+    ] = output_shape;
+    if batch == 0
+        || input0_channels == 0
+        || input0_time == 0
+        || height == 0
+        || width == 0
+        || output_batch != batch
+        || output_channels == 0
+        || output_time == 0
+        || output_height != height
+        || output_width != width
+    {
+        bail!("resident NCTHW temporal dimensions are invalid");
+    }
+    let input0_elements = batch
+        .checked_mul(input0_channels)
+        .and_then(|value| value.checked_mul(input0_time))
+        .and_then(|value| value.checked_mul(height))
+        .and_then(|value| value.checked_mul(width))
+        .context("resident NCTHW temporal input size overflow")?;
+    let input1_elements = input1.elements;
+    if input0.element_type != ResidentElementType::F32
+        || input1.element_type != ResidentElementType::F32
+        || input0.elements != input0_elements
+    {
+        bail!("resident NCTHW temporal input storage does not match its dimensions");
+    }
+    let output_elements = batch
+        .checked_mul(output_channels)
+        .and_then(|value| value.checked_mul(output_time))
+        .and_then(|value| value.checked_mul(height))
+        .and_then(|value| value.checked_mul(width))
+        .context("resident NCTHW temporal output size overflow")?;
+    let parameters = [
+        operation,
+        output_elements,
+        batch,
+        output_channels,
+        output_time,
+        height,
+        width,
+        input0_channels,
+        input0_time,
+        input1_time,
+        parameter0,
+    ]
+    .map(u32::try_from)
+    .into_iter()
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .context("resident NCTHW temporal dimensions exceed u32")?;
+    let id = with_runtime(|runtime| {
+        runtime.resident_ncthw_temporal(
+            input0.id(),
+            input1.id(),
+            input0_elements,
+            input1_elements,
+            parameters
+                .as_slice()
+                .try_into()
+                .expect("11 NCTHW temporal parameters"),
+        )
+    })?;
+    Ok(resident_tensor(
+        id,
+        output_elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_ncthw_slice_time(
+    input: &ResidentTensor,
+    input_shape: [usize; 5],
+    start: usize,
+    count: usize,
+) -> Result<ResidentTensor> {
+    if count == 0 {
+        bail!("resident NCTHW temporal slice cannot be empty");
+    }
+    let end = start
+        .checked_add(count)
+        .context("resident NCTHW temporal slice overflow")?;
+    if end > input_shape[2] {
+        bail!("resident NCTHW temporal slice is out of bounds");
+    }
+    let output_shape = [
+        input_shape[0],
+        input_shape[1],
+        count,
+        input_shape[3],
+        input_shape[4],
+    ];
+    resident_ncthw_temporal(
+        input,
+        input,
+        input_shape,
+        input_shape[2],
+        output_shape,
+        0,
+        start,
+    )
+}
+
+pub(crate) fn resident_ncthw_concat_time(
+    left: &ResidentTensor,
+    right: &ResidentTensor,
+    left_shape: [usize; 5],
+    right_time: usize,
+) -> Result<ResidentTensor> {
+    let output_time = left_shape[2]
+        .checked_add(right_time)
+        .context("resident NCTHW temporal concat overflow")?;
+    let output_shape = [
+        left_shape[0],
+        left_shape[1],
+        output_time,
+        left_shape[3],
+        left_shape[4],
+    ];
+    resident_ncthw_temporal(left, right, left_shape, right_time, output_shape, 1, 0)
+}
+
+pub(crate) fn resident_ncthw_prepend_zero_time(
+    input: &ResidentTensor,
+    input_shape: [usize; 5],
+    count: usize,
+) -> Result<ResidentTensor> {
+    if count == 0 {
+        return Ok(input.clone());
+    }
+    let output_time = input_shape[2]
+        .checked_add(count)
+        .context("resident NCTHW zero-time prepend overflow")?;
+    let output_shape = [
+        input_shape[0],
+        input_shape[1],
+        output_time,
+        input_shape[3],
+        input_shape[4],
+    ];
+    resident_ncthw_temporal(
+        input,
+        input,
+        input_shape,
+        input_shape[2],
+        output_shape,
+        2,
+        count,
+    )
+}
+
+pub(crate) fn resident_ncthw_channels_to_time(
+    input: &ResidentTensor,
+    input_shape: [usize; 5],
+) -> Result<ResidentTensor> {
+    if input_shape[1] % 2 != 0 {
+        bail!("resident Wan channel-to-time shuffle needs an even channel count");
+    }
+    let output_time = input_shape[2]
+        .checked_mul(2)
+        .context("resident Wan channel-to-time output length overflow")?;
+    let output_shape = [
+        input_shape[0],
+        input_shape[1] / 2,
+        output_time,
+        input_shape[3],
+        input_shape[4],
+    ];
+    resident_ncthw_temporal(
+        input,
+        input,
+        input_shape,
+        input_shape[2],
+        output_shape,
+        3,
+        0,
+    )
 }
 
 pub(crate) fn resident_silu(input: &ResidentTensor) -> Result<ResidentTensor> {
@@ -2129,6 +2329,7 @@ struct VulkanRuntime {
     patch_layout_pipeline: vk::Pipeline,
     wan_head_modulate_pipeline: vk::Pipeline,
     resident_conv3d_pipeline: vk::Pipeline,
+    ncthw_temporal_pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
     command_pool: vk::CommandPool,
     device_name: String,
@@ -2379,6 +2580,7 @@ impl VulkanRuntime {
             patch_layout_pipeline: vk::Pipeline::null(),
             wan_head_modulate_pipeline: vk::Pipeline::null(),
             resident_conv3d_pipeline: vk::Pipeline::null(),
+            ncthw_temporal_pipeline: vk::Pipeline::null(),
             descriptor_pool: vk::DescriptorPool::null(),
             command_pool: vk::CommandPool::null(),
             device_name,
@@ -2513,6 +2715,7 @@ impl VulkanRuntime {
         self.patch_layout_pipeline = self.create_pipeline(PATCH_LAYOUT_SHADER)?;
         self.wan_head_modulate_pipeline = self.create_pipeline(WAN_HEAD_MODULATE_SHADER)?;
         self.resident_conv3d_pipeline = self.create_pipeline(RESIDENT_CONV3D_SHADER)?;
+        self.ncthw_temporal_pipeline = self.create_pipeline(NCTHW_TEMPORAL_SHADER)?;
 
         let pool_size = [vk::DescriptorPoolSize::builder()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
@@ -2967,6 +3170,110 @@ impl VulkanRuntime {
         result
     }
 
+    fn resident_ncthw_temporal(
+        &mut self,
+        input0_id: u64,
+        input1_id: u64,
+        input0_elements: usize,
+        input1_elements: usize,
+        parameters: &[u32; 11],
+    ) -> Result<u64> {
+        let [
+            operation,
+            output_elements,
+            batch,
+            output_channels,
+            output_time,
+            height,
+            width,
+            input0_channels,
+            input0_time,
+            input1_time,
+            parameter0,
+        ] = *parameters;
+        if operation > 3
+            || [
+                output_elements,
+                batch,
+                output_channels,
+                output_time,
+                height,
+                width,
+                input0_channels,
+                input0_time,
+            ]
+            .contains(&0)
+        {
+            bail!("resident NCTHW temporal parameters are invalid");
+        }
+        let expected_input0 = batch as usize
+            * input0_channels as usize
+            * input0_time as usize
+            * height as usize
+            * width as usize;
+        let expected_output = batch as usize
+            * output_channels as usize
+            * output_time as usize
+            * height as usize
+            * width as usize;
+        if input0_elements != expected_input0 || output_elements as usize != expected_output {
+            bail!("resident NCTHW temporal element counts are inconsistent");
+        }
+        match operation {
+            0 => {
+                if parameter0 as usize + output_time as usize > input0_time as usize
+                    || output_channels != input0_channels
+                {
+                    bail!("resident NCTHW temporal slice is out of bounds");
+                }
+            }
+            1 => {
+                let expected_input1 = batch as usize
+                    * input0_channels as usize
+                    * input1_time as usize
+                    * height as usize
+                    * width as usize;
+                if input1_time == 0
+                    || input1_elements != expected_input1
+                    || output_channels != input0_channels
+                    || output_time != input0_time + input1_time
+                {
+                    bail!("resident NCTHW temporal concat dimensions are inconsistent");
+                }
+            }
+            2 => {
+                if parameter0 == 0
+                    || output_channels != input0_channels
+                    || output_time != input0_time + parameter0
+                {
+                    bail!("resident NCTHW zero-time prepend dimensions are inconsistent");
+                }
+            }
+            3 => {
+                if input0_channels % 2 != 0
+                    || output_channels * 2 != input0_channels
+                    || output_time != input0_time * 2
+                {
+                    bail!("resident Wan channel-to-time dimensions are inconsistent");
+                }
+            }
+            _ => unreachable!(),
+        }
+        self.require_resident(input0_id, input0_elements, ResidentElementType::F32)?;
+        self.require_resident(input1_id, input1_elements, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input0_id, input1_id],
+            output_elements as usize,
+            self.ncthw_temporal_pipeline,
+            bytes_of(parameters),
+            [output_elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
     fn resident_silu(&mut self, input_id: u64, elements: u32) -> Result<u64> {
         self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
         let wall_started = Instant::now();
@@ -3414,6 +3721,14 @@ impl VulkanRuntime {
             );
         }
         Ok(())
+    }
+
+    fn resident_is_device_local(&self, id: u64) -> Result<bool> {
+        let resident = self
+            .resident_buffers
+            .get(&id)
+            .with_context(|| format!("unknown resident Vulkan buffer {id}"))?;
+        Ok(resident.buffer.memory_class == BufferMemoryClass::DeviceLocal)
     }
 
     fn download_resident(&mut self, id: u64, elements: usize) -> Result<Vec<f32>> {
@@ -5430,6 +5745,10 @@ impl Drop for VulkanRuntime {
             if self.resident_conv3d_pipeline != vk::Pipeline::null() {
                 self.device
                     .destroy_pipeline(self.resident_conv3d_pipeline, None);
+            }
+            if self.ncthw_temporal_pipeline != vk::Pipeline::null() {
+                self.device
+                    .destroy_pipeline(self.ncthw_temporal_pipeline, None);
             }
             if self.gemm_pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.gemm_pipeline, None);

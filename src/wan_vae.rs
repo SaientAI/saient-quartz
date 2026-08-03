@@ -8,6 +8,8 @@
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
+#[cfg(feature = "vulkan")]
+use crate::backend::BackendKind;
 use crate::{
     backend::{Conv3dWeightHandle, DeviceTensor, SCALAR_BACKEND, TensorBackend},
     safetensors::SafeTensorFile,
@@ -107,6 +109,42 @@ impl CausalConv3d {
         ];
         backend.conv3d_prepared_device(
             input,
+            &prepared.weights,
+            padding_before,
+            [0, self.padding[1], self.padding[2]],
+        )
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn forward_with_backend(
+        &self,
+        input: &DeviceTensor,
+        cache: Option<&DeviceTensor>,
+        backend: &dyn TensorBackend,
+        prepared: &PreparedCausalConv3d,
+    ) -> Result<DeviceTensor> {
+        let mut convolution_input = input.clone();
+        let mut padding_before = [
+            self.padding[0]
+                .checked_mul(2)
+                .context("resident causal temporal padding overflow")?,
+            self.padding[1],
+            self.padding[2],
+        ];
+        if let Some(cache) = cache {
+            require_matching_device_nchw_axes(input, cache, "resident causal convolution cache")?;
+            let cache_time = cache.shape()[2];
+            if cache_time > padding_before[0] {
+                bail!(
+                    "resident causal convolution cache has {cache_time} frames but temporal padding is {}",
+                    padding_before[0]
+                );
+            }
+            convolution_input = backend.ncthw_concat_time_device(&[cache, input])?;
+            padding_before[0] -= cache_time;
+        }
+        backend.conv3d_prepared_device(
+            &convolution_input,
             &prepared.weights,
             padding_before,
             [0, self.padding[1], self.padding[2]],
@@ -213,6 +251,164 @@ impl FeatureCache {
         self.index += 1;
         Ok(index)
     }
+}
+
+#[cfg(feature = "vulkan")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DeviceFeatureCacheStats {
+    current_bytes: usize,
+    peak_bytes: usize,
+    occupied_slots: usize,
+    replaced_slots: usize,
+    evicted_slots: usize,
+    all_slots_resident: bool,
+    all_slots_device_local: bool,
+}
+
+/// Device-owned counterpart of Wan's scalar feature cache. Cloning a slot
+/// clones only the resident-buffer lease; tensor contents never return to the
+/// host. Exactly the 32 cache-consuming decoder layers have slots.
+#[cfg(feature = "vulkan")]
+struct DeviceFeatureCache {
+    slots: [Option<DeviceTensor>; USED_CACHE_SLOTS],
+    active_index: usize,
+    current_bytes: usize,
+    peak_bytes: usize,
+    replaced_slots: usize,
+    evicted_slots: usize,
+}
+
+#[cfg(feature = "vulkan")]
+impl DeviceFeatureCache {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| None),
+            active_index: 0,
+            current_bytes: 0,
+            peak_bytes: 0,
+            replaced_slots: 0,
+            evicted_slots: 0,
+        }
+    }
+
+    fn begin_chunk(&mut self) {
+        self.active_index = 0;
+    }
+
+    fn take_index(&mut self) -> Result<usize> {
+        if self.active_index >= self.slots.len() {
+            bail!(
+                "Wan VAE device feature-cache index {} is out of range",
+                self.active_index
+            );
+        }
+        let index = self.active_index;
+        self.active_index += 1;
+        Ok(index)
+    }
+
+    fn temporal_prefix(&self, index: usize, input: &DeviceTensor) -> Result<Option<DeviceTensor>> {
+        let slot = self.slots.get(index).with_context(|| {
+            format!("Wan VAE device feature-cache slot {index} is out of range")
+        })?;
+        if let Some(prefix) = slot {
+            require_matching_device_nchw_axes(input, prefix, "device feature-cache prefix")?;
+            if prefix.shape()[2] > CACHE_TIME {
+                bail!(
+                    "device feature-cache prefix has {} frames, maximum is {CACHE_TIME}",
+                    prefix.shape()[2]
+                );
+            }
+        }
+        Ok(slot.clone())
+    }
+
+    fn replace(&mut self, index: usize, tensor: DeviceTensor) -> Result<()> {
+        if tensor.backend_kind() != BackendKind::Vulkan || !tensor.remains_resident() {
+            bail!("Wan VAE device feature-cache accepts only resident Vulkan tensors");
+        }
+        let shape: [usize; 5] = tensor
+            .shape()
+            .try_into()
+            .context("Wan VAE device feature-cache tensor must be NCTHW")?;
+        if shape.contains(&0) || shape[2] > CACHE_TIME {
+            bail!(
+                "Wan VAE device feature-cache tensor has invalid shape {:?}",
+                tensor.shape()
+            );
+        }
+        let slot = self.slots.get_mut(index).with_context(|| {
+            format!("Wan VAE device feature-cache slot {index} is out of range")
+        })?;
+        if let Some(previous) = slot.replace(tensor) {
+            self.current_bytes = self.current_bytes.saturating_sub(previous.byte_len());
+            self.replaced_slots += 1;
+        }
+        self.current_bytes = self
+            .current_bytes
+            .checked_add(slot.as_ref().expect("slot was just populated").byte_len())
+            .context("Wan VAE device feature-cache byte count overflow")?;
+        self.peak_bytes = self.peak_bytes.max(self.current_bytes);
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        let occupied = self.slots.iter().filter(|slot| slot.is_some()).count();
+        for slot in &mut self.slots {
+            *slot = None;
+        }
+        self.evicted_slots += occupied;
+        self.active_index = 0;
+        self.current_bytes = 0;
+    }
+
+    fn stats(&self) -> Result<DeviceFeatureCacheStats> {
+        let occupied = self.slots.iter().flatten().collect::<Vec<_>>();
+        let occupied_slots = occupied.len();
+        let all_slots_resident =
+            occupied_slots > 0 && occupied.iter().all(|tensor| tensor.remains_resident());
+        let all_slots_device_local = occupied_slots > 0
+            && occupied
+                .iter()
+                .map(|tensor| tensor.is_device_local())
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .all(|is_device_local| is_device_local);
+        Ok(DeviceFeatureCacheStats {
+            current_bytes: self.current_bytes,
+            peak_bytes: self.peak_bytes,
+            occupied_slots,
+            replaced_slots: self.replaced_slots,
+            evicted_slots: self.evicted_slots,
+            all_slots_resident,
+            all_slots_device_local,
+        })
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn cached_causal_conv_with_backend(
+    layer: &CausalConv3d,
+    input: &DeviceTensor,
+    cache: &mut DeviceFeatureCache,
+    backend: &dyn TensorBackend,
+    prepared: &PreparedCausalConv3d,
+) -> Result<DeviceTensor> {
+    let index = cache.take_index()?;
+    let previous = cache.temporal_prefix(index, input)?;
+    let input_time = input.shape()[2];
+    let next_start = input_time.saturating_sub(CACHE_TIME);
+    let mut next = backend.ncthw_slice_time_device(input, next_start, input_time - next_start)?;
+    if next.shape()[2] < CACHE_TIME
+        && let Some(previous) = previous.as_ref()
+    {
+        let previous_time = previous.shape()[2];
+        let previous_tail = backend.ncthw_slice_time_device(previous, previous_time - 1, 1)?;
+        next = backend.ncthw_concat_time_device(&[&previous_tail, &next])?;
+    }
+    let output = layer.forward_with_backend(input, previous.as_ref(), backend, prepared)?;
+    cache.replace(index, next)?;
+    Ok(output)
 }
 
 fn cached_causal_conv(
@@ -593,6 +789,29 @@ fn require_matching_nchw_axes(first: &Tensor, second: &Tensor, label: &str) -> R
     Ok(())
 }
 
+#[cfg(feature = "vulkan")]
+fn require_matching_device_nchw_axes(
+    first: &DeviceTensor,
+    second: &DeviceTensor,
+    label: &str,
+) -> Result<()> {
+    let first: [usize; 5] = first
+        .shape()
+        .try_into()
+        .with_context(|| format!("{label} first tensor must be NCTHW"))?;
+    let second: [usize; 5] = second
+        .shape()
+        .try_into()
+        .with_context(|| format!("{label} second tensor must be NCTHW"))?;
+    if [first[0], first[1], first[3], first[4]] != [second[0], second[1], second[3], second[4]] {
+        bail!("{label} shape mismatch: {first:?} vs {second:?}");
+    }
+    if first[2] == 0 || second[2] == 0 {
+        bail!("{label} cannot contain a zero-length temporal axis");
+    }
+    Ok(())
+}
+
 fn slice_time(input: &Tensor, start: usize, end: usize) -> Result<Tensor> {
     let [batch, channels, time, height, width] = ncthw(input)?;
     if start >= end || end > time {
@@ -932,6 +1151,235 @@ mod tests {
             output.data(),
             &[1.7404919, 3.7404919, 3.198141, 5.198141],
             2e-6,
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn device_feature_cache_owns_exactly_32_slots_and_resets_cleanly() {
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let before = match crate::vulkan::persistence_stats() {
+            Ok(stats) => stats,
+            Err(error) if std::env::var_os("QUARTZ_REQUIRE_VULKAN").is_none() => {
+                eprintln!("skipping device feature-cache ownership test: {error:#}");
+                return;
+            }
+            Err(error) => panic!("required device feature-cache test failed: {error:#}"),
+        };
+        let backend = &crate::backend::VULKAN_BACKEND;
+        let source = tensor(&[1, 1, 2, 1, 1], &[1.0, 2.0]);
+        let device_source = backend.upload_tensor(&source).unwrap();
+        let mismatched = backend
+            .upload_tensor(&Tensor::zeros(vec![1, 2, 1, 1, 1]).unwrap())
+            .unwrap();
+        let scalar_source = SCALAR_BACKEND.upload_tensor(&source).unwrap();
+        let mut cache = DeviceFeatureCache::new();
+        assert_eq!(cache.slots.len(), 32);
+        cache.begin_chunk();
+        for expected_index in 0..32 {
+            let index = cache.take_index().unwrap();
+            assert_eq!(index, expected_index);
+            let slot_tensor = backend
+                .ncthw_slice_time_device(&device_source, expected_index % 2, 1)
+                .unwrap();
+            cache.replace(index, slot_tensor).unwrap();
+        }
+        assert!(cache.take_index().is_err());
+        let full_stats = cache.stats().unwrap();
+        assert_eq!(
+            full_stats,
+            DeviceFeatureCacheStats {
+                current_bytes: 32 * std::mem::size_of::<f32>(),
+                peak_bytes: 32 * std::mem::size_of::<f32>(),
+                occupied_slots: 32,
+                replaced_slots: 0,
+                evicted_slots: 0,
+                all_slots_resident: true,
+                all_slots_device_local: false,
+            }
+        );
+        assert!(cache.temporal_prefix(0, &mismatched).is_err());
+        assert!(cache.replace(0, scalar_source).is_err());
+
+        cache.replace(0, device_source.clone()).unwrap();
+        let replaced_stats = cache.stats().unwrap();
+        assert_eq!(
+            replaced_stats.current_bytes,
+            33 * std::mem::size_of::<f32>()
+        );
+        assert_eq!(replaced_stats.peak_bytes, 33 * std::mem::size_of::<f32>());
+        assert_eq!(replaced_stats.occupied_slots, 32);
+        assert_eq!(replaced_stats.replaced_slots, 1);
+        assert!(replaced_stats.all_slots_resident);
+        assert!(!replaced_stats.all_slots_device_local);
+
+        cache.reset();
+        let reset_stats = cache.stats().unwrap();
+        assert_eq!(reset_stats.current_bytes, 0);
+        assert_eq!(reset_stats.peak_bytes, 33 * std::mem::size_of::<f32>());
+        assert_eq!(reset_stats.occupied_slots, 0);
+        assert_eq!(reset_stats.replaced_slots, 1);
+        assert_eq!(reset_stats.evicted_slots, 32);
+        assert!(!reset_stats.all_slots_resident);
+        assert!(!reset_stats.all_slots_device_local);
+        assert_eq!(cache.active_index, 0);
+        assert!(cache.slots.iter().all(Option::is_none));
+
+        println!(
+            "DeviceFeatureCache: slots={} current_bytes={} peak_bytes={} occupied={} replaced={} evicted={} resident={} device_local={}",
+            cache.slots.len(),
+            reset_stats.current_bytes,
+            reset_stats.peak_bytes,
+            reset_stats.occupied_slots,
+            reset_stats.replaced_slots,
+            reset_stats.evicted_slots,
+            reset_stats.all_slots_resident,
+            reset_stats.all_slots_device_local,
+        );
+
+        drop(cache);
+        drop(mismatched);
+        drop(device_source);
+        let after_drop = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after_drop.resident_allocated_bytes,
+            before.resident_allocated_bytes
+        );
+        assert_eq!(
+            after_drop.resident_device_local_bytes,
+            before.resident_device_local_bytes
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn cached_vulkan_causal_conv3d_three_chunks_matches_scalar_one_shot() {
+        use crate::parity::{ParityTolerance, compare_tensors};
+
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let before = match crate::vulkan::persistence_stats() {
+            Ok(stats) => stats,
+            Err(error) if std::env::var_os("QUARTZ_REQUIRE_VULKAN").is_none() => {
+                eprintln!("skipping cached Vulkan causal Conv3D parity: {error:#}");
+                return;
+            }
+            Err(error) => panic!("required cached Vulkan causal Conv3D parity failed: {error:#}"),
+        };
+        let backend = &crate::backend::VULKAN_BACKEND;
+        let input = Tensor::new(
+            vec![1, 2, 5, 2, 3],
+            (0..60)
+                .map(|index| ((index * 11) % 37) as f32 * 0.125 - 2.0)
+                .collect(),
+        )
+        .unwrap();
+        let weight = Tensor::new(
+            vec![3, 2, 3, 3, 3],
+            (0..162)
+                .map(|index| ((index * 5) % 13) as f32 * 0.0625 - 0.375)
+                .collect(),
+        )
+        .unwrap();
+        let bias = tensor(&[3], &[0.125, -0.25, 0.375]);
+        let layer = conv3d(weight, Some(bias), [1, 1, 1]);
+        assert_eq!(layer.stride, [1, 1, 1]);
+        assert_eq!(layer.dilation, [1, 1, 1]);
+        let expected = layer.forward(&input, None).unwrap();
+
+        let prepared = layer.prepare(backend).unwrap();
+        let device_input = backend.upload_tensor(&input).unwrap();
+        let mut cache = DeviceFeatureCache::new();
+        let chunks = [(0, 1), (1, 2), (3, 2)];
+        let started = std::time::Instant::now();
+        let mut outputs = Vec::new();
+        for (start, count) in chunks {
+            cache.begin_chunk();
+            assert_eq!(cache.active_index, 0);
+            let chunk = backend
+                .ncthw_slice_time_device(&device_input, start, count)
+                .unwrap();
+            let output =
+                cached_causal_conv_with_backend(&layer, &chunk, &mut cache, backend, &prepared)
+                    .unwrap();
+            assert_eq!(cache.active_index, 1);
+            assert_eq!(output.shape(), &[1, 3, count, 2, 3]);
+            outputs.push(output);
+        }
+        let output_refs = outputs.iter().collect::<Vec<_>>();
+        let incremental = backend.ncthw_concat_time_device(&output_refs).unwrap();
+        let output = backend.download_tensor(&incremental).unwrap();
+        let runtime = started.elapsed();
+        let metrics = compare_tensors(&output, &expected).unwrap();
+        metrics
+            .require(ParityTolerance {
+                minimum_cosine_similarity: 0.999_999,
+                maximum_absolute_error: 2e-5,
+                maximum_mean_absolute_error: 2e-6,
+            })
+            .unwrap();
+        assert_eq!(output.shape(), &[1, 3, 5, 2, 3]);
+
+        let cache_stats = cache.stats().unwrap();
+        assert_eq!(cache_stats.current_bytes, 1 * 2 * 2 * 2 * 3 * 4);
+        assert_eq!(cache_stats.peak_bytes, 1 * 2 * 2 * 2 * 3 * 4);
+        assert_eq!(cache_stats.occupied_slots, 1);
+        assert_eq!(cache_stats.replaced_slots, 2);
+        assert_eq!(cache_stats.evicted_slots, 0);
+        assert!(cache_stats.all_slots_resident);
+        assert!(!cache_stats.all_slots_device_local);
+        let after = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            1
+        );
+        assert_eq!(
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            1
+        );
+        assert_eq!(after.resident_downloads - before.resident_downloads, 1);
+        println!(
+            "cached causal Conv3D: input={:?} weight={:?} output={:?} padding_before={:?} padding_after={:?} stride={:?} chunks={chunks:?} cosine={:.9} max_abs={:.9} mean_abs={:.9} runtime_ms={:.3} current_vulkan_bytes={} cache_current_bytes={} cache_peak_bytes={} cache_occupied={} cache_replaced={} cache_device_local={} host_uploads={} weight_uploads={} downloads={}",
+            input.shape(),
+            layer.weight.shape(),
+            output.shape(),
+            [2, 1, 1],
+            [0, 1, 1],
+            layer.stride,
+            metrics.cosine_similarity,
+            metrics.maximum_absolute_error,
+            metrics.mean_absolute_error,
+            runtime.as_secs_f64() * 1_000.0,
+            after.resident_allocated_bytes - before.resident_allocated_bytes,
+            cache_stats.current_bytes,
+            cache_stats.peak_bytes,
+            cache_stats.occupied_slots,
+            cache_stats.replaced_slots,
+            cache_stats.all_slots_device_local,
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            after.resident_downloads - before.resident_downloads,
+        );
+
+        cache.reset();
+        let reset_stats = cache.stats().unwrap();
+        assert_eq!(reset_stats.current_bytes, 0);
+        assert_eq!(reset_stats.occupied_slots, 0);
+        assert_eq!(reset_stats.evicted_slots, 1);
+        assert!(cache.slots.iter().all(Option::is_none));
+
+        drop(incremental);
+        drop(outputs);
+        drop(device_input);
+        drop(prepared);
+        drop(cache);
+        let after_drop = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after_drop.resident_allocated_bytes,
+            before.resident_allocated_bytes
+        );
+        assert_eq!(
+            after_drop.resident_device_local_bytes,
+            before.resident_device_local_bytes
         );
     }
 
