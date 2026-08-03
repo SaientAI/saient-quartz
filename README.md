@@ -153,20 +153,23 @@ eyeballing output frames, because a wrong RoPE, a wrong AdaLN modulation and a
 wrong VAE scale all produce indistinguishable garbage. See
 [`reference/README.md`](reference/README.md).
 
-**It does not replace the C++ engine yet, and the app still ships that engine.**
-Two things are outstanding:
+End-to-end parity passes, and the result is a stronger statement than "close
+enough": measured against the C++ engine's own output, the Rust pipeline
+agrees with it **more closely than that engine agrees with itself**.
 
-1. The end-to-end parity test currently **fails** its pixel budget
-   (cosine `0.999`, but `max_abs 0.184` against a `0.03` tolerance). Each
-   individual stage matches; the residual traces to the DiT velocity, whose
-   delta is smaller than the reference engine's disagreement *with itself*
-   between its flash-attention and non-flash-attention paths. The tolerance has
-   not been relaxed to make this pass.
-2. Performance is nowhere near shipping. A 5-frame 416x240 clip takes about
-   **623 s** on a desktop RTX 5060 Ti, against roughly a second for the C++/GPU
-   engine. The Vulkan graph is deliberately unfused so that block-boundary
-   parity can identify the first divergent primitive; fusing it is a separate
-   and substantial piece of work.
+The reference engine does not have one answer at this precision. Toggling only
+`--diffusion-fa` — same binary, same weights, same seed, same prompt — moves
+its decoded pixels by cosine `0.998562`, max abs `0.234375`. Quartz differs
+from it by cosine `0.999008`, max abs `0.184277`: inside the engine's own
+arithmetic spread on every metric. Both figures come from controlled runs that
+reproduce the committed captures bit-exactly.
+
+**It does not replace the C++ engine yet, and the app still ships that engine.**
+Performance is the blocker, and it is not close: a 5-frame 416x240 clip takes
+about **639 s** on a desktop RTX 5060 Ti, against roughly a second for the
+C++/GPU engine. The Vulkan graph is deliberately unfused so that block-boundary
+parity can identify the first divergent primitive. Fusing it is a separate and
+substantial piece of work.
 
 ## Status / provenance note
 
