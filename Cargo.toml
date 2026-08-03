@@ -1,8 +1,24 @@
 [package]
-name = "quartz"
+name = "saient-quartz"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Local LLM, image and video inference in pure Rust — GGUF quantised models on CPU, CUDA or hand-written Vulkan compute shaders, including a from-scratch Wan2.1 text-to-video pipeline."
+repository = "https://github.com/SaientAI/saient-quartz"
+readme = "README.md"
+keywords = ["llm", "inference", "gguf", "vulkan", "quantization"]
+categories = ["science", "command-line-utilities"]
+# Fixtures for #[ignore]d parity tests that also need multi-gigabyte model
+# weights which are not distributed here; regenerate them with the capture
+# command in reference/README.md. reference/dit is kept because the routine
+# suite's RoPE parity test reads it.
+exclude = ["reference/vae/*", "reference/t5/*", "reference-dump.patch"]
+
+# The package is `saient-quartz` because `quartz` was already taken on
+# crates.io, but the installed command stays `quartz`.
+[[bin]]
+name = "quartz"
+path = "src/main.rs"
 
 [features]
 cuda = []
