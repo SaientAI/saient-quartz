@@ -565,6 +565,11 @@ struct Upsample {
     spatial: Conv2dFrames,
 }
 
+#[cfg(feature = "vulkan")]
+struct PreparedTemporalUpsample {
+    temporal: Option<PreparedCausalConv3d>,
+}
+
 impl Upsample {
     fn load(weights: &SafeTensorFile, prefix: &str, temporal: bool) -> Result<Self> {
         Ok(Self {
@@ -583,6 +588,17 @@ impl Upsample {
     }
 
     fn forward(
+        &self,
+        input: &Tensor,
+        cache: &mut FeatureCache,
+        chunk_index: usize,
+    ) -> Result<Tensor> {
+        let hidden = self.forward_temporal(input, cache, chunk_index)?;
+        let hidden = upsample_spatial_nearest(&hidden, 2)?;
+        self.spatial.forward(&hidden)
+    }
+
+    fn forward_temporal(
         &self,
         input: &Tensor,
         cache: &mut FeatureCache,
@@ -611,8 +627,75 @@ impl Upsample {
                 hidden = channels_to_time(&hidden)?;
             }
         }
-        hidden = upsample_spatial_nearest(&hidden, 2)?;
-        self.spatial.forward(&hidden)
+        Ok(hidden)
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn prepare_temporal(&self, backend: &dyn TensorBackend) -> Result<PreparedTemporalUpsample> {
+        Ok(PreparedTemporalUpsample {
+            temporal: self
+                .temporal
+                .as_ref()
+                .map(|temporal| temporal.prepare(backend))
+                .transpose()?,
+        })
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn forward_temporal_with_backend(
+        &self,
+        input: &DeviceTensor,
+        cache: &mut DeviceFeatureCache,
+        chunk_index: usize,
+        backend: &dyn TensorBackend,
+        prepared: &PreparedTemporalUpsample,
+    ) -> Result<DeviceTensor> {
+        let mut hidden = input.clone();
+        if let Some(time_conv) = self.temporal.as_ref() {
+            let prepared_time_conv = prepared
+                .temporal
+                .as_ref()
+                .context("prepared temporal upsample is missing time_conv weights")?;
+            let cache_index = cache.take_index()?;
+            if chunk_index > 0 {
+                let previous = cache.temporal_prefix(cache_index, &hidden)?;
+                let hidden_time = hidden.shape()[2];
+                let next_start = hidden_time.saturating_sub(CACHE_TIME);
+                let mut next = backend.ncthw_slice_time_device(
+                    &hidden,
+                    next_start,
+                    hidden_time - next_start,
+                )?;
+                if chunk_index >= 2
+                    && next.shape()[2] < CACHE_TIME
+                    && let Some(previous) = previous.as_ref()
+                {
+                    let previous_time = previous.shape()[2];
+                    let previous_tail =
+                        backend.ncthw_slice_time_device(previous, previous_time - 1, 1)?;
+                    next = backend.ncthw_concat_time_device(&[&previous_tail, &next])?;
+                }
+                if chunk_index == 1 && next.shape()[2] < CACHE_TIME {
+                    next = backend
+                        .ncthw_prepend_zero_time_device(&next, CACHE_TIME - next.shape()[2])?;
+                }
+                hidden = if chunk_index == 1 {
+                    time_conv.forward_with_backend(&hidden, None, backend, prepared_time_conv)?
+                } else {
+                    time_conv.forward_with_backend(
+                        &hidden,
+                        previous.as_ref(),
+                        backend,
+                        prepared_time_conv,
+                    )?
+                };
+                cache.replace(cache_index, next)?;
+                hidden = backend.ncthw_channels_to_time_device(&hidden)?;
+            }
+        } else if prepared.temporal.is_some() {
+            bail!("prepared temporal upsample contains unexpected time_conv weights");
+        }
+        Ok(hidden)
     }
 }
 
@@ -1127,6 +1210,148 @@ mod tests {
         assert_eq!(cache.slots[0].as_ref().unwrap().data(), &[2., 3., 20., 30.]);
         assert!(later.data()[..8].iter().all(|&value| value == 3.0));
         assert!(later.data()[8..].iter().all(|&value| value == 30.0));
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_temporal_upsample_branches_match_scalar_and_cache_state() {
+        use crate::parity::compare_tensors;
+
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let before = match crate::vulkan::persistence_stats() {
+            Ok(stats) => stats,
+            Err(error) if std::env::var_os("QUARTZ_REQUIRE_VULKAN").is_none() => {
+                eprintln!("skipping Vulkan temporal-upsample branch parity: {error:#}");
+                return;
+            }
+            Err(error) => panic!("required Vulkan temporal-upsample parity failed: {error:#}"),
+        };
+        let mut time_weight = vec![0.0; 4 * 2 * 3];
+        for channel_half in 0..2 {
+            for channel in 0..2 {
+                let output_channel = channel_half * 2 + channel;
+                time_weight[(output_channel * 2 + channel) * 3 + 2] = 1.0;
+            }
+        }
+        let upsample = Upsample {
+            temporal: Some(conv3d(
+                tensor(&[4, 2, 3, 1, 1], &time_weight),
+                Some(Tensor::zeros(vec![4]).unwrap()),
+                [1, 0, 0],
+            )),
+            spatial: conv2d(
+                tensor(&[2, 2, 1, 1], &[1.0, 0.0, 0.0, 1.0]),
+                Some(Tensor::zeros(vec![2]).unwrap()),
+            ),
+        };
+        let input = tensor(
+            &[1, 2, 3, 1, 2],
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0,
+            ],
+        );
+        let backend = &crate::backend::VULKAN_BACKEND;
+        let prepared = upsample.prepare_temporal(backend).unwrap();
+        let device_input = backend.upload_tensor(&input).unwrap();
+        let mut scalar_cache = FeatureCache::new();
+        let mut device_cache = DeviceFeatureCache::new();
+        let mut resident_outputs = Vec::new();
+        let started = std::time::Instant::now();
+
+        for chunk_index in 0..3 {
+            let scalar_input = slice_time(&input, chunk_index, chunk_index + 1).unwrap();
+            scalar_cache.begin_chunk();
+            let expected = upsample
+                .forward_temporal(&scalar_input, &mut scalar_cache, chunk_index)
+                .unwrap();
+
+            device_cache.begin_chunk();
+            let device_chunk = backend
+                .ncthw_slice_time_device(&device_input, chunk_index, 1)
+                .unwrap();
+            let actual = upsample
+                .forward_temporal_with_backend(
+                    &device_chunk,
+                    &mut device_cache,
+                    chunk_index,
+                    backend,
+                    &prepared,
+                )
+                .unwrap();
+            let actual_host = backend.download_tensor(&actual).unwrap();
+            let metrics = compare_tensors(&actual_host, &expected).unwrap();
+            assert_eq!(actual_host, expected);
+            assert_eq!(device_cache.active_index, 1);
+            assert_eq!(scalar_cache.index, 1);
+            if chunk_index == 0 {
+                assert_eq!(actual_host.shape(), &[1, 2, 1, 1, 2]);
+                assert!(scalar_cache.slots[0].is_none());
+                assert!(device_cache.slots[0].is_none());
+            } else {
+                assert_eq!(actual_host.shape(), &[1, 2, 2, 1, 2]);
+                let expected_cache = scalar_cache.slots[0].as_ref().unwrap();
+                let actual_cache = backend
+                    .download_tensor(device_cache.slots[0].as_ref().unwrap())
+                    .unwrap();
+                assert_eq!(&actual_cache, expected_cache);
+            }
+            println!(
+                "temporal upsample chunk_idx={chunk_index}: input={:?} output={:?} cosine={:.9} max_abs={:.9} mean_abs={:.9}",
+                scalar_input.shape(),
+                actual_host.shape(),
+                metrics.cosine_similarity,
+                metrics.maximum_absolute_error,
+                metrics.mean_absolute_error,
+            );
+            resident_outputs.push(actual);
+        }
+
+        let runtime = started.elapsed();
+        let cache_stats = device_cache.stats().unwrap();
+        assert_eq!(cache_stats.current_bytes, 1 * 2 * 2 * 1 * 2 * 4);
+        assert_eq!(cache_stats.peak_bytes, 1 * 2 * 2 * 1 * 2 * 4);
+        assert_eq!(cache_stats.occupied_slots, 1);
+        assert_eq!(cache_stats.replaced_slots, 1);
+        assert!(cache_stats.all_slots_resident);
+        assert!(!cache_stats.all_slots_device_local);
+        let after = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            1
+        );
+        assert_eq!(
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            1
+        );
+        assert_eq!(after.resident_downloads - before.resident_downloads, 5);
+        println!(
+            "temporal upsample branches: input={:?} chunk_outputs=[1,2,2] runtime_ms={:.3} current_vulkan_bytes={} cache_current_bytes={} cache_peak_bytes={} cache_replaced={} cache_device_local={} host_uploads={} weight_uploads={} downloads={}",
+            input.shape(),
+            runtime.as_secs_f64() * 1_000.0,
+            after.resident_allocated_bytes - before.resident_allocated_bytes,
+            cache_stats.current_bytes,
+            cache_stats.peak_bytes,
+            cache_stats.replaced_slots,
+            cache_stats.all_slots_device_local,
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            after.resident_downloads - before.resident_downloads,
+        );
+
+        device_cache.reset();
+        drop(resident_outputs);
+        drop(device_input);
+        drop(prepared);
+        drop(device_cache);
+        let after_drop = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after_drop.resident_allocated_bytes,
+            before.resident_allocated_bytes
+        );
+        assert_eq!(
+            after_drop.resident_device_local_bytes,
+            before.resident_device_local_bytes
+        );
     }
 
     #[test]

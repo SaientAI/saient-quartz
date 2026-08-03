@@ -227,3 +227,12 @@ Vulkan execution matched one-shot scalar with cosine `1.0`, maximum error `0`,
 and mean error `0`. The focused execution took `4.983 ms`, retained a 96-byte
 two-frame cache prefix, and held 1,392 logical Vulkan bytes at comparison. It
 used one activation upload, one prepared-weight upload, and one final download.
+
+Temporal upsampling preserves its three reference branches rather than
+collapsing them into one reshape. A deterministic `[1,2,3,1,2]` sequence
+verified `chunk_idx == 0`, `chunk_idx == 1`, and `chunk_idx >= 2` independently.
+Their output temporal lengths were `1`, `2`, and `2`; every output and cache
+write matched scalar exactly (cosine `1.0`, maximum/mean error `0`). The focused
+run took `5.385 ms`, retained 32 cache bytes, held 224 logical Vulkan bytes,
+and used one activation upload, one prepared-weight upload, and five deliberate
+downloads for three outputs plus the two populated cache states.
