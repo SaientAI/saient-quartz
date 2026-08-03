@@ -24,6 +24,7 @@ mod server;
 mod tensor;
 mod t5_tokenizer;
 mod tokenizer;
+mod umt5;
 mod wan_scheduler;
 #[cfg(feature = "vulkan")]
 mod vulkan;
