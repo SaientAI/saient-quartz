@@ -1,9 +1,10 @@
 [package]
 name = "saient-quartz"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "Local LLM, image and video inference in pure Rust — GGUF quantised models on CPU, CUDA or hand-written Vulkan compute shaders, including a from-scratch Wan2.1 text-to-video pipeline."
+homepage = "https://saient.co.uk"
 repository = "https://github.com/SaientAI/saient-quartz"
 readme = "README.md"
 keywords = ["llm", "inference", "gguf", "vulkan", "quantization"]
