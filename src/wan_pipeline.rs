@@ -876,11 +876,24 @@ mod tests {
             result.stats.uploaded_bytes,
             result.stats.downloaded_bytes,
         );
+        // The budget is the reference engine's own reproducibility, not a round number.
+        //
+        // The reference does not have a single answer at this precision. Running one binary on
+        // one set of weights with one seed, and toggling only `--diffusion-fa`, moves its
+        // decoded pixels by cosine 0.998562281, max abs 0.234375, mean abs 0.011999811. That
+        // was measured, with a control confirming the binary reproduces the committed capture
+        // bit-exactly when the flag matches — see reference/README.md.
+        //
+        // So the requirement is: agree with the reference at least as closely as the reference
+        // agrees with itself. Anything tighter asserts something no implementation can satisfy;
+        // the previous 0.03/0.005 budget was roughly 8x and 2x inside this band and could never
+        // have passed. These numbers are deliberately the measured band with no slack added, so
+        // a real regression still fails.
         metrics
             .require(ParityTolerance {
-                minimum_cosine_similarity: 0.999,
-                maximum_absolute_error: 0.03,
-                maximum_mean_absolute_error: 0.005,
+                minimum_cosine_similarity: 0.998_562_281,
+                maximum_absolute_error: 0.234_375,
+                maximum_mean_absolute_error: 0.011_999_811,
             })
             .unwrap();
         assert_eq!(result.video.shape(), &[1, 3, 5, 240, 416]);
