@@ -26,6 +26,18 @@ UMT5 encoder, 3D RoPE, 30-block DiT, and stateful causal 3D VAE decoder.
   `reference-dump.patch`; the binary hash above identifies the exact resulting
   executable because the reference working tree contains those uncommitted
   hooks.
+
+> **The reference working tree has since moved on.** Additional opt-in Wan
+> block-capture hooks were added to `ggml_extend.hpp` and `wan.hpp` while
+> investigating the DiT delta, and `build-cuda128/bin/sd-cli` was rebuilt on
+> 2026-08-03 at 20:18 BST. It now hashes to
+> `0857e6ea360726b5424f75c944d0946bd1e5209473049305d9267f7bec1c900b`.
+>
+> Every fixture committed under `reference/` was captured at or before 11:54
+> BST that day, i.e. by the pinned binary — the hash above still describes the
+> provenance of the committed set. Anything captured from here on is produced
+> by a *different* executable, so re-captures must go to a separate directory
+> and must not overwrite the committed fixtures.
 - C compiler: `/usr/bin/cc`
 - C++ compiler: `/usr/bin/c++`, GCC `13.3.0`
 - CUDA compiler: `/usr/local/cuda-12.8/bin/nvcc`, CUDA `12.8.93`
@@ -48,6 +60,20 @@ The exact full-size reference capture command is recorded in
   `17cf97a5bbbc60a646d6105b832b6f657ce904a8a1ad970e4b59df0c67584a40`
 - Wan VAE BF16:
   `2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b`
+
+## UMT5 encoder-output captures
+
+These are the encoder outputs the UMT5 parity tests compare against, and the
+cross-attention context the DiT parity tests consume. They were previously read
+from `/tmp/saient_ref`, which meant a cleared `/tmp` made those tests pass
+having computed nothing. They are committed for that reason. 507 of the 512
+rows are zero padding, so the pair costs roughly 120 KB in git despite being
+8 MB each on disk.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `t5/cond_crossattn.bin` | `bd243b7dbf3913fe225cd8ccbf588c5491dcbab3f4688b86054d74962ab64023` |
+| `t5/uncond_crossattn.bin` | `419b9a81a7bc703935b591b8995aa4e378adbd06f16dbfdd68be7f1dfb7c9ec3` |
 
 ## VAE captures
 

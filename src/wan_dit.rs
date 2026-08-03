@@ -2687,9 +2687,12 @@ mod parity {
     use std::path::Path;
 
     const PACK: &str = "/home/tiny/projects/saient/models/wan2.1-t2v-1.3b-mobile-pack";
-    const REF: &str = "/home/tiny/projects/tinyq4/reference/dit";
-    /// The 8MB UMT5 output is not committed; regenerate with SAIENT_DUMP=1 if absent.
-    const CTX: &str = "/tmp/saient_ref/cond_crossattn.bin";
+    const REF: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/reference/dit");
+    /// Committed alongside the DiT fixtures so this parity test cannot pass by skipping.
+    const CTX: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/reference/t5/cond_crossattn.bin"
+    );
 
     fn read_dump(p: &Path) -> Option<(Vec<i64>, Vec<f32>)> {
         let b = std::fs::read(p).ok()?;
@@ -2717,14 +2720,13 @@ mod parity {
             Path::new(REF).join("dit_t_0.bin"),
             Path::new(CTX),
         );
-        for p in [&gp, &ip, &op, &tp] {
-            if !p.exists() {
-                eprintln!("skipping: {p:?} missing");
-                return;
-            }
+        // Committed fixtures must be present; only the 816 MB DiT weights may legitimately be
+        // absent from a checkout, so only that is allowed to skip.
+        for p in [ip.as_path(), op.as_path(), tp.as_path(), cp] {
+            assert!(p.exists(), "missing committed fixture {p:?}");
         }
-        if !cp.exists() {
-            eprintln!("skipping: {cp:?} missing (regenerate the UMT5 dump with SAIENT_DUMP=1)");
+        if !gp.exists() {
+            eprintln!("skipping: DiT weights {gp:?} not present");
             return;
         }
 
