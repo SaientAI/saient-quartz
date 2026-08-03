@@ -1671,6 +1671,27 @@ pub(crate) fn resident_add(
     resident_add_vector(left, right)
 }
 
+pub(crate) fn resident_multiply(
+    left: &ResidentTensor,
+    right: &ResidentTensor,
+) -> Result<ResidentTensor> {
+    if left.elements != right.elements
+        || left.element_type != ResidentElementType::F32
+        || right.element_type != ResidentElementType::F32
+    {
+        bail!(
+            "resident Vulkan multiply storage differs: {} {:?} vs {} {:?}",
+            left.elements,
+            left.element_type,
+            right.elements,
+            right.element_type
+        );
+    }
+    let elements = u32::try_from(left.elements).context("resident multiply length exceeds u32")?;
+    let id = with_runtime(|runtime| runtime.resident_multiply(left.id(), right.id(), elements))?;
+    Ok(resident_tensor(id, left.elements, ResidentElementType::F32))
+}
+
 pub(crate) fn resident_layer_norm(
     input: &ResidentTensor,
     affine: Option<(&ResidentTensor, &ResidentTensor)>,
@@ -4038,6 +4059,22 @@ impl VulkanRuntime {
             elements as usize,
             self.elementwise_pipeline,
             bytes_of(&[elements, 0, 0, 0]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_multiply(&mut self, left_id: u64, right_id: u64, elements: u32) -> Result<u64> {
+        self.require_resident(left_id, elements as usize, ResidentElementType::F32)?;
+        self.require_resident(right_id, elements as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[left_id, right_id],
+            elements as usize,
+            self.elementwise_pipeline,
+            bytes_of(&[elements, 1, 0, 0]),
             [elements.div_ceil(256), 1, 1],
             KernelKind::Elementwise,
         );

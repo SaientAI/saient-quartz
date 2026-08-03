@@ -35,6 +35,45 @@ SAIENT_DUMP=1 ./build-cuda128/bin/sd-cli --mode vid_gen \
 
 Dump format `SQD1`: magic `"SQD1"`, `u32` ndim, `i64` dims, then f32 data.
 
+## How precise can parity actually be?
+
+Before reading any number below, know the floor. The reference engine does not
+have one answer at this precision — it has a band.
+
+Running the *same binary* on the *same weights, input, prompt and seed*, and
+changing only whether `--diffusion-fa` is passed, changes its own DiT velocity
+by:
+
+| | cosine | max abs | mean abs |
+| --- | ---: | ---: | ---: |
+| reference FA vs reference non-FA | 0.999904678 | 0.063464403 | 0.011568323 |
+
+For comparison, Quartz's scalar DiT against those same two captures:
+
+| | cosine | max abs | mean abs |
+| --- | ---: | ---: | ---: |
+| Quartz vs reference FA | 0.999946307 | 0.050458491 | 0.008700544 |
+| Quartz vs reference non-FA | 0.999946508 | 0.061944485 | 0.008714318 |
+
+**Quartz sits inside the reference's own spread**, and its mean error against
+either variant (0.0087) is smaller than the reference's disagreement with
+itself (0.0116). Quartz's independent scalar and Vulkan DiTs agree with each
+other to seven decimals (0.999946307 vs 0.999946270) while both differ from the
+reference by this same amount — two independent implementations do not converge
+on an identical wrong answer.
+
+The practical consequence: **driving the DiT delta to zero is not a
+well-posed goal.** There is no unique target to converge on. A parity budget
+for this stage has to be stated relative to the reference's measured
+self-consistency, not to an absolute number picked in advance.
+
+This was established with a control run, which matters — the reference binary
+had been rebuilt with extra instrumentation since the fixtures were captured.
+The control (rebuilt binary, `--diffusion-fa`, hooks off) reproduced the
+committed capture **bit-exactly**, cosine `1.000000000` and max abs `0.0`, so
+the comparison above is between arithmetic paths and nothing else. The inputs
+were confirmed identical across all three runs.
+
 ## What is verified so far
 
 | Stage | Status | Verified by |
@@ -42,8 +81,51 @@ Dump format `SQD1`: magic `"SQD1"`, `u32` ndim, `i64` dims, then f32 data.
 | Flow-matching sigma schedule | **verified** | `src/wan_scheduler.rs` tests, exact against dumped sigmas |
 | T5 tokenizer | **verified** | exact token IDs in `t5_ids_*.txt` |
 | UMT5-XXL encoder | **verified** | cosine similarity 0.99918 against `cond_crossattn` |
-| Wan DiT | **verified** | cosine similarity 0.99995 against the captured velocity |
+| Wan DiT | **verified** | cosine similarity 0.99995 against the captured velocity, which is inside the reference's own FA/non-FA spread — see above |
 | 3D causal VAE | **verified** | small and full decoder parity tests described below |
+| Whole pipeline, end to end | **fails its tolerance** | see below |
+
+### End-to-end status: red
+
+`wan_pipeline::tests::full_native_vulkan_generation_matches_captured_reference`
+runs the complete native pipeline — native UMT5, two DiT passes, CFG, the Euler
+flow step, and the VAE decode — with no external inference runtime, and
+compares the final pixels with the captured reference video.
+
+```
+shape=[1,3,5,240,416]  runtime_s=623.477  cosine=0.999007871
+max_abs=0.184276968    mean_abs=0.010395278
+peak_resident=2374665612  cache_peak=944286720  downloads=1
+FAILED: maximum absolute error 0.184276968 exceeds 0.029999999
+```
+
+The structural assertions pass: correct output shape, exactly one device
+download, and every feature-cache slot resident. It is the `max_abs` budget
+that fails, by roughly 6x.
+
+What is known about the cause:
+
+- Everything downstream of the DiT is separately verified to contribute very
+  little. Captured velocities through CFG, the Euler step and the channel
+  affine match at max abs `2.4e-7`; the captured VAE input through the full
+  decoder matches at max abs `0.0044`. Composed, the verified downstream
+  accounts for well under `0.005` of pixel error.
+- The residual therefore enters at or before the DiT velocity, which is the
+  stage whose delta is bounded by the reference's own ambiguity band above.
+- Pixel `mean_abs` (`0.0104`) is close to DiT velocity `mean_abs` (`0.0087`),
+  i.e. a gain near 1.2. Classifier-free guidance at scale 6 would amplify an
+  *uncorrelated* error by roughly 8-11x; it does not here, which is consistent
+  with the conditional and unconditional branches carrying the same systematic
+  arithmetic difference and largely cancelling in `-5*uncond + 6*cond`.
+
+**The tolerance has deliberately not been relaxed.** A `0.03` pixel budget is
+almost certainly below what the reference can reproduce against itself — the
+reference's own FA/non-FA velocity spread is `0.063`, larger than the delta
+being measured — but replacing a failing assertion with a passing one is a
+decision that needs to be made explicitly and on measured grounds, not applied
+quietly by whoever happened to notice. The honest state today is: the pipeline
+runs end to end natively, agrees with the reference to cosine `0.999`, and does
+not meet the budget the test asserts.
 
 ## 3D causal VAE decoder
 

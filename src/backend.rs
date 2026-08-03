@@ -807,6 +807,21 @@ pub(crate) trait TensorBackend: Send + Sync {
         self.upload_tensor(&self.add(left, right)?)
     }
 
+    fn multiply_device(&self, left: &DeviceTensor, right: &DeviceTensor) -> Result<DeviceTensor> {
+        self.require_tensor(left)?;
+        self.require_tensor(right)?;
+        if left.shape() != right.shape() {
+            bail!(
+                "resident multiply shape mismatch: {:?} vs {:?}",
+                left.shape(),
+                right.shape()
+            );
+        }
+        let left = left.storage.host()?;
+        let right = right.storage.host()?;
+        self.upload_tensor(&self.multiply(left, right)?)
+    }
+
     fn scale_device(&self, input: &DeviceTensor, value: f32) -> Result<DeviceTensor> {
         self.require_tensor(input)?;
         if !value.is_finite() {
@@ -2286,6 +2301,32 @@ impl TensorBackend for VulkanBackend {
         })
     }
 
+    fn multiply_device(&self, left: &DeviceTensor, right: &DeviceTensor) -> Result<DeviceTensor> {
+        self.require_tensor(left)?;
+        self.require_tensor(right)?;
+        if left.shape() != right.shape() {
+            bail!(
+                "resident Vulkan multiply shape mismatch: {:?} vs {:?}",
+                left.shape(),
+                right.shape()
+            );
+        }
+        let DeviceTensorStorage::Vulkan(left_storage) = &left.storage else {
+            bail!("Vulkan backend received non-Vulkan multiply input");
+        };
+        let DeviceTensorStorage::Vulkan(right_storage) = &right.storage else {
+            bail!("Vulkan backend received non-Vulkan multiply input");
+        };
+        Ok(DeviceTensor {
+            backend: BackendKind::Vulkan,
+            shape: left.shape.clone(),
+            storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_multiply(
+                left_storage,
+                right_storage,
+            )?),
+        })
+    }
+
     fn scale_device(&self, input: &DeviceTensor, value: f32) -> Result<DeviceTensor> {
         self.require_tensor(input)?;
         if !value.is_finite() {
@@ -3481,6 +3522,66 @@ mod tests {
             ))
             .unwrap(),
             2e-6,
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_resident_multiply_matches_scalar_without_intermediate_transfers() {
+        use crate::parity::{ParityTolerance, compare_tensors};
+
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let left = Tensor::new(
+            vec![2, 3, 5],
+            (0..30)
+                .map(|index| ((index * 11) % 37) as f32 * 0.125 - 2.0)
+                .collect(),
+        )
+        .unwrap();
+        let right = Tensor::new(
+            vec![2, 3, 5],
+            (0..30)
+                .map(|index| ((index * 7) % 23) as f32 * -0.0625 + 0.25)
+                .collect(),
+        )
+        .unwrap();
+        let expected = SCALAR_BACKEND.multiply(&left, &right).unwrap();
+
+        let before = match crate::vulkan::persistence_stats() {
+            Ok(stats) => stats,
+            Err(error) if std::env::var_os("QUARTZ_REQUIRE_VULKAN").is_none() => {
+                eprintln!("skipping resident Vulkan multiply parity: {error:#}");
+                return;
+            }
+            Err(error) => panic!("required resident Vulkan multiply parity failed: {error:#}"),
+        };
+        let left = VULKAN_BACKEND.upload_tensor(&left).unwrap();
+        let right = VULKAN_BACKEND.upload_tensor(&right).unwrap();
+        let output = VULKAN_BACKEND.multiply_device(&left, &right).unwrap();
+        assert!(output.remains_resident());
+        let output = VULKAN_BACKEND.download_tensor(&output).unwrap();
+        let after = crate::vulkan::persistence_stats().unwrap();
+        let metrics = compare_tensors(&output, &expected).unwrap();
+        metrics
+            .require(ParityTolerance {
+                minimum_cosine_similarity: 1.0,
+                maximum_absolute_error: 0.0,
+                maximum_mean_absolute_error: 0.0,
+            })
+            .unwrap();
+        assert_eq!(
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            2
+        );
+        assert_eq!(after.resident_downloads - before.resident_downloads, 1);
+        eprintln!(
+            "resident multiply: shape={:?} cosine={:.9} max_abs={:.9} mean_abs={:.9} uploads={} downloads={}",
+            output.shape(),
+            metrics.cosine_similarity,
+            metrics.maximum_absolute_error,
+            metrics.mean_absolute_error,
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            after.resident_downloads - before.resident_downloads,
         );
     }
 

@@ -356,3 +356,37 @@ host reconstruction occurs.
 The channel-affine primitive also has a hand-checkable multi-batch,
 multi-channel, non-square `[2,3,2,2,3]` fixture so the NCTHW channel index cannot
 silently collapse into a last-axis broadcast.
+
+## Resident UMT5 encoder
+
+The text encoder is the last stage to move onto the backend, which closes the
+loop: prompt to pixels now runs without the scalar path. Its 24 blocks are
+staged one at a time — each block's nine matrices and norms are prepared,
+executed, and released before the next block is staged — so a 3.6 GB encoder
+peaks at roughly 85 MB of resident Vulkan memory. Embedding rows are still
+gathered directly from quantized storage; the 4.2 GB FP32 table is never
+materialized.
+
+The block-staging policy is asserted, not assumed. Each run must perform
+exactly `24 * 9 + 1 = 217` prepared-weight uploads, `24 + 1 = 25` host tensor
+uploads (embeddings plus one relative-bias table per block), and exactly one
+download, and must return to its starting resident and device-local byte counts
+when the encode finishes. A regression that leaked a staged block or
+reconstructed an intermediate on the host would fail on the counters before it
+failed on the numbers.
+
+| Prompt | Valid tokens | Cosine | Max abs | Mean abs | Runtime |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `"a red fox"` | 5 | 0.999185399 | 0.022604108 | 0.000016754 | 28.295 s |
+| `""` | 2 | 0.999656275 | 0.005097963 | 0.000002335 | 28.339 s |
+
+The conditional cosine matches the scalar encoder's 0.99918 against the same
+capture, so moving to Vulkan cost no accuracy. Padding is verified to be
+exactly zero rather than merely small, because the DiT attends over the full
+512-row context.
+
+The cost of block staging is visible in the transfer counters: each encode
+uploads about 9.27 GB to hold 85 MB resident. That is the deliberate trade for
+bounded memory, and it is the obvious first target if encoder latency ever
+matters — but at roughly 28 s for a one-off prompt encode it is not currently
+the bottleneck.

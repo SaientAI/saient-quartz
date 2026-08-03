@@ -16,6 +16,47 @@ use crate::{
 #[cfg(feature = "vulkan")]
 use crate::wan::WanModelPack;
 
+#[cfg(all(test, feature = "vulkan"))]
+fn read_test_reference_context(path: &std::path::Path) -> Result<Tensor> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("cannot read test reference context {}", path.display()))?;
+    if bytes.len() < 8 || &bytes[..4] != b"SQD1" {
+        bail!(
+            "test reference context {} has an invalid SQD1 header",
+            path.display()
+        );
+    }
+    let dimensions = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let header = 8usize
+        .checked_add(dimensions * 8)
+        .context("test reference context header overflow")?;
+    if bytes.len() < header || (bytes.len() - header) % 4 != 0 {
+        bail!(
+            "test reference context {} has an invalid length",
+            path.display()
+        );
+    }
+    let shape = (0..dimensions)
+        .map(|index| {
+            let offset = 8 + index * 8;
+            i64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+        })
+        .collect::<Vec<_>>();
+    if shape != [4096, 512, 1] {
+        bail!(
+            "test reference context {} has SQD1 shape {:?}; expected [4096, 512, 1]",
+            path.display(),
+            shape
+        );
+    }
+    let values = bytes[header..]
+        .chunks_exact(4)
+        .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    Tensor::new(vec![512, 4096], values)
+        .with_context(|| format!("construct test reference context {}", path.display()))
+}
+
 const LATENT_CHANNELS: usize = 16;
 const PHILOX_MULTIPLIERS: [u32; 2] = [0xD251_1F53, 0xCD9E_8D57];
 const PHILOX_WEYL: [u32; 2] = [0x9E37_79B9, 0xBB67_AE85];
@@ -249,6 +290,26 @@ pub(crate) fn generate_vulkan_with_control(
         completed: 2,
         total: 2,
     });
+
+    // Diagnostic isolation only: strict end-to-end tests can substitute the captured CUDA UMT5
+    // outputs to determine whether a final-frame mismatch originates in prompt encoding or in a
+    // downstream DiT/VAE operation. This branch is absent from non-test builds, so production
+    // generation cannot accidentally depend on reference files or an external runtime.
+    #[cfg(test)]
+    let (unconditional, conditional) = if let Some(directory) =
+        std::env::var_os("QUARTZ_TEST_WAN_REFERENCE_CONTEXT_DIR")
+    {
+        let directory = std::path::PathBuf::from(directory);
+        let unconditional = read_test_reference_context(&directory.join("uncond_crossattn.bin"))?;
+        let conditional = read_test_reference_context(&directory.join("cond_crossattn.bin"))?;
+        eprintln!(
+            "Wan strict diagnostic: substituted captured UMT5 contexts from {}",
+            directory.display()
+        );
+        (unconditional, conditional)
+    } else {
+        (unconditional, conditional)
+    };
 
     let backend: &dyn TensorBackend = &VULKAN_BACKEND;
     let conditional = backend

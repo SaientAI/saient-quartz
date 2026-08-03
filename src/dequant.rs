@@ -199,6 +199,451 @@ pub fn gemm(
     out
 }
 
+#[derive(Clone)]
+struct Q8_1MmqBlock {
+    values: [i8; 32],
+    scale: f32,
+    sum: f32,
+}
+
+/// CPU oracle for the Q4_K × Q8_1 arithmetic used by ggml's CUDA MMQ path.
+///
+/// This is intentionally separate from [`gemm`]: the ordinary scalar reference computes a more
+/// accurate dequantized FP32 dot product, while the pinned Wan capture quantizes every 32-value
+/// activation group to Q8_1 and rounds both activation and weight scale pairs to FP16 before the
+/// integer dot product. Keeping the oracle explicit lets the Vulkan quantized kernel prove its
+/// arithmetic without changing established scalar behavior prematurely.
+pub(crate) fn gemm_q4k_q8_1_mmq(
+    x: &[f32],
+    data: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+    rows: usize,
+) -> Vec<f32> {
+    gemm_q4k_q8_1_mmq_impl(x, data, in_dim, out_dim, rows, None)
+}
+
+/// Q4_K MMQ oracle including ggml-cuda's stream-K partition and fixup order.
+pub(crate) fn gemm_q4k_q8_1_mmq_stream_k(
+    x: &[f32],
+    data: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+    rows: usize,
+    reference_rows: usize,
+    multiprocessors: usize,
+) -> Vec<f32> {
+    gemm_q4k_q8_1_mmq_impl(
+        x,
+        data,
+        in_dim,
+        out_dim,
+        rows,
+        Some((reference_rows, multiprocessors)),
+    )
+}
+
+fn gemm_q4k_q8_1_mmq_impl(
+    x: &[f32],
+    data: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+    rows: usize,
+    stream_k: Option<(usize, usize)>,
+) -> Vec<f32> {
+    const Q4_K_VALUES: usize = 256;
+    const Q4_K_BYTES: usize = 144;
+    const Q8_1_VALUES: usize = 32;
+    assert_eq!(in_dim % Q4_K_VALUES, 0);
+    assert_eq!(x.len(), rows * in_dim);
+    assert_eq!(data.len(), out_dim * in_dim / Q4_K_VALUES * Q4_K_BYTES);
+
+    let q8_blocks_per_row = in_dim / Q8_1_VALUES;
+    let activations = quantize_q8_1_mmq(x, in_dim, rows);
+
+    let q4_blocks_per_row = in_dim / Q4_K_VALUES;
+    let columns = (0..out_dim)
+        .into_par_iter()
+        .map(|column| {
+            let weight_row = &data[column * q4_blocks_per_row * Q4_K_BYTES
+                ..(column + 1) * q4_blocks_per_row * Q4_K_BYTES];
+            let mut output = vec![0.0f32; rows];
+            for row in 0..rows {
+                let mut accumulator = 0.0f32;
+                let stream_k_cut = stream_k.and_then(|(reference_rows, multiprocessors)| {
+                    cuda_stream_k_cut(
+                        row,
+                        column,
+                        in_dim,
+                        out_dim,
+                        reference_rows,
+                        multiprocessors,
+                    )
+                });
+                let mut stream_k_prefix = 0.0f32;
+                for block_index in 0..q4_blocks_per_row {
+                    if stream_k_cut == Some(block_index) {
+                        stream_k_prefix = accumulator;
+                        accumulator = 0.0;
+                    }
+                    let block =
+                        &weight_row[block_index * Q4_K_BYTES..(block_index + 1) * Q4_K_BYTES];
+                    let weight_scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                    let weight_minimum = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+                    let scales = &block[4..16];
+                    let quantized = &block[16..144];
+                    for group_index in 0..8 {
+                        let (scale, minimum) = get_scale_min_k4(group_index, scales);
+                        let combined_scale = round_to_f16(weight_scale * f32::from(scale));
+                        let combined_minimum = round_to_f16(-weight_minimum * f32::from(minimum));
+                        let activation =
+                            &activations[row * q8_blocks_per_row + block_index * 8 + group_index];
+                        let quant_offset = group_index / 2 * 32;
+                        let high_nibble = group_index % 2 != 0;
+                        let mut integer_dot = 0i32;
+                        for value_index in 0..32 {
+                            let packed = quantized[quant_offset + value_index];
+                            let weight = if high_nibble {
+                                packed >> 4
+                            } else {
+                                packed & 0x0f
+                            };
+                            integer_dot +=
+                                i32::from(weight) * i32::from(activation.values[value_index]);
+                        }
+                        let dequant_scale = combined_scale * activation.scale;
+                        accumulator = dequant_scale.mul_add(integer_dot as f32, accumulator);
+                        accumulator = combined_minimum.mul_add(activation.sum, accumulator);
+                    }
+                }
+                if stream_k_cut.is_some() {
+                    // The block that owns the tile tail writes first. ggml's fixup kernel then
+                    // adds the prefix partial, so the rounded order is `tail + prefix`.
+                    accumulator += stream_k_prefix;
+                }
+                output[row] = accumulator;
+            }
+            output
+        })
+        .collect::<Vec<_>>();
+    let mut output = vec![0.0; rows * out_dim];
+    for column in 0..out_dim {
+        for row in 0..rows {
+            output[row * out_dim + column] = columns[column][row];
+        }
+    }
+    output
+}
+
+fn cuda_stream_k_cut(
+    row: usize,
+    column: usize,
+    in_dim: usize,
+    out_dim: usize,
+    reference_rows: usize,
+    multiprocessors: usize,
+) -> Option<usize> {
+    const MMQ_X: usize = 128;
+    const MMQ_Y: usize = 128;
+    const VALUES_PER_K_BLOCK: usize = 256;
+    if multiprocessors == 0 || in_dim % VALUES_PER_K_BLOCK != 0 {
+        return None;
+    }
+    let blocks_per_tile = in_dim / VALUES_PER_K_BLOCK;
+    let tiles_x = reference_rows.div_ceil(MMQ_X);
+    let tiles_y = out_dim.div_ceil(MMQ_Y);
+    let tile_count = tiles_x * tiles_y;
+    let waves = tile_count.div_ceil(multiprocessors);
+    let efficiency_percent = 100 * tile_count / (multiprocessors * waves);
+    let grid = if efficiency_percent >= 90 {
+        tile_count
+    } else {
+        multiprocessors
+    };
+    if grid == 0 || tile_count % grid == 0 {
+        return None;
+    }
+    let tile = (column / MMQ_Y) * tiles_x + row / MMQ_X;
+    let tile_start = tile * blocks_per_tile;
+    let tile_end = tile_start + blocks_per_tile;
+    let total_blocks = tile_count * blocks_per_tile;
+    (1..grid)
+        .map(|block| block * total_blocks / grid)
+        .find(|boundary| *boundary > tile_start && *boundary < tile_end)
+        .map(|boundary| boundary - tile_start)
+}
+
+/// CPU oracle for ggml CUDA's Q6_K × Q8_1 MMQ arithmetic.
+pub(crate) fn gemm_q6k_q8_1_mmq(
+    x: &[f32],
+    data: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+    rows: usize,
+) -> Vec<f32> {
+    gemm_q6k_q8_1_mmq_impl(x, data, in_dim, out_dim, rows, None)
+}
+
+/// Q6_K MMQ oracle including ggml-cuda's stream-K partition and fixup order.
+pub(crate) fn gemm_q6k_q8_1_mmq_stream_k(
+    x: &[f32],
+    data: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+    rows: usize,
+    reference_rows: usize,
+    multiprocessors: usize,
+) -> Vec<f32> {
+    gemm_q6k_q8_1_mmq_impl(
+        x,
+        data,
+        in_dim,
+        out_dim,
+        rows,
+        Some((reference_rows, multiprocessors)),
+    )
+}
+
+fn gemm_q6k_q8_1_mmq_impl(
+    x: &[f32],
+    data: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+    rows: usize,
+    stream_k: Option<(usize, usize)>,
+) -> Vec<f32> {
+    const Q6_K_VALUES: usize = 256;
+    const Q6_K_BYTES: usize = 210;
+    assert_eq!(in_dim % Q6_K_VALUES, 0);
+    assert_eq!(x.len(), rows * in_dim);
+    assert_eq!(data.len(), out_dim * in_dim / Q6_K_VALUES * Q6_K_BYTES);
+
+    let q8_blocks_per_row = in_dim / 32;
+    let activations = quantize_q8_1_mmq_d4(x, in_dim, rows);
+    let q6_blocks_per_row = in_dim / Q6_K_VALUES;
+    let columns = (0..out_dim)
+        .into_par_iter()
+        .map(|column| {
+            let weight_row = &data[column * q6_blocks_per_row * Q6_K_BYTES
+                ..(column + 1) * q6_blocks_per_row * Q6_K_BYTES];
+            let mut output = vec![0.0f32; rows];
+            for row in 0..rows {
+                let mut accumulator = 0.0f32;
+                let stream_k_cut = stream_k.and_then(|(reference_rows, multiprocessors)| {
+                    cuda_stream_k_cut(
+                        row,
+                        column,
+                        in_dim,
+                        out_dim,
+                        reference_rows,
+                        multiprocessors,
+                    )
+                });
+                let mut stream_k_prefix = 0.0f32;
+                for block_index in 0..q6_blocks_per_row {
+                    if stream_k_cut == Some(block_index) {
+                        stream_k_prefix = accumulator;
+                        accumulator = 0.0;
+                    }
+                    let block =
+                        &weight_row[block_index * Q6_K_BYTES..(block_index + 1) * Q6_K_BYTES];
+                    let ql = &block[..128];
+                    let qh = &block[128..192];
+                    let scales = &block[192..208];
+                    let d6 = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+                    let mut quantized = [0i8; Q6_K_VALUES];
+                    for half in 0..2 {
+                        let ql_offset = half * 64;
+                        let qh_offset = half * 32;
+                        let output_offset = half * 128;
+                        for index in 0..32 {
+                            let low0 = ql[ql_offset + index];
+                            let low1 = ql[ql_offset + index + 32];
+                            let high = qh[qh_offset + index];
+                            quantized[output_offset + index] =
+                                ((low0 & 0x0f) | ((high & 0x03) << 4)) as i8 - 32;
+                            quantized[output_offset + index + 32] =
+                                ((low1 & 0x0f) | (((high >> 2) & 0x03) << 4)) as i8 - 32;
+                            quantized[output_offset + index + 64] =
+                                ((low0 >> 4) | (((high >> 4) & 0x03) << 4)) as i8 - 32;
+                            quantized[output_offset + index + 96] =
+                                ((low1 >> 4) | (((high >> 6) & 0x03) << 4)) as i8 - 32;
+                        }
+                    }
+                    // The Turing MMA path accumulates four Q8_1 groups in a 128-value tile, then
+                    // applies the shared Q6_K scale before advancing to the other half-block.
+                    for fragment_index in 0..2 {
+                        let mut fragment_sum = 0.0f32;
+                        for group_index in fragment_index * 4..fragment_index * 4 + 4 {
+                            let activation = &activations
+                                [row * q8_blocks_per_row + block_index * 8 + group_index];
+                            let weight_group = &quantized[group_index * 32..(group_index + 1) * 32];
+                            let mut first_dot = 0i32;
+                            let mut second_dot = 0i32;
+                            for index in 0..16 {
+                                first_dot += i32::from(weight_group[index])
+                                    * i32::from(activation.values[index]);
+                                second_dot += i32::from(weight_group[index + 16])
+                                    * i32::from(activation.values[index + 16]);
+                            }
+                            let first_scale = i32::from(scales[group_index * 2] as i8);
+                            let second_scale = i32::from(scales[group_index * 2 + 1] as i8);
+                            let scaled_dot = first_scale * first_dot + second_scale * second_dot;
+                            fragment_sum =
+                                activation.scale.mul_add(scaled_dot as f32, fragment_sum);
+                        }
+                        accumulator = d6.mul_add(fragment_sum, accumulator);
+                    }
+                }
+                if stream_k_cut.is_some() {
+                    accumulator += stream_k_prefix;
+                }
+                output[row] = accumulator;
+            }
+            output
+        })
+        .collect::<Vec<_>>();
+    let mut output = vec![0.0; rows * out_dim];
+    for column in 0..out_dim {
+        for row in 0..rows {
+            output[row * out_dim + column] = columns[column][row];
+        }
+    }
+    output
+}
+
+fn quantize_q8_1_mmq(x: &[f32], in_dim: usize, rows: usize) -> Vec<Q8_1MmqBlock> {
+    const Q8_1_VALUES: usize = 32;
+    let q8_blocks_per_row = in_dim / Q8_1_VALUES;
+    let mut activations = Vec::with_capacity(rows * q8_blocks_per_row);
+    for row in 0..rows {
+        for group in x[row * in_dim..(row + 1) * in_dim].chunks_exact(Q8_1_VALUES) {
+            let mut partial_maxima = [0.0f32; 8];
+            let mut partial_sums = [0.0f32; 8];
+            for lane in 0..8 {
+                let values = &group[lane * 4..lane * 4 + 4];
+                partial_maxima[lane] = values.iter().map(|value| value.abs()).fold(0.0, f32::max);
+                partial_sums[lane] = values[0] + values[1] + values[2] + values[3];
+            }
+            // CUDA's warp XOR reduction combines the eight float4 lanes in this order.
+            for offset in [4, 2, 1] {
+                let old_maxima = partial_maxima;
+                let old_sums = partial_sums;
+                for lane in 0..8 {
+                    partial_maxima[lane] = old_maxima[lane].max(old_maxima[lane ^ offset]);
+                    partial_sums[lane] = old_sums[lane] + old_sums[lane ^ offset];
+                }
+            }
+            let maximum = partial_maxima[0];
+            let inverse_scale = if maximum == 0.0 { 0.0 } else { 127.0 / maximum };
+            let mut values = [0i8; Q8_1_VALUES];
+            if inverse_scale != 0.0 {
+                for (output, input) in values.iter_mut().zip(group) {
+                    *output = (*input * inverse_scale).round() as i8;
+                }
+            }
+            let scale = if inverse_scale == 0.0 {
+                0.0
+            } else {
+                1.0 / inverse_scale
+            };
+            activations.push(Q8_1MmqBlock {
+                values,
+                scale: round_to_f16(scale),
+                sum: round_to_f16(partial_sums[0]),
+            });
+        }
+    }
+    activations
+}
+
+fn quantize_q8_1_mmq_d4(x: &[f32], in_dim: usize, rows: usize) -> Vec<Q8_1MmqBlock> {
+    const VALUES_PER_SCALE: usize = 32;
+    assert_eq!(in_dim % VALUES_PER_SCALE, 0);
+    let mut activations = Vec::with_capacity(rows * in_dim / 32);
+    for row in 0..rows {
+        for group in x[row * in_dim..(row + 1) * in_dim].chunks_exact(VALUES_PER_SCALE) {
+            let mut partial_maxima = [0.0f32; 8];
+            for lane in 0..8 {
+                let values = &group[lane * 4..lane * 4 + 4];
+                partial_maxima[lane] = values.iter().map(|value| value.abs()).fold(0.0, f32::max);
+            }
+            for offset in [4, 2, 1] {
+                let previous = partial_maxima;
+                for lane in 0..8 {
+                    partial_maxima[lane] = previous[lane].max(previous[lane ^ offset]);
+                }
+            }
+            let maximum = partial_maxima[0];
+            let inverse_scale = if maximum == 0.0 { 0.0 } else { 127.0 / maximum };
+            let scale = if inverse_scale == 0.0 {
+                0.0
+            } else {
+                1.0 / inverse_scale
+            };
+            let mut values = [0i8; 32];
+            if inverse_scale != 0.0 {
+                for (output, input) in values.iter_mut().zip(group) {
+                    *output = (*input * inverse_scale).round() as i8;
+                }
+            }
+            activations.push(Q8_1MmqBlock {
+                values,
+                scale,
+                sum: 0.0,
+            });
+        }
+    }
+    activations
+}
+
+fn round_to_f16(value: f32) -> f32 {
+    f16_to_f32(f32_to_f16_round_to_even(value))
+}
+
+fn f32_to_f16_round_to_even(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x7f_ffff;
+    if exponent == 0xff {
+        return sign | if mantissa == 0 { 0x7c00 } else { 0x7e00 };
+    }
+    let half_exponent = exponent - 127 + 15;
+    if half_exponent >= 31 {
+        return sign | 0x7c00;
+    }
+    if half_exponent <= 0 {
+        if half_exponent < -10 {
+            return sign;
+        }
+        let significand = mantissa | 0x80_0000;
+        let shift = (14 - half_exponent) as u32;
+        let mut rounded = significand >> shift;
+        let remainder = significand & ((1u32 << shift) - 1);
+        let halfway = 1u32 << (shift - 1);
+        if remainder > halfway || (remainder == halfway && rounded & 1 != 0) {
+            rounded += 1;
+        }
+        return sign | rounded as u16;
+    }
+    let mut rounded = mantissa >> 13;
+    let remainder = mantissa & 0x1fff;
+    if remainder > 0x1000 || (remainder == 0x1000 && rounded & 1 != 0) {
+        rounded += 1;
+    }
+    if rounded == 0x400 {
+        let exponent = half_exponent + 1;
+        return sign
+            | if exponent >= 31 {
+                0x7c00
+            } else {
+                (exponent as u16) << 10
+            };
+    }
+    sign | ((half_exponent as u16) << 10) | rounded as u16
+}
+
 // ── Fused Q4_K / Q6_K matrix-vector products ────────────────────────────────────
 //
 // Both dequantize each 256-element block on the fly straight into the dot product
