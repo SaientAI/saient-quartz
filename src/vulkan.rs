@@ -1394,6 +1394,48 @@ pub(crate) fn resident_rms_norm(
     ))
 }
 
+pub(crate) fn resident_channel_rms_norm_3d(
+    input: &ResidentTensor,
+    weight: &ResidentTensor,
+    shape: [usize; 5],
+    epsilon: f32,
+) -> Result<ResidentTensor> {
+    let [batch, channels, time, height, width] = shape;
+    let volume = time
+        .checked_mul(height)
+        .and_then(|value| value.checked_mul(width))
+        .context("resident channel RMSNorm volume overflow")?;
+    let expected = batch
+        .checked_mul(channels)
+        .and_then(|value| value.checked_mul(volume))
+        .context("resident channel RMSNorm input size overflow")?;
+    if batch == 0
+        || channels == 0
+        || volume == 0
+        || input.elements != expected
+        || weight.elements != channels
+    {
+        bail!("resident channel RMSNorm dimensions do not match its tensors");
+    }
+    if !epsilon.is_finite() || epsilon <= 0.0 {
+        bail!("resident channel RMSNorm epsilon must be finite and positive");
+    }
+    let dimensions = [
+        u32::try_from(batch).context("resident channel RMSNorm batch exceeds u32")?,
+        u32::try_from(channels).context("resident channel RMSNorm channels exceed u32")?,
+        u32::try_from(volume).context("resident channel RMSNorm volume exceeds u32")?,
+        epsilon.to_bits(),
+    ];
+    let id = with_runtime(|runtime| {
+        runtime.resident_channel_rms_norm(input.id(), weight.id(), dimensions, input.elements)
+    })?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
 pub(crate) fn resident_rope(
     input: &ResidentTensor,
     positions: &ResidentTensor,
@@ -2890,28 +2932,33 @@ impl VulkanRuntime {
         if payloads.is_empty() || payloads.iter().any(|payload| payload.is_empty()) {
             bail!("device-local staging requires at least one non-empty payload");
         }
-        if payloads.iter().any(|payload| payload.len() % 4 != 0) {
-            bail!("device-local staging payloads must be four-byte aligned");
-        }
-        let staging_bytes = payloads
-            .iter()
-            .try_fold(0usize, |total, payload| total.checked_add(payload.len()));
+        let staging_bytes = payloads.iter().try_fold(0usize, |total, payload| {
+            total.checked_add(payload.len().next_multiple_of(4))
+        });
         let staging_bytes = staging_bytes.context("device-local staging size overflow")?;
         let staging =
             Buffer::new_staging(&self.instance, self.physical, &self.device, staging_bytes)?;
         let mut destinations = Vec::with_capacity(payloads.len());
         let mut offsets = Vec::with_capacity(payloads.len());
+        let mut copy_bytes = Vec::with_capacity(payloads.len());
         let mut offset = 0usize;
+        let zero_padding = [0u8; 3];
         for payload in payloads {
+            let aligned_bytes = payload.len().next_multiple_of(4);
             staging.write_bytes_at(offset, payload)?;
+            let padding_bytes = aligned_bytes - payload.len();
+            if padding_bytes > 0 {
+                staging.write_bytes_at(offset + payload.len(), &zero_padding[..padding_bytes])?;
+            }
             destinations.push(Buffer::new_device_local_storage(
                 &self.instance,
                 self.physical,
                 &self.device,
-                payload.len(),
+                aligned_bytes,
             )?);
             offsets.push(offset);
-            offset += payload.len();
+            copy_bytes.push(aligned_bytes);
+            offset += aligned_bytes;
         }
 
         unsafe {
@@ -2933,8 +2980,8 @@ impl VulkanRuntime {
             self.device
                 .begin_command_buffer(command, &begin_info)
                 .map_err(|error| anyhow!("resident staging command begin failed: {error:?}"))?;
-            for ((payload, destination), &source_offset) in
-                payloads.iter().zip(&destinations).zip(&offsets)
+            for ((destination, &source_offset), &bytes) in
+                destinations.iter().zip(&offsets).zip(&copy_bytes)
             {
                 self.device.cmd_copy_buffer(
                     command,
@@ -2943,14 +2990,14 @@ impl VulkanRuntime {
                     &[vk::BufferCopy {
                         src_offset: source_offset as u64,
                         dst_offset: 0,
-                        size: payload.len() as u64,
+                        size: bytes as u64,
                     }],
                 );
             }
-            let barriers = payloads
+            let barriers = destinations
                 .iter()
-                .zip(&destinations)
-                .map(|(payload, destination)| {
+                .zip(&copy_bytes)
+                .map(|(destination, &bytes)| {
                     vk::BufferMemoryBarrier::builder()
                         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                         .dst_access_mask(vk::AccessFlags::SHADER_READ)
@@ -2958,7 +3005,7 @@ impl VulkanRuntime {
                         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .buffer(destination.buffer)
                         .offset(0)
-                        .size(payload.len() as u64)
+                        .size(bytes as u64)
                         .build()
                 })
                 .collect::<Vec<_>>();
@@ -3473,6 +3520,36 @@ impl VulkanRuntime {
             self.rmsnorm_pipeline,
             bytes_of(&[rows, width, epsilon.to_bits(), 0]),
             [rows, 1, 1],
+            KernelKind::Norm,
+        );
+        self.stats.norm.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_channel_rms_norm(
+        &mut self,
+        input_id: u64,
+        weight_id: u64,
+        dimensions: [u32; 4],
+        elements: usize,
+    ) -> Result<u64> {
+        let [batch, channels, volume, _] = dimensions;
+        let expected = batch as usize * channels as usize * volume as usize;
+        if batch == 0 || channels == 0 || volume == 0 || elements != expected {
+            bail!("resident channel RMSNorm dimensions are invalid");
+        }
+        self.require_resident(input_id, elements, ResidentElementType::F32)?;
+        self.require_resident(weight_id, channels as usize, ResidentElementType::F32)?;
+        let locations = batch
+            .checked_mul(volume)
+            .context("resident channel RMSNorm location count overflow")?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, weight_id],
+            elements,
+            self.channel_rmsnorm_pipeline,
+            bytes_of(&dimensions),
+            [locations, 1, 1],
             KernelKind::Norm,
         );
         self.stats.norm.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;

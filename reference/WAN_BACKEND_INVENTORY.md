@@ -236,3 +236,22 @@ write matched scalar exactly (cosine `1.0`, maximum/mean error `0`). The focused
 run took `5.385 ms`, retained 32 cache bytes, held 224 logical Vulkan bytes,
 and used one activation upload, one prepared-weight upload, and five deliberate
 downloads for three outputs plus the two populated cache states.
+
+The complete VAE residual path is now resident: channel-axis RMSNorm with
+epsilon `1e-12`, SiLU, two cached causal Conv3D operations, an optional learned
+`1x1x1` projection, and the residual add. Device-local staging now pads each
+transfer to Vulkan's four-byte copy granularity while retaining the tensor's
+logical element and byte counts; this is required for FP16 convolution weights
+with odd element counts. A deterministic channel-changing block processed
+three one-frame chunks from `[1,2,3,2,2]` to `[1,3,3,2,2]`, used both cache
+slots and a learned shortcut, and matched scalar at cosine `1.0`, maximum error
+`4.77e-7`, and mean error `1.49e-7`. The focused run took `16.213 ms`, held
+1,422 logical Vulkan bytes and 160 peak cache bytes, and used one activation
+upload, five prepared-weight uploads, and one final download.
+
+The real `decoder.upsamples.12` residual block from the preserved Wan VAE was
+also checked on non-square `[1,96,1,2,3]` input. Its `[1,96,1,2,3]` output
+matched scalar at cosine `1.0`, maximum error `1.431e-6`, and mean error
+`1.60e-7`. Scalar execution took `16.149 ms`; Vulkan execution took `3.246 ms`.
+The graph held 1,006,080 logical Vulkan bytes and 4,608 peak cache bytes, with
+one activation upload, four prepared-weight uploads, and one final download.

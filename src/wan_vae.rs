@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
 #[cfg(feature = "vulkan")]
-use crate::backend::BackendKind;
+use crate::backend::{BackendKind, PreparedVectorHandle};
 use crate::{
     backend::{Conv3dWeightHandle, DeviceTensor, SCALAR_BACKEND, TensorBackend},
     safetensors::SafeTensorFile,
@@ -437,6 +437,15 @@ struct ResidualBlock {
     shortcut: Option<CausalConv3d>,
 }
 
+#[cfg(feature = "vulkan")]
+struct PreparedResidualBlock {
+    norm1: PreparedVectorHandle,
+    conv1: PreparedCausalConv3d,
+    norm2: PreparedVectorHandle,
+    conv2: PreparedCausalConv3d,
+    shortcut: Option<PreparedCausalConv3d>,
+}
+
 impl ResidualBlock {
     fn load(weights: &SafeTensorFile, prefix: &str) -> Result<Self> {
         Ok(Self {
@@ -479,6 +488,52 @@ impl ResidualBlock {
         let hidden = cached_causal_conv(&self.conv1, &hidden, cache)?;
         let hidden = hidden.channel_rms_norm_3d(&self.norm2, RMS_EPSILON)?.silu();
         backend.add(&cached_causal_conv(&self.conv2, &hidden, cache)?, &residual)
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn prepare(&self, backend: &dyn TensorBackend) -> Result<PreparedResidualBlock> {
+        Ok(PreparedResidualBlock {
+            norm1: backend.prepare_vector(&self.norm1)?,
+            conv1: self.conv1.prepare(backend)?,
+            norm2: backend.prepare_vector(&self.norm2)?,
+            conv2: self.conv2.prepare(backend)?,
+            shortcut: self
+                .shortcut
+                .as_ref()
+                .map(|shortcut| shortcut.prepare(backend))
+                .transpose()?,
+        })
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn forward_with_backend(
+        &self,
+        input: &DeviceTensor,
+        cache: &mut DeviceFeatureCache,
+        backend: &dyn TensorBackend,
+        prepared: &PreparedResidualBlock,
+    ) -> Result<DeviceTensor> {
+        let residual = if let Some(shortcut) = self.shortcut.as_ref() {
+            let prepared_shortcut = prepared
+                .shortcut
+                .as_ref()
+                .context("prepared residual block is missing shortcut weights")?;
+            shortcut.forward_with_backend(input, None, backend, prepared_shortcut)?
+        } else {
+            if prepared.shortcut.is_some() {
+                bail!("prepared residual block contains unexpected shortcut weights");
+            }
+            input.clone()
+        };
+        let hidden = backend.channel_rms_norm_3d_device(input, &prepared.norm1, RMS_EPSILON)?;
+        let hidden = backend.silu_device(&hidden)?;
+        let hidden =
+            cached_causal_conv_with_backend(&self.conv1, &hidden, cache, backend, &prepared.conv1)?;
+        let hidden = backend.channel_rms_norm_3d_device(&hidden, &prepared.norm2, RMS_EPSILON)?;
+        let hidden = backend.silu_device(&hidden)?;
+        let hidden =
+            cached_causal_conv_with_backend(&self.conv2, &hidden, cache, backend, &prepared.conv2)?;
+        backend.add_device(&hidden, &residual)
     }
 }
 
@@ -1163,6 +1218,262 @@ mod tests {
         assert_eq!(output.data(), &[6.5, -2.]);
         assert_eq!(cache.index, 2);
         assert_eq!(backend.additions.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_residual_block_with_shortcut_and_two_cache_slots_matches_scalar() {
+        use crate::parity::{ParityTolerance, compare_tensors};
+
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let before = match crate::vulkan::persistence_stats() {
+            Ok(stats) => stats,
+            Err(error) if std::env::var_os("QUARTZ_REQUIRE_VULKAN").is_none() => {
+                eprintln!("skipping Vulkan residual-block parity: {error:#}");
+                return;
+            }
+            Err(error) => panic!("required Vulkan residual-block parity failed: {error:#}"),
+        };
+        let conv1_weight = Tensor::new(
+            vec![3, 2, 3, 3, 3],
+            (0..162)
+                .map(|index| ((index * 5) % 11) as f32 * 0.03125 - 0.15625)
+                .collect(),
+        )
+        .unwrap();
+        let conv2_weight = Tensor::new(
+            vec![3, 3, 3, 3, 3],
+            (0..243)
+                .map(|index| ((index * 7) % 13) as f32 * 0.03125 - 0.1875)
+                .collect(),
+        )
+        .unwrap();
+        let block = ResidualBlock {
+            norm1: tensor(&[2], &[1.0, 0.75]),
+            conv1: conv3d(
+                conv1_weight,
+                Some(tensor(&[3], &[0.0625, -0.125, 0.1875])),
+                [1, 1, 1],
+            ),
+            norm2: tensor(&[3], &[1.0, 0.875, 1.125]),
+            conv2: conv3d(
+                conv2_weight,
+                Some(tensor(&[3], &[-0.0625, 0.125, -0.1875])),
+                [1, 1, 1],
+            ),
+            shortcut: Some(conv3d(
+                tensor(&[3, 2, 1, 1, 1], &[1.0, 0.0, 0.5, -0.5, -0.25, 0.75]),
+                Some(tensor(&[3], &[0.125, -0.25, 0.375])),
+                [0, 0, 0],
+            )),
+        };
+        let input = Tensor::new(
+            vec![1, 2, 3, 2, 2],
+            (0..24)
+                .map(|index| ((index * 11) % 29) as f32 * 0.125 - 1.5)
+                .collect(),
+        )
+        .unwrap();
+        let backend = &crate::backend::VULKAN_BACKEND;
+        let prepared = block.prepare(backend).unwrap();
+        let device_input = backend.upload_tensor(&input).unwrap();
+        let mut scalar_cache = FeatureCache::new();
+        let mut device_cache = DeviceFeatureCache::new();
+        let mut expected_chunks = Vec::new();
+        let mut actual_chunks = Vec::new();
+        let started = std::time::Instant::now();
+        for chunk_index in 0..3 {
+            scalar_cache.begin_chunk();
+            let scalar_input = slice_time(&input, chunk_index, chunk_index + 1).unwrap();
+            expected_chunks.push(
+                block
+                    .forward(&scalar_input, &mut scalar_cache, &SCALAR_BACKEND)
+                    .unwrap(),
+            );
+
+            device_cache.begin_chunk();
+            let device_chunk = backend
+                .ncthw_slice_time_device(&device_input, chunk_index, 1)
+                .unwrap();
+            actual_chunks.push(
+                block
+                    .forward_with_backend(&device_chunk, &mut device_cache, backend, &prepared)
+                    .unwrap(),
+            );
+            assert_eq!(scalar_cache.index, 2);
+            assert_eq!(device_cache.active_index, 2);
+        }
+        let expected_refs = expected_chunks.iter().collect::<Vec<_>>();
+        let expected = concat_time(&expected_refs).unwrap();
+        let actual_refs = actual_chunks.iter().collect::<Vec<_>>();
+        let actual = backend.ncthw_concat_time_device(&actual_refs).unwrap();
+        let output = backend.download_tensor(&actual).unwrap();
+        let runtime = started.elapsed();
+        let metrics = compare_tensors(&output, &expected).unwrap();
+        metrics
+            .require(ParityTolerance {
+                minimum_cosine_similarity: 0.999_999,
+                maximum_absolute_error: 2e-5,
+                maximum_mean_absolute_error: 2e-6,
+            })
+            .unwrap();
+        assert_eq!(output.shape(), &[1, 3, 3, 2, 2]);
+
+        let cache_stats = device_cache.stats().unwrap();
+        assert_eq!(cache_stats.current_bytes, (2 + 3) * 2 * 2 * 2 * 4);
+        assert_eq!(cache_stats.peak_bytes, (2 + 3) * 2 * 2 * 2 * 4);
+        assert_eq!(cache_stats.occupied_slots, 2);
+        assert_eq!(cache_stats.replaced_slots, 4);
+        assert!(cache_stats.all_slots_resident);
+        assert!(!cache_stats.all_slots_device_local);
+        let after = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            5
+        );
+        assert_eq!(
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            1
+        );
+        assert_eq!(after.resident_downloads - before.resident_downloads, 1);
+        println!(
+            "Vulkan residual block: input={:?} output={:?} shortcut=true chunks=[1,1,1] cache_slots=2 cosine={:.9} max_abs={:.9} mean_abs={:.9} runtime_ms={:.3} current_vulkan_bytes={} cache_current_bytes={} cache_peak_bytes={} cache_replaced={} cache_device_local={} host_uploads={} weight_uploads={} downloads={}",
+            input.shape(),
+            output.shape(),
+            metrics.cosine_similarity,
+            metrics.maximum_absolute_error,
+            metrics.mean_absolute_error,
+            runtime.as_secs_f64() * 1_000.0,
+            after.resident_allocated_bytes - before.resident_allocated_bytes,
+            cache_stats.current_bytes,
+            cache_stats.peak_bytes,
+            cache_stats.replaced_slots,
+            cache_stats.all_slots_device_local,
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            after.resident_downloads - before.resident_downloads,
+        );
+
+        device_cache.reset();
+        drop(actual);
+        drop(actual_chunks);
+        drop(device_input);
+        drop(prepared);
+        drop(device_cache);
+        let after_drop = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after_drop.resident_allocated_bytes,
+            before.resident_allocated_bytes
+        );
+        assert_eq!(
+            after_drop.resident_device_local_bytes,
+            before.resident_device_local_bytes
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "loads real Wan VAE weights; run explicitly for residual-block parity"]
+    fn real_wan_vae_residual_block_matches_scalar() {
+        use crate::{
+            parity::{ParityTolerance, compare_tensors},
+            safetensors::SafeTensorFile,
+        };
+
+        const VAE: &str =
+            "/home/tiny/projects/saient/models/wan2.1-t2v-1.3b-mobile-pack/wan_2.1_vae.safetensors";
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let before = crate::vulkan::persistence_stats().unwrap();
+        let weights = SafeTensorFile::open(VAE).unwrap();
+        let block = ResidualBlock::load(&weights, "decoder.upsamples.12").unwrap();
+        let input_channels = block.norm1.len();
+        let output_channels = block.norm2.len();
+        let input = Tensor::new(
+            vec![1, input_channels, 1, 2, 3],
+            (0..input_channels * 6)
+                .map(|index| ((index * 17) as f32 * 0.013).sin() * 1.25)
+                .collect(),
+        )
+        .unwrap();
+        let mut scalar_cache = FeatureCache::new();
+        scalar_cache.begin_chunk();
+        let scalar_started = std::time::Instant::now();
+        let expected = block
+            .forward(&input, &mut scalar_cache, &SCALAR_BACKEND)
+            .unwrap();
+        let scalar_runtime = scalar_started.elapsed();
+
+        let backend = &crate::backend::VULKAN_BACKEND;
+        let prepared = block.prepare(backend).unwrap();
+        let device_input = backend.upload_tensor(&input).unwrap();
+        let mut device_cache = DeviceFeatureCache::new();
+        device_cache.begin_chunk();
+        let vulkan_started = std::time::Instant::now();
+        let actual = block
+            .forward_with_backend(&device_input, &mut device_cache, backend, &prepared)
+            .unwrap();
+        let output = backend.download_tensor(&actual).unwrap();
+        let vulkan_runtime = vulkan_started.elapsed();
+        let metrics = compare_tensors(&output, &expected).unwrap();
+        metrics
+            .require(ParityTolerance {
+                minimum_cosine_similarity: 0.999_99,
+                maximum_absolute_error: 0.01,
+                maximum_mean_absolute_error: 0.001,
+            })
+            .unwrap();
+        assert_eq!(output.shape(), &[1, output_channels, 1, 2, 3]);
+        assert_eq!(scalar_cache.index, 2);
+        assert_eq!(device_cache.active_index, 2);
+        let cache_stats = device_cache.stats().unwrap();
+        assert_eq!(cache_stats.occupied_slots, 2);
+        assert_eq!(
+            cache_stats.current_bytes,
+            (input_channels + output_channels) * 6 * 4
+        );
+        let after = crate::vulkan::persistence_stats().unwrap();
+        let expected_weight_uploads = if block.shortcut.is_some() { 5 } else { 4 };
+        assert_eq!(
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            expected_weight_uploads
+        );
+        assert_eq!(
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            1
+        );
+        assert_eq!(after.resident_downloads - before.resident_downloads, 1);
+        println!(
+            "real Wan VAE residual block decoder.upsamples.12: input={:?} output={:?} shortcut={} scalar_ms={:.3} vulkan_ms={:.3} cosine={:.9} max_abs={:.9} mean_abs={:.9} current_vulkan_bytes={} cache_current_bytes={} cache_peak_bytes={} host_uploads={} weight_uploads={} downloads={}",
+            input.shape(),
+            output.shape(),
+            block.shortcut.is_some(),
+            scalar_runtime.as_secs_f64() * 1_000.0,
+            vulkan_runtime.as_secs_f64() * 1_000.0,
+            metrics.cosine_similarity,
+            metrics.maximum_absolute_error,
+            metrics.mean_absolute_error,
+            after.resident_allocated_bytes - before.resident_allocated_bytes,
+            cache_stats.current_bytes,
+            cache_stats.peak_bytes,
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            after.resident_downloads - before.resident_downloads,
+        );
+
+        device_cache.reset();
+        drop(actual);
+        drop(device_input);
+        drop(prepared);
+        drop(device_cache);
+        let after_drop = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after_drop.resident_allocated_bytes,
+            before.resident_allocated_bytes
+        );
+        assert_eq!(
+            after_drop.resident_device_local_bytes,
+            before.resident_device_local_bytes
+        );
     }
 
     #[test]

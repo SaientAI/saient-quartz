@@ -673,6 +673,34 @@ pub(crate) trait TensorBackend: Send + Sync {
         self.upload_tensor(&Tensor::new(input.shape().to_vec(), output)?)
     }
 
+    /// Wan VAE RMSNorm reduces across channels independently at every NTHW
+    /// location rather than over the final contiguous axis.
+    fn channel_rms_norm_3d_device(
+        &self,
+        input: &DeviceTensor,
+        weight: &PreparedVectorHandle,
+        epsilon: f32,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        self.require_vector(weight)?;
+        let [_, channels, _, _, _]: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("channel RMSNorm input must be NCTHW")?;
+        if channels == 0 || weight.length != channels {
+            bail!(
+                "channel RMSNorm weight length {} does not match {channels} channels",
+                weight.length
+            );
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            bail!("channel RMSNorm epsilon must be finite and positive");
+        }
+        let input = input.storage.host()?;
+        let weight = weight.storage.host()?;
+        self.upload_tensor(&input.channel_rms_norm_3d(weight, epsilon)?)
+    }
+
     /// Apply Wan's position-local rotary matrix to every head. Positions are
     /// `[rows, head_dim / 2, 4]` and are shared across heads within a row.
     fn rope_device(
@@ -1952,6 +1980,45 @@ impl TensorBackend for VulkanBackend {
                 input_storage,
                 weight_storage,
                 width,
+                epsilon,
+            )?),
+        })
+    }
+
+    fn channel_rms_norm_3d_device(
+        &self,
+        input: &DeviceTensor,
+        weight: &PreparedVectorHandle,
+        epsilon: f32,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        self.require_vector(weight)?;
+        let [batch, channels, time, height, width]: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("Vulkan channel RMSNorm input must be NCTHW")?;
+        if channels == 0 || weight.length != channels {
+            bail!(
+                "Vulkan channel RMSNorm weight length {} does not match {channels} channels",
+                weight.length
+            );
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            bail!("Vulkan channel RMSNorm epsilon must be finite and positive");
+        }
+        let DeviceTensorStorage::Vulkan(input_storage) = &input.storage else {
+            bail!("Vulkan channel RMSNorm received non-Vulkan input storage");
+        };
+        let PreparedVectorStorage::Vulkan(weight_storage) = &weight.storage else {
+            bail!("Vulkan channel RMSNorm received non-Vulkan weight storage");
+        };
+        Ok(DeviceTensor {
+            backend: BackendKind::Vulkan,
+            shape: input.shape.clone(),
+            storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_channel_rms_norm_3d(
+                input_storage,
+                weight_storage,
+                [batch, channels, time, height, width],
                 epsilon,
             )?),
         })
