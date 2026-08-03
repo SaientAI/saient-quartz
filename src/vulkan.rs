@@ -1103,8 +1103,9 @@ fn resident_vae_spatial_layout(
     let [batch, channels, time, height, width] = shape;
     if input.element_type != ResidentElementType::F32
         || [batch, channels, time, height, width].contains(&0)
-        || operation > 3
-        || chunk > 2
+        || operation > 4
+        || (operation == 4 && chunk == 0)
+        || (operation != 4 && chunk > 2)
     {
         bail!("resident VAE spatial layout parameters are invalid");
     }
@@ -1121,7 +1122,18 @@ fn resident_vae_spatial_layout(
     } else {
         base_elements
     };
-    if input.elements != expected_input || (operation != 2 && chunk != 0) {
+    let output_elements = if operation == 4 {
+        base_elements
+            .checked_mul(chunk)
+            .and_then(|value| value.checked_mul(chunk))
+            .context("resident VAE nearest upsample size overflow")?
+    } else {
+        base_elements
+    };
+    if input.elements != expected_input
+        || (operation != 2 && operation != 4 && chunk != 0)
+        || (operation == 2 && chunk > 2)
+    {
         bail!("resident VAE spatial layout input size does not match its operation");
     }
     let parameters = [
@@ -1132,7 +1144,7 @@ fn resident_vae_spatial_layout(
         height,
         width,
         chunk,
-        base_elements,
+        output_elements,
     ]
     .map(u32::try_from)
     .into_iter()
@@ -1148,7 +1160,11 @@ fn resident_vae_spatial_layout(
                 .expect("8 VAE spatial layout parameters"),
         )
     })?;
-    Ok(resident_tensor(id, base_elements, ResidentElementType::F32))
+    Ok(resident_tensor(
+        id,
+        output_elements,
+        ResidentElementType::F32,
+    ))
 }
 
 pub(crate) fn resident_ncthw_to_frames(
@@ -1178,6 +1194,14 @@ pub(crate) fn resident_vae_sequence_to_frames(
     shape: [usize; 5],
 ) -> Result<ResidentTensor> {
     resident_vae_spatial_layout(input, shape, 3, 0)
+}
+
+pub(crate) fn resident_ncthw_upsample_nearest(
+    input: &ResidentTensor,
+    shape: [usize; 5],
+    scale: usize,
+) -> Result<ResidentTensor> {
+    resident_vae_spatial_layout(input, shape, 4, scale)
 }
 
 fn resident_ncthw_temporal(
@@ -1406,6 +1430,45 @@ pub(crate) fn resident_scale(input: &ResidentTensor, value: f32) -> Result<Resid
     }
     let elements = u32::try_from(input.elements).context("resident Vulkan scale exceeds u32")?;
     let id = with_runtime(|runtime| runtime.resident_scale(input.id(), elements, value))?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_affine(
+    input: &ResidentTensor,
+    scale: f32,
+    bias: f32,
+) -> Result<ResidentTensor> {
+    if input.element_type != ResidentElementType::F32 || !scale.is_finite() || !bias.is_finite() {
+        bail!("resident Vulkan affine requires FP32 input and finite parameters");
+    }
+    let elements = u32::try_from(input.elements).context("resident Vulkan affine exceeds u32")?;
+    let id = with_runtime(|runtime| runtime.resident_affine(input.id(), elements, scale, bias))?;
+    Ok(resident_tensor(
+        id,
+        input.elements,
+        ResidentElementType::F32,
+    ))
+}
+
+pub(crate) fn resident_clamp(
+    input: &ResidentTensor,
+    minimum: f32,
+    maximum: f32,
+) -> Result<ResidentTensor> {
+    if input.element_type != ResidentElementType::F32
+        || !minimum.is_finite()
+        || !maximum.is_finite()
+        || minimum > maximum
+    {
+        bail!("resident Vulkan clamp requires FP32 input and ordered finite bounds");
+    }
+    let elements = u32::try_from(input.elements).context("resident Vulkan clamp exceeds u32")?;
+    let id =
+        with_runtime(|runtime| runtime.resident_clamp(input.id(), elements, minimum, maximum))?;
     Ok(resident_tensor(
         id,
         input.elements,
@@ -3543,25 +3606,44 @@ impl VulkanRuntime {
             chunk,
             output_elements,
         ] = *parameters;
-        if operation > 3
+        if operation > 4
             || batch == 0
             || channels == 0
             || time == 0
             || height == 0
             || width == 0
-            || chunk > 2
+            || (operation == 4 && chunk == 0)
+            || (operation != 4 && chunk > 2)
             || output_elements == 0
         {
             bail!("resident VAE spatial layout dimensions are invalid");
         }
+        let base_elements = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(time))
+            .and_then(|value| value.checked_mul(height))
+            .and_then(|value| value.checked_mul(width))
+            .context("resident VAE spatial layout base size overflow")?;
         let expected_input = if operation == 2 {
-            output_elements
+            base_elements
                 .checked_mul(3)
                 .context("resident VAE QKV layout input size overflow")?
         } else {
-            output_elements
+            base_elements
         };
-        if input_elements != expected_input as usize || (operation != 2 && chunk != 0) {
+        let expected_output = if operation == 4 {
+            base_elements
+                .checked_mul(chunk)
+                .and_then(|value| value.checked_mul(chunk))
+                .context("resident VAE nearest upsample output size overflow")?
+        } else {
+            base_elements
+        };
+        if input_elements != expected_input as usize
+            || output_elements != expected_output
+            || (operation != 2 && operation != 4 && chunk != 0)
+            || (operation == 2 && chunk > 2)
+        {
             bail!("resident VAE spatial layout element count is inconsistent");
         }
         self.require_resident(input_id, input_elements, ResidentElementType::F32)?;
@@ -3723,6 +3805,54 @@ impl VulkanRuntime {
             elements as usize,
             self.elementwise_pipeline,
             bytes_of(&[elements, 2, value.to_bits(), 0]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_affine(
+        &mut self,
+        input_id: u64,
+        elements: u32,
+        scale: f32,
+        bias: f32,
+    ) -> Result<u64> {
+        if elements == 0 || !scale.is_finite() || !bias.is_finite() {
+            bail!("resident Vulkan affine parameters must be valid");
+        }
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, input_id],
+            elements as usize,
+            self.elementwise_pipeline,
+            bytes_of(&[elements, 9, scale.to_bits(), bias.to_bits()]),
+            [elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_clamp(
+        &mut self,
+        input_id: u64,
+        elements: u32,
+        minimum: f32,
+        maximum: f32,
+    ) -> Result<u64> {
+        if elements == 0 || !minimum.is_finite() || !maximum.is_finite() || minimum > maximum {
+            bail!("resident Vulkan clamp parameters must be valid");
+        }
+        self.require_resident(input_id, elements as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, input_id],
+            elements as usize,
+            self.elementwise_pipeline,
+            bytes_of(&[elements, 5, minimum.to_bits(), maximum.to_bits()]),
             [elements.div_ceil(256), 1, 1],
             KernelKind::Elementwise,
         );

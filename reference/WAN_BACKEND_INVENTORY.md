@@ -304,3 +304,33 @@ Vulkan execution took `29.323 ms`. The assembled graph held 33,430,848 logical
 Vulkan bytes, 33,384,000 device-local logical bytes, and 37,248 cache bytes. It
 used one activation upload, thirteen prepared-weight uploads, and one final
 download.
+
+## Complete resident VAE decoder
+
+The complete Wan decoder is assembled through the same backend graph: all 12
+up-residuals, three nearest-neighbor spatial 2x stages and prepared Conv2D
+filters, both temporal `time_conv` stages, channel-to-time shuffle branches,
+head channel RMSNorm/SiLU/causal Conv3D, temporal chunk concatenation, output
+affine conversion, and clamp. All intermediate tensors remain Vulkan-owned;
+the only host transfers in each accepted decode are the latent upload and final
+pixel download. Activation and cache buffers are currently host-visible Vulkan
+allocations rather than device-local allocations, so the graph is resident but
+cache reporting correctly says `all_slots_device_local=false`.
+
+The captured small case `[1,16,2,8,8] -> [1,3,5,64,64]` matched at cosine
+`0.999992503`, maximum error `0.002739191`, and mean error `0.000432826`, exactly
+the preserved scalar-reference metrics. Weight preparation took `835.738 ms`
+and execution took `2,369.059 ms`. Peak logical Vulkan residency was
+237,341,964 bytes; peak cache residency was 38,739,968 bytes; RSS at comparison
+was 639,076 KiB. The run used one activation upload, 69 prepared-weight uploads,
+and one final download.
+
+Only after the small case passed, the captured full case
+`[1,16,2,30,52] -> [1,3,5,240,416]` was executed. It matched at cosine
+`0.999999012`, maximum error `0.004377365`, and mean error `0.000316649`, again
+exactly the preserved scalar-reference cosine. Weight preparation took
+`820.098 ms`; the deliberately simple unfused Vulkan graph executed in
+`300,412.909 ms`. Peak logical Vulkan residency was 2,357,688,588 bytes; peak
+cache residency was 944,286,720 bytes; RSS at comparison was 616,328 KiB. The
+run used one activation upload, 69 prepared-weight uploads, and one final
+download.

@@ -69,6 +69,9 @@ void main() {
             value = left * right_values[
                 vector_chunk * vector_width + index % vector_width];
             break;
+        case 9:
+            value = left * parameters.parameter0 + parameters.parameter1;
+            break;
         default:
             value = uintBitsToFloat(0x7fc00000);
             break;

@@ -187,6 +187,39 @@ impl PreparedVectorStorage {
     }
 }
 
+fn upsample_spatial_nearest_backend(
+    input: &Tensor,
+    shape: [usize; 5],
+    scale: usize,
+) -> Result<Tensor> {
+    let [batch, channels, time, height, width] = shape;
+    if scale == 0 || input.shape() != shape {
+        bail!("nearest upsample input shape or scale is invalid");
+    }
+    let output_height = height
+        .checked_mul(scale)
+        .context("nearest upsample height overflow")?;
+    let output_width = width
+        .checked_mul(scale)
+        .context("nearest upsample width overflow")?;
+    let input_plane = height * width;
+    let output_plane = output_height * output_width;
+    let mut data = vec![0.0; batch * channels * time * output_plane];
+    for plane_index in 0..batch * channels * time {
+        for output_y in 0..output_height {
+            for output_x in 0..output_width {
+                data[plane_index * output_plane + output_y * output_width + output_x] = input
+                    .data()
+                    [plane_index * input_plane + (output_y / scale) * width + output_x / scale];
+            }
+        }
+    }
+    Tensor::new(
+        vec![batch, channels, time, output_height, output_width],
+        data,
+    )
+}
+
 pub(crate) trait TensorBackend: Send + Sync {
     fn kind(&self) -> BackendKind;
     fn name(&self) -> &'static str;
@@ -514,6 +547,27 @@ pub(crate) trait TensorBackend: Send + Sync {
         self.upload_tensor(&Tensor::new(vec![frames, channels, height, width], data)?)
     }
 
+    fn ncthw_upsample_nearest_device(
+        &self,
+        input: &DeviceTensor,
+        scale: usize,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        let [batch, channels, time, height, width]: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("nearest upsample input must be NCTHW")?;
+        if scale == 0 {
+            bail!("nearest upsample scale must be non-zero");
+        }
+        let input = input.storage.host()?;
+        self.upload_tensor(&upsample_spatial_nearest_backend(
+            input,
+            [batch, channels, time, height, width],
+            scale,
+        )?)
+    }
+
     /// Prepare one dense projection. Matrix and optional bias ownership are
     /// grouped so an accelerated backend can upload them exactly once.
     fn prepare_linear(&self, weight: &Tensor, bias: Option<&Tensor>) -> Result<LinearWeightHandle> {
@@ -742,6 +796,34 @@ pub(crate) trait TensorBackend: Send + Sync {
         }
         let input = input.storage.host()?;
         self.upload_tensor(&self.scale(input, value)?)
+    }
+
+    fn affine_device(&self, input: &DeviceTensor, scale: f32, bias: f32) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        if !scale.is_finite() || !bias.is_finite() {
+            bail!("resident affine parameters must be finite");
+        }
+        let input = input.storage.host()?;
+        let data = input
+            .data()
+            .iter()
+            .map(|value| value * scale + bias)
+            .collect();
+        self.upload_tensor(&Tensor::new(input.shape().to_vec(), data)?)
+    }
+
+    fn clamp_device(
+        &self,
+        input: &DeviceTensor,
+        minimum: f32,
+        maximum: f32,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        if !minimum.is_finite() || !maximum.is_finite() || minimum > maximum {
+            bail!("resident clamp bounds must be finite and ordered");
+        }
+        let input = input.storage.host()?;
+        self.upload_tensor(&self.clamp(input, minimum, maximum)?)
     }
 
     /// Prepare a persistent FP32 vector such as a normalization parameter or
@@ -1843,6 +1925,37 @@ impl TensorBackend for VulkanBackend {
         })
     }
 
+    fn ncthw_upsample_nearest_device(
+        &self,
+        input: &DeviceTensor,
+        scale: usize,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        let shape: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("Vulkan nearest upsample input must be NCTHW")?;
+        if scale == 0 {
+            bail!("Vulkan nearest upsample scale must be non-zero");
+        }
+        let output_height = shape[3]
+            .checked_mul(scale)
+            .context("Vulkan nearest upsample height overflow")?;
+        let output_width = shape[4]
+            .checked_mul(scale)
+            .context("Vulkan nearest upsample width overflow")?;
+        let DeviceTensorStorage::Vulkan(storage) = &input.storage else {
+            bail!("Vulkan nearest upsample received non-Vulkan storage");
+        };
+        Ok(DeviceTensor {
+            backend: BackendKind::Vulkan,
+            shape: vec![shape[0], shape[1], shape[2], output_height, output_width],
+            storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_ncthw_upsample_nearest(
+                storage, shape, scale,
+            )?),
+        })
+    }
+
     fn prepare_linear(&self, weight: &Tensor, bias: Option<&Tensor>) -> Result<LinearWeightHandle> {
         let [output_width, input_width]: [usize; 2] = weight
             .shape()
@@ -2130,6 +2243,49 @@ impl TensorBackend for VulkanBackend {
             storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_scale(
                 input_storage,
                 value,
+            )?),
+        })
+    }
+
+    fn affine_device(&self, input: &DeviceTensor, scale: f32, bias: f32) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        if !scale.is_finite() || !bias.is_finite() {
+            bail!("resident Vulkan affine parameters must be finite");
+        }
+        let DeviceTensorStorage::Vulkan(input_storage) = &input.storage else {
+            bail!("Vulkan backend received non-Vulkan affine input");
+        };
+        Ok(DeviceTensor {
+            backend: BackendKind::Vulkan,
+            shape: input.shape.clone(),
+            storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_affine(
+                input_storage,
+                scale,
+                bias,
+            )?),
+        })
+    }
+
+    fn clamp_device(
+        &self,
+        input: &DeviceTensor,
+        minimum: f32,
+        maximum: f32,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        if !minimum.is_finite() || !maximum.is_finite() || minimum > maximum {
+            bail!("resident Vulkan clamp bounds must be finite and ordered");
+        }
+        let DeviceTensorStorage::Vulkan(input_storage) = &input.storage else {
+            bail!("Vulkan backend received non-Vulkan clamp input");
+        };
+        Ok(DeviceTensor {
+            backend: BackendKind::Vulkan,
+            shape: input.shape.clone(),
+            storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_clamp(
+                input_storage,
+                minimum,
+                maximum,
             )?),
         })
     }

@@ -56,13 +56,24 @@ void main() {
         uint frame_index = remaining / plane;
         uint qkv_channel = parameters.chunk * parameters.channels + channel;
         source = (frame_index * parameters.channels * 3 + qkv_channel) * plane + position;
-    } else {
+    } else if (parameters.operation == 3) {
         // (N*T),(H*W),C -> (N*T),C,H,W.
         uint position = index % plane;
         uint remaining = index / plane;
         uint channel = remaining % parameters.channels;
         uint frame_index = remaining / parameters.channels;
         source = (frame_index * plane + position) * parameters.channels + channel;
+    } else {
+        // Nearest-neighbor NCTHW spatial upsample. `chunk` is the scale.
+        uint output_width = parameters.width * parameters.chunk;
+        uint output_height = parameters.height * parameters.chunk;
+        uint output_plane = output_height * output_width;
+        uint output_x = index % output_width;
+        uint output_y = (index / output_width) % output_height;
+        uint plane_index = index / output_plane;
+        uint input_x = output_x / parameters.chunk;
+        uint input_y = output_y / parameters.chunk;
+        source = plane_index * plane + input_y * parameters.width + input_x;
     }
     output_values[index] = input_values[source];
 }

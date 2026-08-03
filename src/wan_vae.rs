@@ -724,6 +724,12 @@ struct PreparedTemporalUpsample {
     temporal: Option<PreparedCausalConv3d>,
 }
 
+#[cfg(feature = "vulkan")]
+struct PreparedUpsample {
+    temporal: PreparedTemporalUpsample,
+    spatial: PreparedConv2dFrames,
+}
+
 impl Upsample {
     fn load(weights: &SafeTensorFile, prefix: &str, temporal: bool) -> Result<Self> {
         Ok(Self {
@@ -851,6 +857,35 @@ impl Upsample {
         }
         Ok(hidden)
     }
+
+    #[cfg(feature = "vulkan")]
+    fn prepare(&self, backend: &dyn TensorBackend) -> Result<PreparedUpsample> {
+        Ok(PreparedUpsample {
+            temporal: self.prepare_temporal(backend)?,
+            spatial: self.spatial.prepare(backend)?,
+        })
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn forward_with_backend(
+        &self,
+        input: &DeviceTensor,
+        cache: &mut DeviceFeatureCache,
+        chunk_index: usize,
+        backend: &dyn TensorBackend,
+        prepared: &PreparedUpsample,
+    ) -> Result<DeviceTensor> {
+        let hidden = self.forward_temporal_with_backend(
+            input,
+            cache,
+            chunk_index,
+            backend,
+            &prepared.temporal,
+        )?;
+        let hidden = backend.ncthw_upsample_nearest_device(&hidden, 2)?;
+        self.spatial
+            .forward_with_backend(&hidden, backend, &prepared.spatial)
+    }
 }
 
 pub struct WanVae {
@@ -874,6 +909,15 @@ struct PreparedDecoderMiddle {
     middle_0: PreparedResidualBlock,
     middle_attention: PreparedSpatialAttention,
     middle_2: PreparedResidualBlock,
+}
+
+#[cfg(feature = "vulkan")]
+struct PreparedWanVae {
+    middle: PreparedDecoderMiddle,
+    up_residuals: Vec<PreparedResidualBlock>,
+    upsamples: [PreparedUpsample; 3],
+    head_norm: PreparedVectorHandle,
+    head: PreparedCausalConv3d,
 }
 
 impl WanVae {
@@ -937,6 +981,145 @@ impl WanVae {
         )?;
         self.middle_2
             .forward_with_backend(&hidden, cache, backend, &prepared.middle_2)
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn prepare_with_backend(&self, backend: &dyn TensorBackend) -> Result<PreparedWanVae> {
+        Ok(PreparedWanVae {
+            middle: self.prepare_decoder_middle(backend)?,
+            up_residuals: self
+                .up_residuals
+                .iter()
+                .map(|residual| residual.prepare(backend))
+                .collect::<Result<Vec<_>>>()?,
+            upsamples: [
+                self.upsample_0.prepare(backend)?,
+                self.upsample_1.prepare(backend)?,
+                self.upsample_2.prepare(backend)?,
+            ],
+            head_norm: backend.prepare_vector(&self.head_norm)?,
+            head: self.head.prepare(backend)?,
+        })
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn forward_chunk_with_backend(
+        &self,
+        mut hidden: DeviceTensor,
+        cache: &mut DeviceFeatureCache,
+        chunk_index: usize,
+        backend: &dyn TensorBackend,
+        prepared: &PreparedWanVae,
+    ) -> Result<DeviceTensor> {
+        hidden = cached_causal_conv_with_backend(
+            &self.decoder_in,
+            &hidden,
+            cache,
+            backend,
+            &prepared.middle.decoder_in,
+        )?;
+        hidden = self.middle_0.forward_with_backend(
+            &hidden,
+            cache,
+            backend,
+            &prepared.middle.middle_0,
+        )?;
+        hidden = self.middle_attention.forward_with_backend(
+            &hidden,
+            backend,
+            &prepared.middle.middle_attention,
+        )?;
+        hidden = self.middle_2.forward_with_backend(
+            &hidden,
+            cache,
+            backend,
+            &prepared.middle.middle_2,
+        )?;
+
+        let mut residual_index = 0;
+        for stage in 0..4 {
+            for _ in 0..3 {
+                hidden = self.up_residuals[residual_index].forward_with_backend(
+                    &hidden,
+                    cache,
+                    backend,
+                    &prepared.up_residuals[residual_index],
+                )?;
+                residual_index += 1;
+            }
+            hidden = match stage {
+                0 => self.upsample_0.forward_with_backend(
+                    &hidden,
+                    cache,
+                    chunk_index,
+                    backend,
+                    &prepared.upsamples[0],
+                )?,
+                1 => self.upsample_1.forward_with_backend(
+                    &hidden,
+                    cache,
+                    chunk_index,
+                    backend,
+                    &prepared.upsamples[1],
+                )?,
+                2 => self.upsample_2.forward_with_backend(
+                    &hidden,
+                    cache,
+                    chunk_index,
+                    backend,
+                    &prepared.upsamples[2],
+                )?,
+                3 => hidden,
+                _ => unreachable!(),
+            };
+        }
+        hidden = backend.channel_rms_norm_3d_device(&hidden, &prepared.head_norm, RMS_EPSILON)?;
+        hidden = backend.silu_device(&hidden)?;
+        cached_causal_conv_with_backend(&self.head, &hidden, cache, backend, &prepared.head)
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn decode_device_with_backend(
+        &self,
+        latents: &DeviceTensor,
+        backend: &dyn TensorBackend,
+        prepared: &PreparedWanVae,
+    ) -> Result<(DeviceTensor, DeviceFeatureCacheStats)> {
+        let [batch, channels, time, _, _]: [usize; 5] = latents
+            .shape()
+            .try_into()
+            .context("resident Wan VAE latents must be NCTHW")?;
+        if batch != 1 || channels != 16 || time == 0 {
+            bail!(
+                "resident Wan 2.1 VAE latents must have shape [1,16,T,H,W], got {:?}",
+                latents.shape()
+            );
+        }
+        let transformed =
+            self.pre
+                .forward_uncached_with_backend(latents, backend, &prepared.middle.pre)?;
+        let mut cache = DeviceFeatureCache::new();
+        let mut chunks = Vec::with_capacity(time);
+        for chunk_index in 0..time {
+            cache.begin_chunk();
+            let chunk = backend.ncthw_slice_time_device(&transformed, chunk_index, 1)?;
+            let chunk =
+                self.forward_chunk_with_backend(chunk, &mut cache, chunk_index, backend, prepared)?;
+            if cache.active_index != USED_CACHE_SLOTS {
+                bail!(
+                    "resident Wan VAE chunk consumed {} cache slots, expected {USED_CACHE_SLOTS}",
+                    cache.active_index
+                );
+            }
+            chunks.push(chunk);
+        }
+        let chunk_refs = chunks.iter().collect::<Vec<_>>();
+        let output = backend.ncthw_concat_time_device(&chunk_refs)?;
+        let output = backend.affine_device(&output, 0.5, 0.5)?;
+        let output = backend.clamp_device(&output, 0.0, 1.0)?;
+        let cache_stats = cache.stats()?;
+        cache.reset();
+        Ok((output, cache_stats))
     }
 
     /// Decode VAE-space latents to clamped `[0,1]` RGB pixels.
@@ -2516,6 +2699,20 @@ mod parity {
         Some((shape, data))
     }
 
+    #[cfg(feature = "vulkan")]
+    fn current_rss_kib() -> Option<u64> {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmRSS:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+    }
+
     fn run_case(
         label: &str,
         input_name: &str,
@@ -2641,6 +2838,192 @@ mod parity {
             after.peak_resident_allocated_bytes,
         );
         crate::vulkan::print_statistics();
+
+        drop(device_output);
+        drop(device_input);
+        drop(prepared);
+        let after_drop = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after_drop.resident_allocated_bytes,
+            before.resident_allocated_bytes
+        );
+        assert_eq!(
+            after_drop.resident_device_local_bytes,
+            before.resident_device_local_bytes
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "loads the Wan VAE and validates the full small resident decoder"]
+    fn resident_vulkan_small_decode_matches_reference() {
+        use crate::{
+            backend::{TensorBackend, VULKAN_BACKEND},
+            parity::{ParityTolerance, compare_tensors},
+        };
+
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let vae_path = Path::new(VAE);
+        let input_path = Path::new(REFERENCE).join("vae_in_small.bin");
+        let output_path = Path::new(REFERENCE).join("vae_out_small.bin");
+        for path in [vae_path, input_path.as_path(), output_path.as_path()] {
+            assert!(path.exists(), "required parity input is missing: {path:?}");
+        }
+        let (captured_input_shape, input_values) = read_dump(&input_path).unwrap();
+        let (captured_output_shape, expected_values) = read_dump(&output_path).unwrap();
+        assert_eq!(captured_input_shape, [8, 8, 2, 16, 1]);
+        assert_eq!(captured_output_shape, [64, 64, 5, 3, 1]);
+        let input = Tensor::new(vec![1, 16, 2, 8, 8], input_values).unwrap();
+        let expected = Tensor::new(vec![1, 3, 5, 64, 64], expected_values).unwrap();
+        let weights = SafeTensorFile::open(vae_path).unwrap();
+        let decoder = WanVae::load(&weights).unwrap();
+
+        let before = crate::vulkan::persistence_stats().unwrap();
+        let prepare_started = std::time::Instant::now();
+        let prepared = decoder.prepare_with_backend(&VULKAN_BACKEND).unwrap();
+        let prepare_runtime = prepare_started.elapsed();
+        let after_prepare = crate::vulkan::persistence_stats().unwrap();
+        let device_input = VULKAN_BACKEND.upload_tensor(&input).unwrap();
+        let execute_started = std::time::Instant::now();
+        let (device_output, cache_stats) = decoder
+            .decode_device_with_backend(&device_input, &VULKAN_BACKEND, &prepared)
+            .unwrap();
+        let execute_runtime = execute_started.elapsed();
+        let output = VULKAN_BACKEND.download_tensor(&device_output).unwrap();
+        let after = crate::vulkan::persistence_stats().unwrap();
+        let metrics = compare_tensors(&output, &expected).unwrap();
+        metrics
+            .require(ParityTolerance {
+                minimum_cosine_similarity: 0.999,
+                maximum_absolute_error: 0.03,
+                maximum_mean_absolute_error: 0.005,
+            })
+            .unwrap();
+        assert_eq!(output.shape(), &[1, 3, 5, 64, 64]);
+        assert_eq!(cache_stats.occupied_slots, USED_CACHE_SLOTS);
+        assert!(cache_stats.all_slots_resident);
+        assert!(!cache_stats.all_slots_device_local);
+        assert_eq!(
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            1
+        );
+        assert_eq!(after.resident_downloads - before.resident_downloads, 1);
+        println!(
+            "resident Vulkan small VAE decode: input={:?} output={:?} prepare_ms={:.3} execute_ms={:.3} cosine={:.9} max_abs={:.9} mean_abs={:.9} current_vulkan_bytes={} peak_vulkan_bytes={} device_local_bytes={} peak_device_local_bytes={} cache_current_bytes={} cache_peak_bytes={} cache_occupied={} cache_replaced={} cache_device_local={} host_uploads={} weight_uploads={} downloads={} rss_kib={:?}",
+            input.shape(),
+            output.shape(),
+            prepare_runtime.as_secs_f64() * 1_000.0,
+            execute_runtime.as_secs_f64() * 1_000.0,
+            metrics.cosine_similarity,
+            metrics.maximum_absolute_error,
+            metrics.mean_absolute_error,
+            after.resident_allocated_bytes - before.resident_allocated_bytes,
+            after.peak_resident_allocated_bytes,
+            after.resident_device_local_bytes - before.resident_device_local_bytes,
+            after.peak_resident_device_local_bytes,
+            cache_stats.current_bytes,
+            cache_stats.peak_bytes,
+            cache_stats.occupied_slots,
+            cache_stats.replaced_slots,
+            cache_stats.all_slots_device_local,
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            after.resident_downloads - before.resident_downloads,
+            current_rss_kib(),
+        );
+
+        drop(device_output);
+        drop(device_input);
+        drop(prepared);
+        let after_drop = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after_drop.resident_allocated_bytes,
+            before.resident_allocated_bytes
+        );
+        assert_eq!(
+            after_drop.resident_device_local_bytes,
+            before.resident_device_local_bytes
+        );
+        assert!(after_prepare.resident_weight_uploads > before.resident_weight_uploads);
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "loads the Wan VAE and validates the full-size resident decoder"]
+    fn resident_vulkan_full_decode_matches_reference() {
+        use crate::{
+            backend::{TensorBackend, VULKAN_BACKEND},
+            parity::{ParityTolerance, compare_tensors},
+        };
+
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let vae_path = Path::new(VAE);
+        let input_path = Path::new(REFERENCE).join("vae_in_full.bin");
+        let output_path = Path::new(REFERENCE).join("vae_out_full.bin");
+        for path in [vae_path, input_path.as_path(), output_path.as_path()] {
+            assert!(path.exists(), "required parity input is missing: {path:?}");
+        }
+        let (captured_input_shape, input_values) = read_dump(&input_path).unwrap();
+        let (captured_output_shape, expected_values) = read_dump(&output_path).unwrap();
+        assert_eq!(captured_input_shape, [52, 30, 2, 16, 1]);
+        assert_eq!(captured_output_shape, [416, 240, 5, 3, 1]);
+        let input = Tensor::new(vec![1, 16, 2, 30, 52], input_values).unwrap();
+        let expected = Tensor::new(vec![1, 3, 5, 240, 416], expected_values).unwrap();
+        let weights = SafeTensorFile::open(vae_path).unwrap();
+        let decoder = WanVae::load(&weights).unwrap();
+
+        let before = crate::vulkan::persistence_stats().unwrap();
+        let prepare_started = std::time::Instant::now();
+        let prepared = decoder.prepare_with_backend(&VULKAN_BACKEND).unwrap();
+        let prepare_runtime = prepare_started.elapsed();
+        let device_input = VULKAN_BACKEND.upload_tensor(&input).unwrap();
+        let execute_started = std::time::Instant::now();
+        let (device_output, cache_stats) = decoder
+            .decode_device_with_backend(&device_input, &VULKAN_BACKEND, &prepared)
+            .unwrap();
+        let execute_runtime = execute_started.elapsed();
+        let output = VULKAN_BACKEND.download_tensor(&device_output).unwrap();
+        let after = crate::vulkan::persistence_stats().unwrap();
+        let metrics = compare_tensors(&output, &expected).unwrap();
+        metrics
+            .require(ParityTolerance {
+                minimum_cosine_similarity: 0.999,
+                maximum_absolute_error: 0.03,
+                maximum_mean_absolute_error: 0.005,
+            })
+            .unwrap();
+        assert_eq!(output.shape(), &[1, 3, 5, 240, 416]);
+        assert_eq!(cache_stats.occupied_slots, USED_CACHE_SLOTS);
+        assert!(cache_stats.all_slots_resident);
+        assert!(!cache_stats.all_slots_device_local);
+        assert_eq!(
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            1
+        );
+        assert_eq!(after.resident_downloads - before.resident_downloads, 1);
+        println!(
+            "resident Vulkan full VAE decode: input={:?} output={:?} prepare_ms={:.3} execute_ms={:.3} cosine={:.9} max_abs={:.9} mean_abs={:.9} current_vulkan_bytes={} peak_vulkan_bytes={} device_local_bytes={} peak_device_local_bytes={} cache_current_bytes={} cache_peak_bytes={} cache_occupied={} cache_replaced={} cache_device_local={} host_uploads={} weight_uploads={} downloads={} rss_kib={:?}",
+            input.shape(),
+            output.shape(),
+            prepare_runtime.as_secs_f64() * 1_000.0,
+            execute_runtime.as_secs_f64() * 1_000.0,
+            metrics.cosine_similarity,
+            metrics.maximum_absolute_error,
+            metrics.mean_absolute_error,
+            after.resident_allocated_bytes - before.resident_allocated_bytes,
+            after.peak_resident_allocated_bytes,
+            after.resident_device_local_bytes - before.resident_device_local_bytes,
+            after.peak_resident_device_local_bytes,
+            cache_stats.current_bytes,
+            cache_stats.peak_bytes,
+            cache_stats.occupied_slots,
+            cache_stats.replaced_slots,
+            cache_stats.all_slots_device_local,
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            after.resident_downloads - before.resident_downloads,
+            current_rss_kib(),
+        );
 
         drop(device_output);
         drop(device_input);
