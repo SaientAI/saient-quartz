@@ -139,6 +139,16 @@ metric: higher cosine, smaller maximum error, smaller mean error. The failing
 `0.03` budget is roughly eight times tighter than the reference engine's own
 demonstrated reproducibility.
 
+> **These two pixel rows are not yet controlled to the standard of the
+> velocity rows above.** The velocity control was run and came back bit-exact.
+> The pixel equivalent — re-running the FA case and confirming its decoded
+> output reproduces `vae/vae_out_full.bin` bit-exactly — has not been run, so
+> the FA/non-FA attribution of the `0.234375` figure rests on inferring VAE
+> determinism from DiT determinism. That inference skips the decoder, which is
+> the stage contributing roughly a 3.6x gain on maximum error, so it is not
+> good enough to build a decision on. Treat the pixel band as provisional
+> until that control is recorded here.
+
 **The tolerance has deliberately not been relaxed.** A `0.03` pixel budget is
 almost certainly below what the reference can reproduce against itself — the
 reference's own FA/non-FA velocity spread is `0.063`, larger than the delta
