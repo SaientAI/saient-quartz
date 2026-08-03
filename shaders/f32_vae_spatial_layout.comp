@@ -1,0 +1,68 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float input_values[];
+};
+layout(set = 0, binding = 1, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Parameters {
+    uint operation;
+    uint batch;
+    uint channels;
+    uint time;
+    uint height;
+    uint width;
+    uint chunk;
+    uint output_elements;
+} parameters;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= parameters.output_elements) {
+        return;
+    }
+    uint plane = parameters.height * parameters.width;
+    uint source = 0;
+
+    if (parameters.operation == 0) {
+        // NCTHW -> (N*T)CHW.
+        uint position = index % plane;
+        uint remaining = index / plane;
+        uint channel = remaining % parameters.channels;
+        uint frame_index = remaining / parameters.channels;
+        uint sample_index = frame_index / parameters.time;
+        uint frame = frame_index % parameters.time;
+        source = ((sample_index * parameters.channels + channel) * parameters.time + frame) *
+            plane + position;
+    } else if (parameters.operation == 1) {
+        // (N*T)CHW -> NCTHW.
+        uint position = index % plane;
+        uint remaining = index / plane;
+        uint frame = remaining % parameters.time;
+        remaining /= parameters.time;
+        uint channel = remaining % parameters.channels;
+        uint sample_index = remaining / parameters.channels;
+        source = ((sample_index * parameters.time + frame) * parameters.channels + channel) *
+            plane + position;
+    } else if (parameters.operation == 2) {
+        // (N*T),(3*C),H,W -> (N*T),(H*W),C. `chunk` selects Q/K/V.
+        uint channel = index % parameters.channels;
+        uint remaining = index / parameters.channels;
+        uint position = remaining % plane;
+        uint frame_index = remaining / plane;
+        uint qkv_channel = parameters.chunk * parameters.channels + channel;
+        source = (frame_index * parameters.channels * 3 + qkv_channel) * plane + position;
+    } else {
+        // (N*T),(H*W),C -> (N*T),C,H,W.
+        uint position = index % plane;
+        uint remaining = index / plane;
+        uint channel = remaining % parameters.channels;
+        uint frame_index = remaining / parameters.channels;
+        source = (frame_index * plane + position) * parameters.channels + channel;
+    }
+    output_values[index] = input_values[source];
+}

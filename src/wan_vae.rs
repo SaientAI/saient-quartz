@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
 #[cfg(feature = "vulkan")]
-use crate::backend::{BackendKind, PreparedVectorHandle};
+use crate::backend::{BackendKind, Conv2dWeightHandle, PreparedVectorHandle};
 use crate::{
     backend::{Conv3dWeightHandle, DeviceTensor, SCALAR_BACKEND, TensorBackend},
     safetensors::SafeTensorFile,
@@ -159,6 +159,11 @@ struct Conv2dFrames {
     padding: [usize; 2],
 }
 
+#[cfg(feature = "vulkan")]
+struct PreparedConv2dFrames {
+    weights: Conv2dWeightHandle,
+}
+
 impl Conv2dFrames {
     fn load(
         weights: &SafeTensorFile,
@@ -223,6 +228,39 @@ impl Conv2dFrames {
             vec![batch, output_channels, time, output_height, output_width],
             data,
         )
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn prepare(&self, backend: &dyn TensorBackend) -> Result<PreparedConv2dFrames> {
+        Ok(PreparedConv2dFrames {
+            weights: backend.prepare_conv2d(&self.weight, self.bias.as_ref())?,
+        })
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn forward_frames_with_backend(
+        &self,
+        input: &DeviceTensor,
+        backend: &dyn TensorBackend,
+        prepared: &PreparedConv2dFrames,
+    ) -> Result<DeviceTensor> {
+        let frames = backend.ncthw_to_nchw_frames_device(input)?;
+        backend.conv2d_prepared_device(&frames, &prepared.weights, self.stride, self.padding)
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn forward_with_backend(
+        &self,
+        input: &DeviceTensor,
+        backend: &dyn TensorBackend,
+        prepared: &PreparedConv2dFrames,
+    ) -> Result<DeviceTensor> {
+        let [batch, _, time, _, _]: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("resident frame Conv2D input must be NCTHW")?;
+        let frames = self.forward_frames_with_backend(input, backend, prepared)?;
+        backend.nchw_frames_to_ncthw_device(&frames, batch, time)
     }
 }
 
@@ -543,6 +581,13 @@ struct SpatialAttention {
     projection: Conv2dFrames,
 }
 
+#[cfg(feature = "vulkan")]
+struct PreparedSpatialAttention {
+    norm: PreparedVectorHandle,
+    qkv: PreparedConv2dFrames,
+    projection: PreparedConv2dFrames,
+}
+
 impl SpatialAttention {
     fn load(weights: &SafeTensorFile, prefix: &str) -> Result<Self> {
         Ok(Self {
@@ -612,6 +657,60 @@ impl SpatialAttention {
             });
         let attended = Tensor::new(vec![batch, channels, time, height, width], attended_ncthw)?;
         backend.add(&self.projection.forward(&attended)?, input)
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn prepare(&self, backend: &dyn TensorBackend) -> Result<PreparedSpatialAttention> {
+        Ok(PreparedSpatialAttention {
+            norm: backend.prepare_vector(&self.norm)?,
+            qkv: self.qkv.prepare(backend)?,
+            projection: self.projection.prepare(backend)?,
+        })
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn forward_with_backend(
+        &self,
+        input: &DeviceTensor,
+        backend: &dyn TensorBackend,
+        prepared: &PreparedSpatialAttention,
+    ) -> Result<DeviceTensor> {
+        let [batch, channels, time, height, width]: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("resident Wan VAE spatial attention input must be NCTHW")?;
+        let positions = height
+            .checked_mul(width)
+            .context("resident Wan VAE attention position overflow")?;
+        let normalized = backend.channel_rms_norm_3d_device(input, &prepared.norm, RMS_EPSILON)?;
+        let qkv_frames =
+            self.qkv
+                .forward_frames_with_backend(&normalized, backend, &prepared.qkv)?;
+        if qkv_frames.shape()[1] != channels * 3 {
+            bail!(
+                "resident Wan VAE QKV produced {} channels, expected {}",
+                qkv_frames.shape()[1],
+                channels * 3
+            );
+        }
+        let (query, key, value) = backend.vae_qkv_to_sequences_device(&qkv_frames)?;
+        let scale = 1.0 / (channels as f32).sqrt();
+        let scores = backend.attention_scores_device(&query, &key, 1, channels, scale)?;
+        let probabilities = backend.softmax_device(&scores)?;
+        let attended = backend.attention_values_device(&probabilities, &value, 1, channels)?;
+        if attended.shape() != [batch * time, positions, channels] {
+            bail!("resident Wan VAE attention returned the wrong sequence shape");
+        }
+        let attended_frames =
+            backend.vae_sequence_to_nchw_frames_device(&attended, height, width)?;
+        let projected_frames = backend.conv2d_prepared_device(
+            &attended_frames,
+            &prepared.projection.weights,
+            self.projection.stride,
+            self.projection.padding,
+        )?;
+        let projected = backend.nchw_frames_to_ncthw_device(&projected_frames, batch, time)?;
+        backend.add_device(&projected, input)
     }
 }
 
@@ -1164,6 +1263,65 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "vulkan")]
+    fn trace_spatial_attention_device(
+        attention: &SpatialAttention,
+        input: &Tensor,
+        backend: &dyn TensorBackend,
+        prepared: &PreparedSpatialAttention,
+    ) -> Result<Vec<(&'static str, Tensor)>> {
+        let [batch, channels, time, height, width] = ncthw(input)?;
+        let device_input = backend.upload_tensor(input)?;
+        let normalized =
+            backend.channel_rms_norm_3d_device(&device_input, &prepared.norm, RMS_EPSILON)?;
+        let normalized_frames = backend.ncthw_to_nchw_frames_device(&normalized)?;
+        let qkv_frames = backend.conv2d_prepared_device(
+            &normalized_frames,
+            &prepared.qkv.weights,
+            attention.qkv.stride,
+            attention.qkv.padding,
+        )?;
+        let (query, key, value) = backend.vae_qkv_to_sequences_device(&qkv_frames)?;
+        let scores = backend.attention_scores_device(
+            &query,
+            &key,
+            1,
+            channels,
+            1.0 / (channels as f32).sqrt(),
+        )?;
+        let probabilities = backend.softmax_device(&scores)?;
+        let attended = backend.attention_values_device(&probabilities, &value, 1, channels)?;
+        let attended_frames =
+            backend.vae_sequence_to_nchw_frames_device(&attended, height, width)?;
+        let projected_frames = backend.conv2d_prepared_device(
+            &attended_frames,
+            &prepared.projection.weights,
+            attention.projection.stride,
+            attention.projection.padding,
+        )?;
+        let projected = backend.nchw_frames_to_ncthw_device(&projected_frames, batch, time)?;
+        let output = backend.add_device(&projected, &device_input)?;
+        let resident = [
+            ("normalized", &normalized),
+            ("normalized_frames", &normalized_frames),
+            ("qkv_frames", &qkv_frames),
+            ("query", &query),
+            ("key", &key),
+            ("value", &value),
+            ("scores", &scores),
+            ("probabilities", &probabilities),
+            ("attended", &attended),
+            ("attended_frames", &attended_frames),
+            ("projected_frames", &projected_frames),
+            ("projected", &projected),
+            ("output", &output),
+        ];
+        resident
+            .into_iter()
+            .map(|(name, tensor)| Ok((name, backend.download_tensor(tensor)?)))
+            .collect()
+    }
+
     #[test]
     fn feature_cache_matches_one_shot_causal_convolution() {
         let layer = conv3d(tensor(&[1, 1, 3, 1, 1], &[1., 10., 100.]), None, [1, 0, 0]);
@@ -1687,6 +1845,245 @@ mod tests {
             output.data(),
             &[1.7404919, 3.7404919, 3.198141, 5.198141],
             2e-6,
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_spatial_attention_matches_scalar_and_isolates_frames() {
+        use crate::parity::{ParityTolerance, compare_tensors};
+
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let before = match crate::vulkan::persistence_stats() {
+            Ok(stats) => stats,
+            Err(error) if std::env::var_os("QUARTZ_REQUIRE_VULKAN").is_none() => {
+                eprintln!("skipping Vulkan spatial-attention parity: {error:#}");
+                return;
+            }
+            Err(error) => panic!("required Vulkan spatial-attention parity failed: {error:#}"),
+        };
+        let attention = SpatialAttention {
+            norm: tensor(&[2], &[1.0, 0.875]),
+            qkv: conv2d(
+                tensor(
+                    &[6, 2, 1, 1],
+                    &[
+                        1.0, 0.0, 0.0, 1.0, // query
+                        0.5, -0.25, 0.25, 0.75, // key
+                        1.0, 0.5, -0.5, 1.0, // value
+                    ],
+                ),
+                Some(tensor(&[6], &[0.0625, -0.125, 0.0, 0.125, -0.0625, 0.1875])),
+            ),
+            projection: conv2d(
+                tensor(&[2, 2, 1, 1], &[0.75, -0.25, 0.5, 1.0]),
+                Some(tensor(&[2], &[0.125, -0.0625])),
+            ),
+        };
+        let input = Tensor::new(
+            vec![2, 2, 2, 2, 3],
+            (0..48)
+                .map(|index| ((index * 13) % 31) as f32 * 0.125 - 1.75)
+                .collect(),
+        )
+        .unwrap();
+        let expected = attention.forward(&input, &SCALAR_BACKEND).unwrap();
+        let scalar_prepared = attention.prepare(&SCALAR_BACKEND).unwrap();
+        let scalar_trace =
+            trace_spatial_attention_device(&attention, &input, &SCALAR_BACKEND, &scalar_prepared)
+                .unwrap();
+        let scalar_device_result = &scalar_trace.last().unwrap().1;
+        let scalar_graph_metrics = compare_tensors(&scalar_device_result, &expected).unwrap();
+        println!(
+            "scalar prepared VAE spatial attention: cosine={:.9} max_abs={:.9} mean_abs={:.9}",
+            scalar_graph_metrics.cosine_similarity,
+            scalar_graph_metrics.maximum_absolute_error,
+            scalar_graph_metrics.mean_absolute_error,
+        );
+        let backend = &crate::backend::VULKAN_BACKEND;
+        let prepared = attention.prepare(backend).unwrap();
+        let started = std::time::Instant::now();
+        let device_trace =
+            trace_spatial_attention_device(&attention, &input, backend, &prepared).unwrap();
+        let runtime = started.elapsed();
+        for ((scalar_name, scalar), (device_name, device)) in scalar_trace.iter().zip(&device_trace)
+        {
+            assert_eq!(scalar_name, device_name);
+            let layer_metrics = compare_tensors(device, scalar).unwrap();
+            println!(
+                "VAE spatial layer {device_name}: shape={:?} cosine={:.9} max_abs={:.9} mean_abs={:.9}",
+                device.shape(),
+                layer_metrics.cosine_similarity,
+                layer_metrics.maximum_absolute_error,
+                layer_metrics.mean_absolute_error,
+            );
+        }
+        let output = &device_trace.last().unwrap().1;
+        let metrics = compare_tensors(&output, &expected).unwrap();
+        metrics
+            .require(ParityTolerance {
+                minimum_cosine_similarity: 0.999_999,
+                maximum_absolute_error: 2e-5,
+                maximum_mean_absolute_error: 2e-6,
+            })
+            .unwrap();
+        assert_eq!(output.shape(), &[2, 2, 2, 2, 3]);
+
+        let mut changed_input = input.clone();
+        let [batch, channels, time, height, width] = [2, 2, 2, 2, 3];
+        let plane = height * width;
+        for sample in 0..batch {
+            for channel in 0..channels {
+                let start = ((sample * channels + channel) * time + 1) * plane;
+                for value in &mut changed_input.data_mut()[start..start + plane] {
+                    *value = *value * -3.0 + 7.0;
+                }
+            }
+        }
+        let changed_device_input = backend.upload_tensor(&changed_input).unwrap();
+        let changed_device_output = attention
+            .forward_with_backend(&changed_device_input, backend, &prepared)
+            .unwrap();
+        let changed_output = backend.download_tensor(&changed_device_output).unwrap();
+        let mut changed_frame_difference = 0.0f32;
+        for sample in 0..batch {
+            for channel in 0..channels {
+                let first_frame = (sample * channels + channel) * time * plane;
+                assert_eq!(
+                    &output.data()[first_frame..first_frame + plane],
+                    &changed_output.data()[first_frame..first_frame + plane]
+                );
+                let second_frame = first_frame + plane;
+                for position in 0..plane {
+                    changed_frame_difference += (output.data()[second_frame + position]
+                        - changed_output.data()[second_frame + position])
+                        .abs();
+                }
+            }
+        }
+        assert!(changed_frame_difference > 1.0);
+        let after = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            3
+        );
+        assert_eq!(
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            2
+        );
+        assert_eq!(after.resident_downloads - before.resident_downloads, 14);
+        println!(
+            "Vulkan VAE spatial attention: input={:?} qkv={:?} output={:?} frames={} positions={} cosine={:.9} max_abs={:.9} mean_abs={:.9} runtime_ms={:.3} changed_frame_delta={:.6} current_vulkan_bytes={} device_local_bytes={} host_uploads={} weight_uploads={} downloads={}",
+            input.shape(),
+            attention.qkv.weight.shape(),
+            output.shape(),
+            batch * time,
+            plane,
+            metrics.cosine_similarity,
+            metrics.maximum_absolute_error,
+            metrics.mean_absolute_error,
+            runtime.as_secs_f64() * 1_000.0,
+            changed_frame_difference,
+            after.resident_allocated_bytes - before.resident_allocated_bytes,
+            after.resident_device_local_bytes - before.resident_device_local_bytes,
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            after.resident_downloads - before.resident_downloads,
+        );
+
+        drop(changed_device_output);
+        drop(changed_device_input);
+        drop(prepared);
+        let after_drop = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after_drop.resident_allocated_bytes,
+            before.resident_allocated_bytes
+        );
+        assert_eq!(
+            after_drop.resident_device_local_bytes,
+            before.resident_device_local_bytes
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "loads real Wan VAE weights; run explicitly for spatial-attention parity"]
+    fn real_wan_vae_spatial_attention_matches_scalar() {
+        use crate::parity::{ParityTolerance, compare_tensors};
+
+        const VAE: &str =
+            "/home/tiny/projects/saient/models/wan2.1-t2v-1.3b-mobile-pack/wan_2.1_vae.safetensors";
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let before = crate::vulkan::persistence_stats().unwrap();
+        let weights = SafeTensorFile::open(VAE).unwrap();
+        let attention = SpatialAttention::load(&weights, "decoder.middle.1").unwrap();
+        let channels = attention.norm.len();
+        let input = Tensor::new(
+            vec![1, channels, 1, 2, 3],
+            (0..channels * 6)
+                .map(|index| ((index * 19) as f32 * 0.011).sin() * 1.5)
+                .collect(),
+        )
+        .unwrap();
+        let scalar_started = std::time::Instant::now();
+        let expected = attention.forward(&input, &SCALAR_BACKEND).unwrap();
+        let scalar_runtime = scalar_started.elapsed();
+
+        let backend = &crate::backend::VULKAN_BACKEND;
+        let prepared = attention.prepare(backend).unwrap();
+        let device_input = backend.upload_tensor(&input).unwrap();
+        let vulkan_started = std::time::Instant::now();
+        let actual = attention
+            .forward_with_backend(&device_input, backend, &prepared)
+            .unwrap();
+        let output = backend.download_tensor(&actual).unwrap();
+        let vulkan_runtime = vulkan_started.elapsed();
+        let metrics = compare_tensors(&output, &expected).unwrap();
+        metrics
+            .require(ParityTolerance {
+                minimum_cosine_similarity: 0.999_99,
+                maximum_absolute_error: 0.01,
+                maximum_mean_absolute_error: 0.001,
+            })
+            .unwrap();
+        assert_eq!(output.shape(), &[1, channels, 1, 2, 3]);
+        let after = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            3
+        );
+        assert_eq!(
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            1
+        );
+        assert_eq!(after.resident_downloads - before.resident_downloads, 1);
+        println!(
+            "real Wan VAE spatial attention decoder.middle.1: input={:?} output={:?} scalar_ms={:.3} vulkan_ms={:.3} cosine={:.9} max_abs={:.9} mean_abs={:.9} current_vulkan_bytes={} device_local_bytes={} host_uploads={} weight_uploads={} downloads={}",
+            input.shape(),
+            output.shape(),
+            scalar_runtime.as_secs_f64() * 1_000.0,
+            vulkan_runtime.as_secs_f64() * 1_000.0,
+            metrics.cosine_similarity,
+            metrics.maximum_absolute_error,
+            metrics.mean_absolute_error,
+            after.resident_allocated_bytes - before.resident_allocated_bytes,
+            after.resident_device_local_bytes - before.resident_device_local_bytes,
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            after.resident_downloads - before.resident_downloads,
+        );
+
+        drop(actual);
+        drop(device_input);
+        drop(prepared);
+        let after_drop = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after_drop.resident_allocated_bytes,
+            before.resident_allocated_bytes
+        );
+        assert_eq!(
+            after_drop.resident_device_local_bytes,
+            before.resident_device_local_bytes
         );
     }
 

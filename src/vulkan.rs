@@ -54,8 +54,12 @@ const WAN_HEAD_MODULATE_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/f32_wan_head_modulate.spv"));
 const RESIDENT_CONV3D_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/f32_f16_conv3d.spv"));
+const RESIDENT_CONV2D_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/f32_f16_conv2d.spv"));
 const NCTHW_TEMPORAL_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/f32_ncthw_temporal.spv"));
+const VAE_SPATIAL_LAYOUT_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/f32_vae_spatial_layout.spv"));
 static SD_ACCELERATION: AtomicBool = AtomicBool::new(false);
 static RUNTIME: OnceLock<Result<Mutex<VulkanRuntime>, String>> = OnceLock::new();
 #[cfg(test)]
@@ -282,6 +286,15 @@ pub(crate) struct ResidentConv3dWeights {
     input_channels: usize,
     output_channels: usize,
     kernel: [usize; 3],
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResidentConv2dWeights {
+    weight: ResidentTensor,
+    bias: ResidentTensor,
+    input_channels: usize,
+    output_channels: usize,
+    kernel: [usize; 2],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -855,6 +868,55 @@ pub(crate) fn prepare_resident_conv3d(
     })
 }
 
+pub(crate) fn prepare_resident_conv2d(
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+) -> Result<ResidentConv2dWeights> {
+    let [output_channels, input_channels, kernel_height, kernel_width]: [usize; 4] = weight
+        .shape()
+        .try_into()
+        .context("resident Vulkan Conv2D weight must be rank four")?;
+    if output_channels == 0 || input_channels == 0 || kernel_height == 0 || kernel_width == 0 {
+        bail!("resident Vulkan Conv2D weight dimensions must be non-zero");
+    }
+    if let Some(bias) = bias
+        && bias.shape() != [output_channels]
+    {
+        bail!(
+            "resident Vulkan Conv2D bias shape {:?} must be [{output_channels}]",
+            bias.shape()
+        );
+    }
+    let weight_f16 = weight
+        .data()
+        .par_iter()
+        .copied()
+        .map(f32_to_f16)
+        .collect::<Vec<_>>();
+    let zero_bias;
+    let bias_values = if let Some(bias) = bias {
+        bias.data()
+    } else {
+        zero_bias = vec![0.0; output_channels];
+        &zero_bias
+    };
+    let (weight_id, bias_id) = with_runtime(|runtime| {
+        runtime.prepare_resident_linear(
+            bytes_of(&weight_f16),
+            weight.len(),
+            bytes_of(bias_values),
+            bias_values.len(),
+        )
+    })?;
+    Ok(ResidentConv2dWeights {
+        weight: resident_tensor(weight_id, weight.len(), ResidentElementType::F16),
+        bias: resident_tensor(bias_id, bias_values.len(), ResidentElementType::F32),
+        input_channels,
+        output_channels,
+        kernel: [kernel_height, kernel_width],
+    })
+}
+
 pub(crate) fn resident_linear(
     input: &ResidentTensor,
     weights: &ResidentLinearWeights,
@@ -958,6 +1020,164 @@ pub(crate) fn resident_conv3d(
         output_elements,
         ResidentElementType::F32,
     ))
+}
+
+pub(crate) fn resident_conv2d(
+    input: &ResidentTensor,
+    weights: &ResidentConv2dWeights,
+    input_shape: [usize; 4],
+    stride: [usize; 2],
+    padding: [usize; 2],
+) -> Result<ResidentTensor> {
+    let [batch, input_channels, input_height, input_width] = input_shape;
+    if input.element_type != ResidentElementType::F32
+        || batch == 0
+        || input_channels != weights.input_channels
+        || input_height == 0
+        || input_width == 0
+        || stride.contains(&0)
+        || input.elements != batch * input_channels * input_height * input_width
+    {
+        bail!("resident Vulkan Conv2D input storage does not match its dimensions");
+    }
+    let input_axes = [input_height, input_width];
+    let mut output_axes = [0; 2];
+    for axis in 0..2 {
+        let padded = input_axes[axis]
+            .checked_add(padding[axis].saturating_mul(2))
+            .context("resident Vulkan Conv2D padded dimension overflow")?;
+        if padded < weights.kernel[axis] {
+            bail!("resident Vulkan Conv2D kernel exceeds padded input");
+        }
+        output_axes[axis] = (padded - weights.kernel[axis]) / stride[axis] + 1;
+    }
+    let output_elements = batch
+        .checked_mul(weights.output_channels)
+        .and_then(|value| value.checked_mul(output_axes[0]))
+        .and_then(|value| value.checked_mul(output_axes[1]))
+        .context("resident Vulkan Conv2D output size overflow")?;
+    let dimensions = [
+        batch,
+        input_channels,
+        input_height,
+        input_width,
+        weights.output_channels,
+        weights.kernel[0],
+        weights.kernel[1],
+        stride[0],
+        stride[1],
+        padding[0],
+        padding[1],
+        output_axes[0],
+        output_axes[1],
+    ]
+    .map(u32::try_from)
+    .into_iter()
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .context("resident Vulkan Conv2D dimensions exceed u32")?;
+    let id = with_runtime(|runtime| {
+        runtime.resident_conv2d(
+            input.id(),
+            weights.weight.id(),
+            weights.bias.id(),
+            dimensions
+                .as_slice()
+                .try_into()
+                .expect("13 Conv2D dimensions"),
+            output_elements,
+        )
+    })?;
+    Ok(resident_tensor(
+        id,
+        output_elements,
+        ResidentElementType::F32,
+    ))
+}
+
+fn resident_vae_spatial_layout(
+    input: &ResidentTensor,
+    shape: [usize; 5],
+    operation: usize,
+    chunk: usize,
+) -> Result<ResidentTensor> {
+    let [batch, channels, time, height, width] = shape;
+    if input.element_type != ResidentElementType::F32
+        || [batch, channels, time, height, width].contains(&0)
+        || operation > 3
+        || chunk > 2
+    {
+        bail!("resident VAE spatial layout parameters are invalid");
+    }
+    let base_elements = batch
+        .checked_mul(channels)
+        .and_then(|value| value.checked_mul(time))
+        .and_then(|value| value.checked_mul(height))
+        .and_then(|value| value.checked_mul(width))
+        .context("resident VAE spatial layout size overflow")?;
+    let expected_input = if operation == 2 {
+        base_elements
+            .checked_mul(3)
+            .context("resident VAE QKV layout size overflow")?
+    } else {
+        base_elements
+    };
+    if input.elements != expected_input || (operation != 2 && chunk != 0) {
+        bail!("resident VAE spatial layout input size does not match its operation");
+    }
+    let parameters = [
+        operation,
+        batch,
+        channels,
+        time,
+        height,
+        width,
+        chunk,
+        base_elements,
+    ]
+    .map(u32::try_from)
+    .into_iter()
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .context("resident VAE spatial layout dimensions exceed u32")?;
+    let id = with_runtime(|runtime| {
+        runtime.resident_vae_spatial_layout(
+            input.id(),
+            input.elements,
+            parameters
+                .as_slice()
+                .try_into()
+                .expect("8 VAE spatial layout parameters"),
+        )
+    })?;
+    Ok(resident_tensor(id, base_elements, ResidentElementType::F32))
+}
+
+pub(crate) fn resident_ncthw_to_frames(
+    input: &ResidentTensor,
+    shape: [usize; 5],
+) -> Result<ResidentTensor> {
+    resident_vae_spatial_layout(input, shape, 0, 0)
+}
+
+pub(crate) fn resident_frames_to_ncthw(
+    input: &ResidentTensor,
+    shape: [usize; 5],
+) -> Result<ResidentTensor> {
+    resident_vae_spatial_layout(input, shape, 1, 0)
+}
+
+pub(crate) fn resident_vae_qkv_sequence(
+    input: &ResidentTensor,
+    shape: [usize; 5],
+    chunk: usize,
+) -> Result<ResidentTensor> {
+    resident_vae_spatial_layout(input, shape, 2, chunk)
+}
+
+pub(crate) fn resident_vae_sequence_to_frames(
+    input: &ResidentTensor,
+    shape: [usize; 5],
+) -> Result<ResidentTensor> {
+    resident_vae_spatial_layout(input, shape, 3, 0)
 }
 
 fn resident_ncthw_temporal(
@@ -1483,16 +1703,20 @@ pub(crate) fn resident_attention_scores(
     heads: usize,
     head_dim: usize,
     scale: f32,
+    batches: usize,
 ) -> Result<ResidentTensor> {
     let width = heads
         .checked_mul(head_dim)
         .context("resident attention score width overflow")?;
-    if query.elements != queries.saturating_mul(width) || key.elements != keys.saturating_mul(width)
+    if batches == 0
+        || query.elements != batches.saturating_mul(queries).saturating_mul(width)
+        || key.elements != batches.saturating_mul(keys).saturating_mul(width)
     {
         bail!("resident Vulkan attention score inputs have the wrong size");
     }
-    let output_elements = heads
-        .checked_mul(queries)
+    let output_elements = batches
+        .checked_mul(heads)
+        .and_then(|values| values.checked_mul(queries))
         .and_then(|values| values.checked_mul(keys))
         .context("resident attention score size overflow")?;
     let id = with_runtime(|runtime| {
@@ -1504,6 +1728,7 @@ pub(crate) fn resident_attention_scores(
             u32::try_from(heads).context("resident attention heads exceed u32")?,
             u32::try_from(head_dim).context("resident attention head dimension exceeds u32")?,
             scale,
+            u32::try_from(batches).context("resident attention batches exceed u32")?,
         )
     })?;
     Ok(resident_tensor(
@@ -1542,21 +1767,24 @@ pub(crate) fn resident_attention_values(
     keys: usize,
     heads: usize,
     head_dim: usize,
+    batches: usize,
 ) -> Result<ResidentTensor> {
     let width = heads
         .checked_mul(head_dim)
         .context("resident attention value width overflow")?;
-    let probability_elements = heads
-        .checked_mul(queries)
+    let probability_elements = batches
+        .checked_mul(heads)
+        .and_then(|values| values.checked_mul(queries))
         .and_then(|values| values.checked_mul(keys))
         .context("resident attention probability size overflow")?;
     if probabilities.elements != probability_elements
-        || value.elements != keys.saturating_mul(width)
+        || value.elements != batches.saturating_mul(keys).saturating_mul(width)
     {
         bail!("resident Vulkan attention value inputs have the wrong size");
     }
-    let output_elements = queries
-        .checked_mul(width)
+    let output_elements = batches
+        .checked_mul(queries)
+        .and_then(|values| values.checked_mul(width))
         .context("resident attention output size overflow")?;
     let id = with_runtime(|runtime| {
         runtime.resident_attention_values(
@@ -1566,6 +1794,7 @@ pub(crate) fn resident_attention_values(
             u32::try_from(keys).context("resident attention keys exceed u32")?,
             u32::try_from(heads).context("resident attention heads exceed u32")?,
             u32::try_from(head_dim).context("resident attention head dimension exceeds u32")?,
+            u32::try_from(batches).context("resident attention batches exceed u32")?,
         )
     })?;
     Ok(resident_tensor(
@@ -2371,7 +2600,9 @@ struct VulkanRuntime {
     patch_layout_pipeline: vk::Pipeline,
     wan_head_modulate_pipeline: vk::Pipeline,
     resident_conv3d_pipeline: vk::Pipeline,
+    resident_conv2d_pipeline: vk::Pipeline,
     ncthw_temporal_pipeline: vk::Pipeline,
+    vae_spatial_layout_pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
     command_pool: vk::CommandPool,
     device_name: String,
@@ -2622,7 +2853,9 @@ impl VulkanRuntime {
             patch_layout_pipeline: vk::Pipeline::null(),
             wan_head_modulate_pipeline: vk::Pipeline::null(),
             resident_conv3d_pipeline: vk::Pipeline::null(),
+            resident_conv2d_pipeline: vk::Pipeline::null(),
             ncthw_temporal_pipeline: vk::Pipeline::null(),
+            vae_spatial_layout_pipeline: vk::Pipeline::null(),
             descriptor_pool: vk::DescriptorPool::null(),
             command_pool: vk::CommandPool::null(),
             device_name,
@@ -2757,7 +2990,9 @@ impl VulkanRuntime {
         self.patch_layout_pipeline = self.create_pipeline(PATCH_LAYOUT_SHADER)?;
         self.wan_head_modulate_pipeline = self.create_pipeline(WAN_HEAD_MODULATE_SHADER)?;
         self.resident_conv3d_pipeline = self.create_pipeline(RESIDENT_CONV3D_SHADER)?;
+        self.resident_conv2d_pipeline = self.create_pipeline(RESIDENT_CONV2D_SHADER)?;
         self.ncthw_temporal_pipeline = self.create_pipeline(NCTHW_TEMPORAL_SHADER)?;
+        self.vae_spatial_layout_pipeline = self.create_pipeline(VAE_SPATIAL_LAYOUT_SHADER)?;
 
         let pool_size = [vk::DescriptorPoolSize::builder()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
@@ -3217,6 +3452,132 @@ impl VulkanRuntime {
         result
     }
 
+    fn resident_conv2d(
+        &mut self,
+        input_id: u64,
+        weight_id: u64,
+        bias_id: u64,
+        dimensions: &[u32; 13],
+        output_elements: usize,
+    ) -> Result<u64> {
+        let [
+            batch,
+            input_channels,
+            input_height,
+            input_width,
+            output_channels,
+            kernel_height,
+            kernel_width,
+            stride_height,
+            stride_width,
+            _,
+            _,
+            output_height,
+            output_width,
+        ] = *dimensions;
+        if [
+            batch,
+            input_channels,
+            input_height,
+            input_width,
+            output_channels,
+            kernel_height,
+            kernel_width,
+            stride_height,
+            stride_width,
+            output_height,
+            output_width,
+        ]
+        .contains(&0)
+        {
+            bail!("resident Vulkan Conv2D dimensions must be non-zero");
+        }
+        let input_elements =
+            batch as usize * input_channels as usize * input_height as usize * input_width as usize;
+        let weight_elements = output_channels as usize
+            * input_channels as usize
+            * kernel_height as usize
+            * kernel_width as usize;
+        let expected_output = batch as usize
+            * output_channels as usize
+            * output_height as usize
+            * output_width as usize;
+        if output_elements != expected_output {
+            bail!("resident Vulkan Conv2D output element count is inconsistent");
+        }
+        self.require_resident(input_id, input_elements, ResidentElementType::F32)?;
+        self.require_resident(weight_id, weight_elements, ResidentElementType::F16)?;
+        self.require_resident(bias_id, output_channels as usize, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id, weight_id, bias_id],
+            output_elements,
+            self.resident_conv2d_pipeline,
+            bytes_of(dimensions),
+            [
+                u32::try_from(output_elements)
+                    .context("resident Vulkan Conv2D output exceeds u32")?
+                    .div_ceil(256),
+                1,
+                1,
+            ],
+            KernelKind::Conv2d,
+        );
+        self.stats.conv2d.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
+    fn resident_vae_spatial_layout(
+        &mut self,
+        input_id: u64,
+        input_elements: usize,
+        parameters: &[u32; 8],
+    ) -> Result<u64> {
+        let [
+            operation,
+            batch,
+            channels,
+            time,
+            height,
+            width,
+            chunk,
+            output_elements,
+        ] = *parameters;
+        if operation > 3
+            || batch == 0
+            || channels == 0
+            || time == 0
+            || height == 0
+            || width == 0
+            || chunk > 2
+            || output_elements == 0
+        {
+            bail!("resident VAE spatial layout dimensions are invalid");
+        }
+        let expected_input = if operation == 2 {
+            output_elements
+                .checked_mul(3)
+                .context("resident VAE QKV layout input size overflow")?
+        } else {
+            output_elements
+        };
+        if input_elements != expected_input as usize || (operation != 2 && chunk != 0) {
+            bail!("resident VAE spatial layout element count is inconsistent");
+        }
+        self.require_resident(input_id, input_elements, ResidentElementType::F32)?;
+        let wall_started = Instant::now();
+        let result = self.dispatch_resident(
+            &[input_id],
+            output_elements as usize,
+            self.vae_spatial_layout_pipeline,
+            bytes_of(parameters),
+            [output_elements.div_ceil(256), 1, 1],
+            KernelKind::Elementwise,
+        );
+        self.stats.elementwise.wall_milliseconds += wall_started.elapsed().as_secs_f64() * 1_000.0;
+        result
+    }
+
     fn resident_ncthw_temporal(
         &mut self,
         input0_id: u64,
@@ -3606,8 +3967,15 @@ impl VulkanRuntime {
         heads: u32,
         head_dim: u32,
         scale: f32,
+        batches: u32,
     ) -> Result<u64> {
-        if queries == 0 || keys == 0 || heads == 0 || head_dim == 0 || !scale.is_finite() {
+        if queries == 0
+            || keys == 0
+            || heads == 0
+            || head_dim == 0
+            || batches == 0
+            || !scale.is_finite()
+        {
             bail!("resident attention score dimensions and scale must be valid");
         }
         let width = heads
@@ -3615,16 +3983,17 @@ impl VulkanRuntime {
             .context("resident attention score width overflow")?;
         self.require_resident(
             query_id,
-            queries as usize * width as usize,
+            batches as usize * queries as usize * width as usize,
             ResidentElementType::F32,
         )?;
         self.require_resident(
             key_id,
-            keys as usize * width as usize,
+            batches as usize * keys as usize * width as usize,
             ResidentElementType::F32,
         )?;
-        let output_elements = heads
-            .checked_mul(queries)
+        let output_elements = batches
+            .checked_mul(heads)
+            .and_then(|values| values.checked_mul(queries))
             .and_then(|values| values.checked_mul(keys))
             .context("resident attention score count overflow")?;
         let wall_started = Instant::now();
@@ -3632,7 +4001,16 @@ impl VulkanRuntime {
             &[query_id, key_id],
             output_elements as usize,
             self.f32_attention_pipeline,
-            bytes_of(&[0, queries, keys, heads, head_dim, scale.to_bits(), 0, 0]),
+            bytes_of(&[
+                0,
+                queries,
+                keys,
+                heads,
+                head_dim,
+                scale.to_bits(),
+                batches,
+                0,
+            ]),
             [output_elements.div_ceil(256), 1, 1],
             KernelKind::Attention,
         );
@@ -3653,7 +4031,7 @@ impl VulkanRuntime {
             &[input_id, input_id],
             elements as usize,
             self.f32_attention_pipeline,
-            bytes_of(&[1, rows, width, 1, 1, 0, 0, 0]),
+            bytes_of(&[1, rows, width, 1, 1, 0, 1, 0]),
             [rows, 1, 1],
             KernelKind::Attention,
         );
@@ -3669,19 +4047,22 @@ impl VulkanRuntime {
         keys: u32,
         heads: u32,
         head_dim: u32,
+        batches: u32,
     ) -> Result<u64> {
-        if queries == 0 || keys == 0 || heads == 0 || head_dim == 0 {
+        if queries == 0 || keys == 0 || heads == 0 || head_dim == 0 || batches == 0 {
             bail!("resident attention value dimensions must be non-zero");
         }
         let width = heads
             .checked_mul(head_dim)
             .context("resident attention value width overflow")?;
-        let probability_elements = heads
-            .checked_mul(queries)
+        let probability_elements = batches
+            .checked_mul(heads)
+            .and_then(|values| values.checked_mul(queries))
             .and_then(|values| values.checked_mul(keys))
             .context("resident attention probability count overflow")?;
-        let output_elements = queries
-            .checked_mul(width)
+        let output_elements = batches
+            .checked_mul(queries)
+            .and_then(|values| values.checked_mul(width))
             .context("resident attention output count overflow")?;
         self.require_resident(
             probability_id,
@@ -3690,7 +4071,7 @@ impl VulkanRuntime {
         )?;
         self.require_resident(
             value_id,
-            keys as usize * width as usize,
+            batches as usize * keys as usize * width as usize,
             ResidentElementType::F32,
         )?;
         let wall_started = Instant::now();
@@ -3698,7 +4079,7 @@ impl VulkanRuntime {
             &[probability_id, value_id],
             output_elements as usize,
             self.f32_attention_pipeline,
-            bytes_of(&[2, queries, keys, heads, head_dim, 0, 0, 0]),
+            bytes_of(&[2, queries, keys, heads, head_dim, 0, batches, 0]),
             [output_elements.div_ceil(256), 1, 1],
             KernelKind::Attention,
         );
@@ -5823,9 +6204,17 @@ impl Drop for VulkanRuntime {
                 self.device
                     .destroy_pipeline(self.resident_conv3d_pipeline, None);
             }
+            if self.resident_conv2d_pipeline != vk::Pipeline::null() {
+                self.device
+                    .destroy_pipeline(self.resident_conv2d_pipeline, None);
+            }
             if self.ncthw_temporal_pipeline != vk::Pipeline::null() {
                 self.device
                     .destroy_pipeline(self.ncthw_temporal_pipeline, None);
+            }
+            if self.vae_spatial_layout_pipeline != vk::Pipeline::null() {
+                self.device
+                    .destroy_pipeline(self.vae_spatial_layout_pipeline, None);
             }
             if self.gemm_pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.gemm_pipeline, None);

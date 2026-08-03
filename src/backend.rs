@@ -105,6 +105,35 @@ pub(crate) struct Conv3dWeightHandle {
 }
 
 #[derive(Clone)]
+pub(crate) struct Conv2dWeightHandle {
+    backend: BackendKind,
+    input_channels: usize,
+    output_channels: usize,
+    kernel: [usize; 2],
+    storage: Conv2dWeightStorage,
+}
+
+#[derive(Clone)]
+enum Conv2dWeightStorage {
+    Host {
+        weight: Arc<Tensor>,
+        bias: Option<Arc<Tensor>>,
+    },
+    #[cfg(feature = "vulkan")]
+    Vulkan(crate::vulkan::ResidentConv2dWeights),
+}
+
+impl Conv2dWeightStorage {
+    fn host(&self) -> Result<(&Tensor, Option<&Tensor>)> {
+        match self {
+            Self::Host { weight, bias } => Ok((weight, bias.as_deref())),
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(_) => bail!("operation requires host Conv2D weight storage"),
+        }
+    }
+}
+
+#[derive(Clone)]
 enum Conv3dWeightStorage {
     Host {
         weight: Arc<Tensor>,
@@ -357,6 +386,134 @@ pub(crate) trait TensorBackend: Send + Sync {
         )?)
     }
 
+    fn ncthw_to_nchw_frames_device(&self, input: &DeviceTensor) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        let [batch, channels, time, height, width]: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("frame packing input must be NCTHW")?;
+        let plane = height
+            .checked_mul(width)
+            .context("frame packing plane overflow")?;
+        let frames = batch.checked_mul(time).context("frame count overflow")?;
+        let input = input.storage.host()?;
+        let mut data = vec![0.0; input.len()];
+        for sample in 0..batch {
+            for frame in 0..time {
+                for channel in 0..channels {
+                    let source = ((sample * channels + channel) * time + frame) * plane;
+                    let destination = ((sample * time + frame) * channels + channel) * plane;
+                    data[destination..destination + plane]
+                        .copy_from_slice(&input.data()[source..source + plane]);
+                }
+            }
+        }
+        self.upload_tensor(&Tensor::new(vec![frames, channels, height, width], data)?)
+    }
+
+    fn nchw_frames_to_ncthw_device(
+        &self,
+        input: &DeviceTensor,
+        batch: usize,
+        time: usize,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        let [frames, channels, height, width]: [usize; 4] = input
+            .shape()
+            .try_into()
+            .context("frame unpacking input must be NCHW")?;
+        if batch == 0 || time == 0 || batch.checked_mul(time) != Some(frames) {
+            bail!("frame unpacking batch/time do not match the frame count");
+        }
+        let plane = height
+            .checked_mul(width)
+            .context("frame unpacking plane overflow")?;
+        let input = input.storage.host()?;
+        let mut data = vec![0.0; input.len()];
+        for sample in 0..batch {
+            for channel in 0..channels {
+                for frame in 0..time {
+                    let source = ((sample * time + frame) * channels + channel) * plane;
+                    let destination = ((sample * channels + channel) * time + frame) * plane;
+                    data[destination..destination + plane]
+                        .copy_from_slice(&input.data()[source..source + plane]);
+                }
+            }
+        }
+        self.upload_tensor(&Tensor::new(
+            vec![batch, channels, time, height, width],
+            data,
+        )?)
+    }
+
+    fn vae_qkv_to_sequences_device(
+        &self,
+        input: &DeviceTensor,
+    ) -> Result<(DeviceTensor, DeviceTensor, DeviceTensor)> {
+        self.require_tensor(input)?;
+        let [frames, qkv_channels, height, width]: [usize; 4] = input
+            .shape()
+            .try_into()
+            .context("VAE QKV layout input must be NCHW")?;
+        if qkv_channels == 0 || qkv_channels % 3 != 0 {
+            bail!("VAE QKV layout needs three equal channel groups");
+        }
+        let channels = qkv_channels / 3;
+        let positions = height
+            .checked_mul(width)
+            .context("VAE QKV position count overflow")?;
+        let input = input.storage.host()?;
+        let mut outputs: [Vec<f32>; 3] =
+            std::array::from_fn(|_| vec![0.0; frames * positions * channels]);
+        for frame in 0..frames {
+            for position in 0..positions {
+                for channel in 0..channels {
+                    for (chunk, output) in outputs.iter_mut().enumerate() {
+                        let source = (frame * qkv_channels + chunk * channels + channel)
+                            * positions
+                            + position;
+                        output[(frame * positions + position) * channels + channel] =
+                            input.data()[source];
+                    }
+                }
+            }
+        }
+        let [query, key, value] = outputs;
+        let shape = vec![frames, positions, channels];
+        Ok((
+            self.upload_tensor(&Tensor::new(shape.clone(), query)?)?,
+            self.upload_tensor(&Tensor::new(shape.clone(), key)?)?,
+            self.upload_tensor(&Tensor::new(shape, value)?)?,
+        ))
+    }
+
+    fn vae_sequence_to_nchw_frames_device(
+        &self,
+        input: &DeviceTensor,
+        height: usize,
+        width: usize,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        let [frames, positions, channels]: [usize; 3] = input
+            .shape()
+            .try_into()
+            .context("VAE sequence layout input must be rank three")?;
+        if height == 0 || width == 0 || height.checked_mul(width) != Some(positions) {
+            bail!("VAE sequence spatial dimensions do not match its positions");
+        }
+        let input = input.storage.host()?;
+        let mut data = vec![0.0; input.len()];
+        for frame in 0..frames {
+            for channel in 0..channels {
+                for position in 0..positions {
+                    data[(frame * channels + channel) * positions + position] =
+                        input.data()[(frame * positions + position) * channels + channel];
+                }
+            }
+        }
+        self.upload_tensor(&Tensor::new(vec![frames, channels, height, width], data)?)
+    }
+
     /// Prepare one dense projection. Matrix and optional bias ownership are
     /// grouped so an accelerated backend can upload them exactly once.
     fn prepare_linear(&self, weight: &Tensor, bias: Option<&Tensor>) -> Result<LinearWeightHandle> {
@@ -447,6 +604,66 @@ pub(crate) trait TensorBackend: Send + Sync {
                 bias: bias.cloned().map(Arc::new),
             },
         })
+    }
+
+    fn prepare_conv2d(&self, weight: &Tensor, bias: Option<&Tensor>) -> Result<Conv2dWeightHandle> {
+        let [output_channels, input_channels, kernel_height, kernel_width]: [usize; 4] = weight
+            .shape()
+            .try_into()
+            .context("Conv2D weight must be [out,in,height,width]")?;
+        if output_channels == 0 || input_channels == 0 || kernel_height == 0 || kernel_width == 0 {
+            bail!("Conv2D weight dimensions must be non-zero");
+        }
+        if let Some(bias) = bias
+            && bias.shape() != [output_channels]
+        {
+            bail!(
+                "Conv2D bias shape {:?} must be [{output_channels}]",
+                bias.shape()
+            );
+        }
+        Ok(Conv2dWeightHandle {
+            backend: self.kind(),
+            input_channels,
+            output_channels,
+            kernel: [kernel_height, kernel_width],
+            storage: Conv2dWeightStorage::Host {
+                weight: Arc::new(weight.clone()),
+                bias: bias.cloned().map(Arc::new),
+            },
+        })
+    }
+
+    /// Apply a prepared groups-one Conv2D to a contiguous NCHW tensor. Wan's
+    /// frame-local VAE path flattens N and T into this batch dimension before
+    /// calling the primitive; the backend itself never interprets time.
+    fn conv2d_prepared_device(
+        &self,
+        input: &DeviceTensor,
+        weights: &Conv2dWeightHandle,
+        stride: [usize; 2],
+        padding: [usize; 2],
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        self.require_conv2d_weights(weights)?;
+        let [batch, input_channels, input_height, input_width]: [usize; 4] = input
+            .shape()
+            .try_into()
+            .context("Conv2D input must be [batch,channels,height,width]")?;
+        if batch == 0 || input_channels != weights.input_channels || stride.contains(&0) {
+            bail!("Conv2D input batch/channels and stride must match prepared weights");
+        }
+        for axis in 0..2 {
+            let padded = [input_height, input_width][axis]
+                .checked_add(padding[axis].saturating_mul(2))
+                .context("Conv2D padded dimension overflow")?;
+            if padded < weights.kernel[axis] {
+                bail!("Conv2D kernel is larger than the padded input");
+            }
+        }
+        let input = input.storage.host()?;
+        let (weight, bias) = weights.storage.host()?;
+        self.upload_tensor(&input.conv2d(weight, bias, stride, padding, [1, 1], 1)?)
     }
 
     fn conv3d_prepared_device(
@@ -748,8 +965,9 @@ pub(crate) trait TensorBackend: Send + Sync {
         self.upload_tensor(&Tensor::new(input.shape().to_vec(), output)?)
     }
 
-    /// Head-major `[heads, queries, keys]` scaled QK scores from row-major
-    /// `[queries, heads * head_dim]` and `[keys, heads * head_dim]` inputs.
+    /// Head-major scaled QK scores from row-major query/key inputs. Rank-two
+    /// inputs produce `[heads, queries, keys]`; rank-three batched inputs
+    /// produce `[batch, heads, queries, keys]` without mixing batches.
     fn attention_scores_device(
         &self,
         query: &DeviceTensor,
@@ -766,34 +984,53 @@ pub(crate) trait TensorBackend: Send + Sync {
         let width = heads
             .checked_mul(head_dim)
             .context("attention score width overflow")?;
-        let [queries, query_width]: [usize; 2] = query
-            .shape()
-            .try_into()
-            .context("attention query must be rank two")?;
-        let [keys, key_width]: [usize; 2] = key
-            .shape()
-            .try_into()
-            .context("attention key must be rank two")?;
-        if queries == 0 || keys == 0 || query_width != width || key_width != width {
+        let (batches, queries, query_width, batched) = match query.shape() {
+            [queries, width] => (1, *queries, *width, false),
+            [batches, queries, width] => (*batches, *queries, *width, true),
+            shape => bail!("attention query must be rank two or three, got {shape:?}"),
+        };
+        let (key_batches, keys, key_width, key_batched) = match key.shape() {
+            [keys, width] => (1, *keys, *width, false),
+            [batches, keys, width] => (*batches, *keys, *width, true),
+            shape => bail!("attention key must be rank two or three, got {shape:?}"),
+        };
+        if batches == 0
+            || queries == 0
+            || keys == 0
+            || key_batches != batches
+            || key_batched != batched
+            || query_width != width
+            || key_width != width
+        {
             bail!("attention Q/K shapes do not match the requested head layout");
         }
         let query = query.storage.host()?;
         let key = key.storage.host()?;
-        let mut scores = vec![0.0; heads * queries * keys];
-        for head in 0..heads {
-            let head_offset = head * head_dim;
-            for query_row in 0..queries {
-                for key_row in 0..keys {
-                    let mut dot = 0.0;
-                    for channel in 0..head_dim {
-                        dot += query.data()[query_row * width + head_offset + channel]
-                            * key.data()[key_row * width + head_offset + channel];
+        let mut scores = vec![0.0; batches * heads * queries * keys];
+        for batch in 0..batches {
+            for head in 0..heads {
+                let head_offset = head * head_dim;
+                for query_row in 0..queries {
+                    for key_row in 0..keys {
+                        let mut dot = 0.0;
+                        for channel in 0..head_dim {
+                            dot += query.data()
+                                [(batch * queries + query_row) * width + head_offset + channel]
+                                * key.data()
+                                    [(batch * keys + key_row) * width + head_offset + channel];
+                        }
+                        scores[((batch * heads + head) * queries + query_row) * keys + key_row] =
+                            dot * scale;
                     }
-                    scores[(head * queries + query_row) * keys + key_row] = dot * scale;
                 }
             }
         }
-        self.upload_tensor(&Tensor::new(vec![heads, queries, keys], scores)?)
+        let shape = if batched {
+            vec![batches, heads, queries, keys]
+        } else {
+            vec![heads, queries, keys]
+        };
+        self.upload_tensor(&Tensor::new(shape, scores)?)
     }
 
     fn softmax_device(&self, input: &DeviceTensor) -> Result<DeviceTensor> {
@@ -823,8 +1060,8 @@ pub(crate) trait TensorBackend: Send + Sync {
         self.upload_tensor(&Tensor::new(input.shape().to_vec(), output)?)
     }
 
-    /// Multiply head-major probabilities by row-major values and merge heads
-    /// back into `[queries, heads * head_dim]`.
+    /// Multiply head-major probabilities by row-major values and merge heads.
+    /// Batched rank-four probabilities remain isolated by their first axis.
     fn attention_values_device(
         &self,
         probabilities: &DeviceTensor,
@@ -834,22 +1071,27 @@ pub(crate) trait TensorBackend: Send + Sync {
     ) -> Result<DeviceTensor> {
         self.require_tensor(probabilities)?;
         self.require_tensor(value)?;
-        let [probability_heads, queries, keys]: [usize; 3] = probabilities
-            .shape()
-            .try_into()
-            .context("attention probabilities must be rank three")?;
-        let [value_rows, value_width]: [usize; 2] = value
-            .shape()
-            .try_into()
-            .context("attention value must be rank two")?;
+        let (batches, probability_heads, queries, keys, batched) = match probabilities.shape() {
+            [heads, queries, keys] => (1, *heads, *queries, *keys, false),
+            [batches, heads, queries, keys] => (*batches, *heads, *queries, *keys, true),
+            shape => bail!("attention probabilities must be rank three or four, got {shape:?}"),
+        };
+        let (value_batches, value_rows, value_width, value_batched) = match value.shape() {
+            [rows, width] => (1, *rows, *width, false),
+            [batches, rows, width] => (*batches, *rows, *width, true),
+            shape => bail!("attention value must be rank two or three, got {shape:?}"),
+        };
         let width = heads
             .checked_mul(head_dim)
             .context("attention value width overflow")?;
         if heads == 0
             || head_dim == 0
             || probability_heads != heads
+            || batches == 0
             || queries == 0
             || keys == 0
+            || value_batches != batches
+            || value_batched != batched
             || value_rows != keys
             || value_width != width
         {
@@ -857,19 +1099,30 @@ pub(crate) trait TensorBackend: Send + Sync {
         }
         let probabilities = probabilities.storage.host()?;
         let value = value.storage.host()?;
-        let mut output = vec![0.0; queries * width];
-        for query in 0..queries {
-            for head in 0..heads {
-                for key in 0..keys {
-                    let probability = probabilities.data()[(head * queries + query) * keys + key];
-                    for channel in 0..head_dim {
-                        output[query * width + head * head_dim + channel] +=
-                            probability * value.data()[key * width + head * head_dim + channel];
+        let mut output = vec![0.0; batches * queries * width];
+        for batch in 0..batches {
+            for query in 0..queries {
+                for head in 0..heads {
+                    for key in 0..keys {
+                        let probability = probabilities.data()
+                            [((batch * heads + head) * queries + query) * keys + key];
+                        for channel in 0..head_dim {
+                            output
+                                [(batch * queries + query) * width + head * head_dim + channel] +=
+                                probability
+                                    * value.data()
+                                        [(batch * keys + key) * width + head * head_dim + channel];
+                        }
                     }
                 }
             }
         }
-        self.upload_tensor(&Tensor::new(vec![queries, width], output)?)
+        let shape = if batched {
+            vec![batches, queries, width]
+        } else {
+            vec![queries, width]
+        };
+        self.upload_tensor(&Tensor::new(shape, output)?)
     }
 
     fn wan_modulate_device(
@@ -1129,6 +1382,17 @@ pub(crate) trait TensorBackend: Send + Sync {
         if weights.backend != self.kind() {
             bail!(
                 "backend {:?} cannot consume Conv3D weights owned by {:?}",
+                self.kind(),
+                weights.backend
+            );
+        }
+        Ok(())
+    }
+
+    fn require_conv2d_weights(&self, weights: &Conv2dWeightHandle) -> Result<()> {
+        if weights.backend != self.kind() {
+            bail!(
+                "backend {:?} cannot consume Conv2D weights owned by {:?}",
                 self.kind(),
                 weights.backend
             );
@@ -1471,6 +1735,114 @@ impl TensorBackend for VulkanBackend {
         })
     }
 
+    fn ncthw_to_nchw_frames_device(&self, input: &DeviceTensor) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        let shape: [usize; 5] = input
+            .shape()
+            .try_into()
+            .context("Vulkan frame packing input must be NCTHW")?;
+        let frames = shape[0]
+            .checked_mul(shape[2])
+            .context("Vulkan frame count overflow")?;
+        let DeviceTensorStorage::Vulkan(storage) = &input.storage else {
+            bail!("Vulkan frame packing received non-Vulkan storage");
+        };
+        Ok(DeviceTensor {
+            backend: BackendKind::Vulkan,
+            shape: vec![frames, shape[1], shape[3], shape[4]],
+            storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_ncthw_to_frames(
+                storage, shape,
+            )?),
+        })
+    }
+
+    fn nchw_frames_to_ncthw_device(
+        &self,
+        input: &DeviceTensor,
+        batch: usize,
+        time: usize,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        let [frames, channels, height, width]: [usize; 4] = input
+            .shape()
+            .try_into()
+            .context("Vulkan frame unpacking input must be NCHW")?;
+        if batch == 0 || time == 0 || batch.checked_mul(time) != Some(frames) {
+            bail!("Vulkan frame unpacking batch/time do not match the frame count");
+        }
+        let DeviceTensorStorage::Vulkan(storage) = &input.storage else {
+            bail!("Vulkan frame unpacking received non-Vulkan storage");
+        };
+        let shape = [batch, channels, time, height, width];
+        Ok(DeviceTensor {
+            backend: BackendKind::Vulkan,
+            shape: shape.to_vec(),
+            storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_frames_to_ncthw(
+                storage, shape,
+            )?),
+        })
+    }
+
+    fn vae_qkv_to_sequences_device(
+        &self,
+        input: &DeviceTensor,
+    ) -> Result<(DeviceTensor, DeviceTensor, DeviceTensor)> {
+        self.require_tensor(input)?;
+        let [frames, qkv_channels, height, width]: [usize; 4] = input
+            .shape()
+            .try_into()
+            .context("Vulkan VAE QKV layout input must be NCHW")?;
+        if qkv_channels == 0 || qkv_channels % 3 != 0 {
+            bail!("Vulkan VAE QKV layout needs three equal channel groups");
+        }
+        let channels = qkv_channels / 3;
+        let positions = height
+            .checked_mul(width)
+            .context("Vulkan VAE QKV position count overflow")?;
+        let DeviceTensorStorage::Vulkan(storage) = &input.storage else {
+            bail!("Vulkan VAE QKV layout received non-Vulkan storage");
+        };
+        let shape = [frames, channels, 1, height, width];
+        let sequence_shape = vec![frames, positions, channels];
+        let make = |chunk| -> Result<DeviceTensor> {
+            Ok(DeviceTensor {
+                backend: BackendKind::Vulkan,
+                shape: sequence_shape.clone(),
+                storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_vae_qkv_sequence(
+                    storage, shape, chunk,
+                )?),
+            })
+        };
+        Ok((make(0)?, make(1)?, make(2)?))
+    }
+
+    fn vae_sequence_to_nchw_frames_device(
+        &self,
+        input: &DeviceTensor,
+        height: usize,
+        width: usize,
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        let [frames, positions, channels]: [usize; 3] = input
+            .shape()
+            .try_into()
+            .context("Vulkan VAE sequence layout input must be rank three")?;
+        if height == 0 || width == 0 || height.checked_mul(width) != Some(positions) {
+            bail!("Vulkan VAE sequence spatial dimensions do not match its positions");
+        }
+        let DeviceTensorStorage::Vulkan(storage) = &input.storage else {
+            bail!("Vulkan VAE sequence layout received non-Vulkan storage");
+        };
+        let shape = [frames, channels, 1, height, width];
+        Ok(DeviceTensor {
+            backend: BackendKind::Vulkan,
+            shape: vec![frames, channels, height, width],
+            storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_vae_sequence_to_frames(
+                storage, shape,
+            )?),
+        })
+    }
+
     fn prepare_linear(&self, weight: &Tensor, bias: Option<&Tensor>) -> Result<LinearWeightHandle> {
         let [output_width, input_width]: [usize; 2] = weight
             .shape()
@@ -1559,6 +1931,84 @@ impl TensorBackend for VulkanBackend {
             kernel: [kernel_time, kernel_height, kernel_width],
             storage: Conv3dWeightStorage::Vulkan(crate::vulkan::prepare_resident_conv3d(
                 weight, bias,
+            )?),
+        })
+    }
+
+    fn prepare_conv2d(&self, weight: &Tensor, bias: Option<&Tensor>) -> Result<Conv2dWeightHandle> {
+        let [output_channels, input_channels, kernel_height, kernel_width]: [usize; 4] = weight
+            .shape()
+            .try_into()
+            .context("Vulkan Conv2D weight must be [out,in,height,width]")?;
+        if output_channels == 0 || input_channels == 0 || kernel_height == 0 || kernel_width == 0 {
+            bail!("Vulkan Conv2D weight dimensions must be non-zero");
+        }
+        if let Some(bias) = bias
+            && bias.shape() != [output_channels]
+        {
+            bail!(
+                "Vulkan Conv2D bias shape {:?} must be [{output_channels}]",
+                bias.shape()
+            );
+        }
+        Ok(Conv2dWeightHandle {
+            backend: BackendKind::Vulkan,
+            input_channels,
+            output_channels,
+            kernel: [kernel_height, kernel_width],
+            storage: Conv2dWeightStorage::Vulkan(crate::vulkan::prepare_resident_conv2d(
+                weight, bias,
+            )?),
+        })
+    }
+
+    fn conv2d_prepared_device(
+        &self,
+        input: &DeviceTensor,
+        weights: &Conv2dWeightHandle,
+        stride: [usize; 2],
+        padding: [usize; 2],
+    ) -> Result<DeviceTensor> {
+        self.require_tensor(input)?;
+        self.require_conv2d_weights(weights)?;
+        let [batch, input_channels, input_height, input_width]: [usize; 4] = input
+            .shape()
+            .try_into()
+            .context("Vulkan Conv2D input must be [batch,channels,height,width]")?;
+        if batch == 0 || input_channels != weights.input_channels || stride.contains(&0) {
+            bail!("Vulkan Conv2D input batch/channels and stride must match prepared weights");
+        }
+        let input_axes = [input_height, input_width];
+        let mut output_axes = [0; 2];
+        for axis in 0..2 {
+            let padded = input_axes[axis]
+                .checked_add(padding[axis].saturating_mul(2))
+                .context("Vulkan Conv2D padded dimension overflow")?;
+            if padded < weights.kernel[axis] {
+                bail!("Vulkan Conv2D kernel is larger than the padded input");
+            }
+            output_axes[axis] = (padded - weights.kernel[axis]) / stride[axis] + 1;
+        }
+        let DeviceTensorStorage::Vulkan(input_storage) = &input.storage else {
+            bail!("Vulkan backend received non-Vulkan Conv2D input");
+        };
+        let Conv2dWeightStorage::Vulkan(weight_storage) = &weights.storage else {
+            bail!("Vulkan backend received non-Vulkan Conv2D weights");
+        };
+        Ok(DeviceTensor {
+            backend: BackendKind::Vulkan,
+            shape: vec![
+                batch,
+                weights.output_channels,
+                output_axes[0],
+                output_axes[1],
+            ],
+            storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_conv2d(
+                input_storage,
+                weight_storage,
+                [batch, input_channels, input_height, input_width],
+                stride,
+                padding,
             )?),
         })
     }
@@ -2088,19 +2538,24 @@ impl TensorBackend for VulkanBackend {
         let width = heads
             .checked_mul(head_dim)
             .context("Vulkan attention score width overflow")?;
-        let [queries, query_width]: [usize; 2] = query
-            .shape()
-            .try_into()
-            .context("Vulkan attention query must be rank two")?;
-        let [keys, key_width]: [usize; 2] = key
-            .shape()
-            .try_into()
-            .context("Vulkan attention key must be rank two")?;
-        if heads == 0
+        let (batches, queries, query_width, batched) = match query.shape() {
+            [queries, width] => (1, *queries, *width, false),
+            [batches, queries, width] => (*batches, *queries, *width, true),
+            shape => bail!("Vulkan attention query must be rank two or three, got {shape:?}"),
+        };
+        let (key_batches, keys, key_width, key_batched) = match key.shape() {
+            [keys, width] => (1, *keys, *width, false),
+            [batches, keys, width] => (*batches, *keys, *width, true),
+            shape => bail!("Vulkan attention key must be rank two or three, got {shape:?}"),
+        };
+        if batches == 0
+            || heads == 0
             || head_dim == 0
             || !scale.is_finite()
             || queries == 0
             || keys == 0
+            || key_batches != batches
+            || key_batched != batched
             || query_width != width
             || key_width != width
         {
@@ -2112,9 +2567,14 @@ impl TensorBackend for VulkanBackend {
         let DeviceTensorStorage::Vulkan(key_storage) = &key.storage else {
             bail!("Vulkan backend received non-Vulkan attention key");
         };
+        let shape = if batched {
+            vec![batches, heads, queries, keys]
+        } else {
+            vec![heads, queries, keys]
+        };
         Ok(DeviceTensor {
             backend: BackendKind::Vulkan,
-            shape: vec![heads, queries, keys],
+            shape,
             storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_attention_scores(
                 query_storage,
                 key_storage,
@@ -2123,6 +2583,7 @@ impl TensorBackend for VulkanBackend {
                 heads,
                 head_dim,
                 scale,
+                batches,
             )?),
         })
     }
@@ -2161,22 +2622,29 @@ impl TensorBackend for VulkanBackend {
     ) -> Result<DeviceTensor> {
         self.require_tensor(probabilities)?;
         self.require_tensor(value)?;
-        let [probability_heads, queries, keys]: [usize; 3] = probabilities
-            .shape()
-            .try_into()
-            .context("Vulkan attention probabilities must be rank three")?;
-        let [value_rows, value_width]: [usize; 2] = value
-            .shape()
-            .try_into()
-            .context("Vulkan attention value must be rank two")?;
+        let (batches, probability_heads, queries, keys, batched) = match probabilities.shape() {
+            [heads, queries, keys] => (1, *heads, *queries, *keys, false),
+            [batches, heads, queries, keys] => (*batches, *heads, *queries, *keys, true),
+            shape => {
+                bail!("Vulkan attention probabilities must be rank three or four, got {shape:?}")
+            }
+        };
+        let (value_batches, value_rows, value_width, value_batched) = match value.shape() {
+            [rows, width] => (1, *rows, *width, false),
+            [batches, rows, width] => (*batches, *rows, *width, true),
+            shape => bail!("Vulkan attention value must be rank two or three, got {shape:?}"),
+        };
         let width = heads
             .checked_mul(head_dim)
             .context("Vulkan attention value width overflow")?;
         if heads == 0
             || head_dim == 0
             || probability_heads != heads
+            || batches == 0
             || queries == 0
             || keys == 0
+            || value_batches != batches
+            || value_batched != batched
             || value_rows != keys
             || value_width != width
         {
@@ -2188,9 +2656,14 @@ impl TensorBackend for VulkanBackend {
         let DeviceTensorStorage::Vulkan(value_storage) = &value.storage else {
             bail!("Vulkan backend received non-Vulkan attention values");
         };
+        let shape = if batched {
+            vec![batches, queries, width]
+        } else {
+            vec![queries, width]
+        };
         Ok(DeviceTensor {
             backend: BackendKind::Vulkan,
-            shape: vec![queries, width],
+            shape,
             storage: DeviceTensorStorage::Vulkan(crate::vulkan::resident_attention_values(
                 probability_storage,
                 value_storage,
@@ -2198,6 +2671,7 @@ impl TensorBackend for VulkanBackend {
                 keys,
                 heads,
                 head_dim,
+                batches,
             )?),
         })
     }
@@ -3505,6 +3979,109 @@ mod tests {
             metrics.cosine_similarity,
             metrics.maximum_absolute_error,
             metrics.mean_absolute_error,
+        );
+
+        drop(device_output);
+        drop(device_weight);
+        drop(device_input);
+        let after_drop = crate::vulkan::persistence_stats().unwrap();
+        assert_eq!(
+            after_drop.resident_allocated_bytes,
+            before.resident_allocated_bytes
+        );
+        assert_eq!(
+            after_drop.resident_device_local_bytes,
+            before.resident_device_local_bytes
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_resident_conv2d_matches_scalar_on_awkward_dimensions() {
+        use crate::parity::{ParityTolerance, compare_tensors};
+
+        let _persistence_guard = crate::vulkan::PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let input = Tensor::new(
+            vec![2, 3, 4, 5],
+            (0..120)
+                .map(|index| ((index * 11) % 37) as f32 * 0.125 - 2.0)
+                .collect(),
+        )
+        .unwrap();
+        // 3*3*3*3 = 81 FP16 values deliberately exercises a prepared weight
+        // payload that needs two bytes of Vulkan transfer padding.
+        let weight = Tensor::new(
+            vec![3, 3, 3, 3],
+            (0..81)
+                .map(|index| ((index * 5) % 13) as f32 * 0.03125 - 0.1875)
+                .collect(),
+        )
+        .unwrap();
+        let bias = Tensor::new(vec![3], vec![0.125, -0.25, 0.375]).unwrap();
+        let stride = [2, 1];
+        let padding = [1, 1];
+
+        let scalar_input = SCALAR_BACKEND.upload_tensor(&input).unwrap();
+        let scalar_weight = SCALAR_BACKEND.prepare_conv2d(&weight, Some(&bias)).unwrap();
+        let scalar_output = SCALAR_BACKEND
+            .conv2d_prepared_device(&scalar_input, &scalar_weight, stride, padding)
+            .unwrap();
+        let expected = SCALAR_BACKEND.download_tensor(&scalar_output).unwrap();
+
+        let before = match crate::vulkan::persistence_stats() {
+            Ok(stats) => stats,
+            Err(error) if std::env::var_os("QUARTZ_REQUIRE_VULKAN").is_none() => {
+                eprintln!("skipping resident Conv2D parity: {error:#}");
+                return;
+            }
+            Err(error) => panic!("required resident Conv2D parity failed: {error:#}"),
+        };
+        let device_input = VULKAN_BACKEND.upload_tensor(&input).unwrap();
+        let device_weight = VULKAN_BACKEND.prepare_conv2d(&weight, Some(&bias)).unwrap();
+        let after_prepare = crate::vulkan::persistence_stats().unwrap();
+        let started = std::time::Instant::now();
+        let device_output = VULKAN_BACKEND
+            .conv2d_prepared_device(&device_input, &device_weight, stride, padding)
+            .unwrap();
+        let output = VULKAN_BACKEND.download_tensor(&device_output).unwrap();
+        let runtime = started.elapsed();
+        let after = crate::vulkan::persistence_stats().unwrap();
+        let metrics = compare_tensors(&output, &expected).unwrap();
+        metrics
+            .require(ParityTolerance {
+                minimum_cosine_similarity: 0.999_999,
+                maximum_absolute_error: 2e-5,
+                maximum_mean_absolute_error: 2e-6,
+            })
+            .unwrap();
+        assert_eq!(output.shape(), &[2, 3, 2, 5]);
+        assert_eq!(
+            after_prepare.resident_weight_uploads - before.resident_weight_uploads,
+            1
+        );
+        assert_eq!(
+            after_prepare.resident_device_local_bytes - before.resident_device_local_bytes,
+            (weight.len() * 2 + bias.len() * 4) as u64
+        );
+        assert_eq!(
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            1
+        );
+        assert_eq!(after.resident_downloads - before.resident_downloads, 1);
+        println!(
+            "resident Conv2D: input={:?} weight={:?} output={:?} stride={stride:?} padding={padding:?} cosine={:.9} max_abs={:.9} mean_abs={:.9} runtime_ms={:.3} current_vulkan_bytes={} device_local_bytes={} host_uploads={} weight_uploads={} downloads={}",
+            input.shape(),
+            weight.shape(),
+            output.shape(),
+            metrics.cosine_similarity,
+            metrics.maximum_absolute_error,
+            metrics.mean_absolute_error,
+            runtime.as_secs_f64() * 1_000.0,
+            after.resident_allocated_bytes - before.resident_allocated_bytes,
+            after.resident_device_local_bytes - before.resident_device_local_bytes,
+            after.resident_tensor_uploads - before.resident_tensor_uploads,
+            after.resident_weight_uploads - before.resident_weight_uploads,
+            after.resident_downloads - before.resident_downloads,
         );
 
         drop(device_output);

@@ -255,3 +255,40 @@ matched scalar at cosine `1.0`, maximum error `1.431e-6`, and mean error
 `1.60e-7`. Scalar execution took `16.149 ms`; Vulkan execution took `3.246 ms`.
 The graph held 1,006,080 logical Vulkan bytes and 4,608 peak cache bytes, with
 one activation upload, four prepared-weight uploads, and one final download.
+
+## Resident VAE spatial milestone
+
+The generic resident Conv2D path uses FP32 NCHW activations, prepared FP16
+OIHW weights, FP32 bias, arbitrary spatial extents, stride, and symmetric
+padding. It is a dedicated 2D shader, not a temporal Conv3D wrapper. The
+awkward `[2,3,4,5]` fixture with `[3,3,3,3]` weights, stride `[2,1]`, and
+padding `[1,1]` produced `[2,3,2,5]` exactly: cosine `1.0`, maximum/mean error
+`0`, and `0.943 ms` focused runtime. Its odd 81-value FP16 weight payload also
+verifies the padded Vulkan staging path. The run held 894 logical Vulkan bytes,
+174 device-local logical bytes, one activation upload, one prepared-weight
+upload, and one final download.
+
+VAE spatial attention has explicit resident layout kernels for NCTHW frame
+packing, frame reconstruction, Q/K/V channel splitting into
+`[N*T,H*W,C]`, and sequence reconstruction. The attention ladder is unfused:
+batched QK scores, row softmax, probability/value multiplication, projection,
+and residual add. The batch axis is the flattened frame identity, so no score
+or value operation can cross a temporal-frame boundary. The first trace found
+and corrected a descriptor-contract error at the frame-packing output; the
+accepted trace compares every intermediate boundary.
+
+The deterministic `[2,2,2,2,3]` attention fixture (four frames, six spatial
+positions) matched scalar at every boundary with final cosine `1.0`, maximum
+error `2.38e-7`, and mean error `6.1e-8`. Changing only frame 1 left frame 0
+bit-identical and changed the targeted frames by an aggregate `159.598557`.
+The primary graph took `4.946 ms`; the test held 456 logical Vulkan bytes and
+72 device-local logical bytes after its second pass, used two activation
+uploads and three prepared-weight uploads, and performed fourteen deliberate
+downloads for the thirteen-boundary trace plus the isolation output.
+
+The real `decoder.middle.1` attention block was checked on
+`[1,384,1,2,3]`. Its output matched scalar at cosine `1.0`, maximum error
+`2.38e-7`, and mean error `3.9e-8`. Scalar execution took `91.069 ms`; Vulkan
+execution took `10.004 ms`. The graph held 1,205,760 logical Vulkan bytes,
+1,187,328 device-local logical bytes, one activation upload, three prepared
+weight uploads, and one final download.

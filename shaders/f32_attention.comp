@@ -19,7 +19,7 @@ layout(push_constant) uniform Dimensions {
     uint heads;
     uint head_dim;
     float scale;
-    uint padding0;
+    uint batches;
     uint padding1;
 } dimensions;
 
@@ -28,17 +28,22 @@ shared float partial[256];
 void attention_scores() {
     uint index = gl_GlobalInvocationID.x;
     uint scores_per_head = dimensions.queries * dimensions.keys;
-    uint total_scores = dimensions.heads * scores_per_head;
+    uint scores_per_batch = dimensions.heads * scores_per_head;
+    uint total_scores = dimensions.batches * scores_per_batch;
     if (index >= total_scores) {
         return;
     }
-    uint head = index / scores_per_head;
-    uint remainder = index % scores_per_head;
+    uint batch_index = index / scores_per_batch;
+    uint batch_remainder = index % scores_per_batch;
+    uint head = batch_remainder / scores_per_head;
+    uint remainder = batch_remainder % scores_per_head;
     uint query = remainder / dimensions.keys;
     uint key = remainder % dimensions.keys;
     uint width = dimensions.heads * dimensions.head_dim;
-    uint query_offset = query * width + head * dimensions.head_dim;
-    uint key_offset = key * width + head * dimensions.head_dim;
+    uint query_offset = (batch_index * dimensions.queries + query) * width +
+        head * dimensions.head_dim;
+    uint key_offset = (batch_index * dimensions.keys + key) * width +
+        head * dimensions.head_dim;
     float score = 0.0;
     for (uint channel = 0; channel < dimensions.head_dim; ++channel) {
         score += left_values[query_offset + channel] *
@@ -92,19 +97,23 @@ void attention_softmax() {
 void attention_values() {
     uint index = gl_GlobalInvocationID.x;
     uint width = dimensions.heads * dimensions.head_dim;
-    uint total_values = dimensions.queries * width;
+    uint values_per_batch = dimensions.queries * width;
+    uint total_values = dimensions.batches * values_per_batch;
     if (index >= total_values) {
         return;
     }
-    uint query = index / width;
+    uint batch_index = index / values_per_batch;
+    uint query = (index % values_per_batch) / width;
     uint row_channel = index % width;
     uint head = row_channel / dimensions.head_dim;
     uint channel = row_channel % dimensions.head_dim;
     uint probability_offset =
-        head * dimensions.queries * dimensions.keys + query * dimensions.keys;
+        ((batch_index * dimensions.heads + head) * dimensions.queries + query) *
+        dimensions.keys;
     float value = 0.0;
     for (uint key = 0; key < dimensions.keys; ++key) {
-        uint value_offset = key * width + head * dimensions.head_dim + channel;
+        uint value_offset = (batch_index * dimensions.keys + key) * width +
+            head * dimensions.head_dim + channel;
         value += left_values[probability_offset + key] * right_values[value_offset];
     }
     output_values[index] = value;
