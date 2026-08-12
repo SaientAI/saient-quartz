@@ -16,6 +16,22 @@ leaves the device.
 on-device generation recorded with Wi-Fi and mobile data switched off,
 so there is no network path a cloud call could take.
 
+## Looking for a ComfyUI alternative?
+
+ComfyUI is exceptionally capable when you want to construct and control a
+node graph. Saient is exploring the other direction: a local-first workspace
+where ordinary image, video, LLM and agent tasks do not require the user to
+assemble Python environments, custom-node dependency chains or execution
+graphs first.
+
+Quartz is the native Rust inference layer beneath that product direction. The
+goal is not to reproduce ComfyUI node-for-node; it is to make direct operation
+of the graph unnecessary for everyday work while keeping models and core
+execution on the user's hardware.
+
+- **[Read: ComfyUI power without the Python dependency maze](COMFYUI_ALTERNATIVE.md)**
+- **[Compare Saient and ComfyUI on the Saient website](https://saient.co.uk/comfyui-alternative)**
+
 (The Wan video model itself runs through a separate, MIT-licensed
 companion binary — see [Relationship to the Wan video engine](#relationship-to-the-wan-video-engine)
 below for how the two fit together. This repo, Quartz proper, is the
