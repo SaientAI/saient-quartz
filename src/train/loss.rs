@@ -5,8 +5,12 @@
 /// project(start, hidden, out) computes logits for out.len() vocabulary rows.
 /// transpose_accumulate(start, d_logits, d_hidden) adds W_chunk^T*d_logits.
 pub fn chunked_cross_entropy<P, B>(
-    hidden: &[f32], vocab: usize, target: usize, chunk: usize,
-    mut project: P, mut transpose_accumulate: B,
+    hidden: &[f32],
+    vocab: usize,
+    target: usize,
+    chunk: usize,
+    mut project: P,
+    mut transpose_accumulate: B,
 ) -> (f32, Vec<f32>)
 where
     P: FnMut(usize, &[f32], &mut [f32]),
@@ -33,7 +37,9 @@ where
             } else {
                 exp_sum += (value - running_max).exp();
             }
-            if start + j == target { target_logit = Some(value); }
+            if start + j == target {
+                target_logit = Some(value);
+            }
         }
     }
     let log_z = running_max + exp_sum.ln();
@@ -58,10 +64,19 @@ where
 mod tests {
     use super::*;
 
-    fn run(weights: &[f32], hidden: &[f32], vocab: usize, chunk: usize, target: usize) -> (f32, Vec<f32>) {
+    fn run(
+        weights: &[f32],
+        hidden: &[f32],
+        vocab: usize,
+        chunk: usize,
+        target: usize,
+    ) -> (f32, Vec<f32>) {
         let d = hidden.len();
         chunked_cross_entropy(
-            hidden, vocab, target, chunk,
+            hidden,
+            vocab,
+            target,
+            chunk,
             |start, x, scores| {
                 for (j, out) in scores.iter_mut().enumerate() {
                     *out = (0..d).map(|i| weights[(start + j) * d + i] * x[i]).sum();
@@ -69,7 +84,9 @@ mod tests {
             },
             |start, g, dx| {
                 for (j, &dj) in g.iter().enumerate() {
-                    for i in 0..d { dx[i] += weights[(start + j) * d + i] * dj; }
+                    for i in 0..d {
+                        dx[i] += weights[(start + j) * d + i] * dj;
+                    }
                 }
             },
         )
@@ -92,12 +109,16 @@ mod tests {
         let mut expected_dx = vec![0.0; d];
         for (j, &score) in full_scores.iter().enumerate() {
             let p = score.exp() / z - if j == target { 1.0 } else { 0.0 };
-            for i in 0..d { expected_dx[i] += p * w[j * d + i]; }
+            for i in 0..d {
+                expected_dx[i] += p * w[j * d + i];
+            }
         }
         for chunk in [1, 2, 4, 9, 20] {
             let (l, g) = run(&w, &hidden, vocab, chunk, target);
             assert!((l - expected_loss).abs() < 1e-5, "{chunk} loss");
-            for i in 0..d { assert!((g[i] - expected_dx[i]).abs() < 1e-5, "{chunk} dH[{i}]"); }
+            for i in 0..d {
+                assert!((g[i] - expected_dx[i]).abs() < 1e-5, "{chunk} dH[{i}]");
+            }
         }
     }
 
@@ -118,11 +139,17 @@ mod tests {
         let (_, dh) = run(&weights, &h, vocab, 2, 3);
         let eps = 1e-3;
         for i in 0..d {
-            h[i] += eps; let a = run(&weights, &h, vocab, 2, 3).0;
-            h[i] -= 2. * eps; let b = run(&weights, &h, vocab, 2, 3).0;
+            h[i] += eps;
+            let a = run(&weights, &h, vocab, 2, 3).0;
+            h[i] -= 2. * eps;
+            let b = run(&weights, &h, vocab, 2, 3).0;
             h[i] += eps;
             let numerical = (a - b) / (2. * eps);
-            assert!((dh[i] - numerical).abs() < 3e-4, "{i}: {} vs {numerical}", dh[i]);
+            assert!(
+                (dh[i] - numerical).abs() < 3e-4,
+                "{i}: {} vs {numerical}",
+                dh[i]
+            );
         }
     }
 }

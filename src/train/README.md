@@ -1,26 +1,53 @@
-# Quartz Train — Stage 0 (experimental)
+# Quartz Train — experimental implementation
 
-This is an initial implementation, NOT a finished GGUF trainer.
-It follows the Quartz LoRA design proposal.
+## Stage 0: scalar reference operators
+- lora.rs: trainable A/B matrices over a frozen quantized projection;
+  explicit adapter-only input gradients.
+- loss.rs: two-pass vocab-chunked cross entropy + hidden gradient.
+- Independent finite-difference, stability and parity tests.
 
-Implemented:
-- CPU reference LoRA A/B projection, compatible with a frozen base.
-- Adapter dA, dB, and dX including the adapter A^T B^T dY term.
-  The frozen W^T dY must still be added by the model-level caller.
-- Two-pass vocab-chunked cross-entropy with callback projections.
-- Finite-difference and numerical-parity unit tests.
+## Stage 1A: real-model output-head LoRA (quartz train-head)
+- head.rs takes a real GGUF and JSONL dataset. Quartz's existing
+  GGUF loader, tokenizer, dense transformer forward, RMSNorm and lazy
+  quantized lm_head projection generate real frozen model features.
+- Training updates only a rank-r output-head LoRA adapter. It uses Adam,
+  clipped averaged gradients, and a frozen GGUF verified by SHA-256 before
+  and after training.
+- The training examples each have a single next-token target; the
+  frozen final hidden states and base token scores are cached.
+- A distinct held-out split is evaluated before/after training.
+- Writes a real safetensors file (quartz-lora-head-v0) with two f32
+  matrices, a base GGUF SHA-256 identifier, and rank/alpha metadata.
+  The loader verifies that identifier and the output's numerical parity.
+- The targeted Android ARM64 build uses CPU for correctness, not GPU.
 
-Not yet implemented: GGUF forward/backprop integration, attention/RoPE/
-normalization backward, AdamW checkpoints, Android thermal scheduler,
-safetensors adapter writer, inference lora-apply, or model fine-tuning.
+Run:
+  quartz train-head BASE.gguf DATA.jsonl OUT.safetensors \
+    --steps 80 --rank 4 --lr 0.015 --max-tokens 16
 
-The Samsung APK smoke test separately demonstrated rank-2 LoRA on a
-synthetic 6x8 layer. That result is not a speed estimate for 0.6–2B
-models.
+Input JSONL line:
+  {"prompt":"Review: excellent\nSentiment:","target":" positive","split":"train"}
 
-Run isolated dependency-free Rust tests:
-  rustc --edition 2024 --test src/train/mod.rs -o /tmp/quartz-lora-tests
-  /tmp/quartz-lora-tests
+Independent reload with novel examples:
+  quartz eval-head BASE.gguf FRESH_HELDOUT.jsonl OUT.safetensors --max-tokens 16
 
-Source lives in a separate clone/branch to preserve the modified
-/home/tiny/projects/tinyq4 working tree.
+Rules: 3..24 total examples, at least two train and one held out, 1..32
+tokens in prompts (default 16), one-token target text. Up to 500 steps.
+
+Scope limitation: this is real GGUF-backed on-device training, but
+only an output-head adapter. It is NOT full transformer LoRA, does
+NOT backpropagate through attention, and cannot change Q/V projections.
+Caching one vocab vector per example is bounded by max 24 examples,
+but is not the Stage 1–3 long-sequence streaming CE design.
+
+## Next acceptance gates
+1. Verify real-model train/heldout loss on the S26 CPU.
+2. Enable a portable lora-apply inference path for head adapters and
+   compare cached and loaded outputs with independent model inference.
+3. Implement norms, attention, RoPE, SwiGLU and all WᵀdY backward
+   operators, with numerical gradients and tiny GGUF end-to-end tests.
+4. Move to last-K q/v LoRA, streaming long-sequence CE, and Android
+   lifecycle/thermal management. Only then consider Vulkan acceleration.
+
+No merged GGUF writer, full SFT, durable optimiser checkpoints or
+background training service is claimed in this milestone.

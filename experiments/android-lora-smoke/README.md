@@ -1,37 +1,81 @@
-# Samsung S26 Ultra: on-device LoRA smoke test (2026-10-28)
+# Samsung S26 Ultra: Quartz LoRA experiments (2026-10-28)
 
-Reproducible code from Forge phone project gpt_quartz_lora_smoke.
-Package: uk.co.saient.generated.gpt_quartz_lora_smoke
-Java source SHA-256: 1b8d110b7671c5ef6e5890f27c3b9c3dbb572ce27aef00373a0071e353e269a7
-APK SHA-256: 67a8b5d3fdd283021d6576a84e5859a16a076819d276d70b73b5ff69cc5ab2d5
-Build: on-phone Forge ECJ + D8; signed APK, zero Android permissions.
-Installed and launched on device SM-S948B (Android 17, Snapdragon SM8850).
-No inference server, external API, network permission, or training cloud.
+## 1. Initial native Java/Android training arithmetic smoke test
 
-Experiment:
-- Frozen synthetic 6x8 base layer (NOT a GGUF model).
-- Rank-2 LoRA, scaling alpha/r = 2.
-- Random nonzero A; B initialized exactly zero.
-- Analytical adapter/input derivatives checked against central differences
-  with both A and B nonzero.
-- Adam optimizer updated ONLY A/B on 96 synthetic training examples.
-- 48 unseen synthetic holdout examples tested before and after.
-- Trained adapter saved to private Android app storage.
+Forge phone project gpt_quartz_lora_smoke, package:
+uk.co.saient.generated.gpt_quartz_lora_smoke
+Java source SHA-256:
+1b8d110b7671c5ef6e5890f27c3b9c3dbb572ce27aef00373a0071e353e269a7
+APK SHA-256:
+67a8b5d3fdd283021d6576a84e5859a16a076819d276d70b73b5ff69cc5ab2d5
 
-Phone runtime log:
-  RESULT: PASS
-  Gradient finite-difference max relative error: 2.3e-09
-  Base weights unchanged: YES
-  Held-out loss: 1.054733 -> 0.000000000 (display rounding)
-  Training loss: 0.000000000 (display rounding)
-  Optimizer steps: 600
-  Duration: 44 ms
-  Android thermal status: 0 (normal)
+On the Samsung (Android 17, Qualcomm SM8850) the synthetic 6x8
+frozen linear layer trained a rank-2 LoRA for 600 Adam updates:
+- Finite-difference gradient max relative error: 2.3e-9
+- Held-out synthetic loss: 1.054733 -> ~0.0 (display rounding)
+- Frozen base unchanged; adapter saved privately
+- 44 milliseconds. This does NOT estimate real model training throughput.
 
-Limits:
-- This is real on-device LoRA math/training, but of a tiny synthetic
-  linear layer using Java CPU arithmetic; NO transformer fine-tuning.
-- The duration is *not* a throughput forecast for 0.6B–2B models.
-- No Vulkan compute, no native Quartz, no GGUF, no safetensors export.
-- The main Rust Stage 0 tests live in src/train; connecting them to
-  GGUF projection kernels is the next substantial engineering step.
+## 2. Real GGUF head-only training
+
+Dataset: real-qwen-sentiment.jsonl (10 train + 4 held-out)
+Model already available from user's own Saient desktop installation:
+Qwen2.5-0.5B Instruct, architecture qwen2, GGUF v3, Apache-2.0.
+24 layers, hidden 896, vocab 151936; file 397,808,192 bytes.
+Base model SHA-256:
+6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+
+Model and dataset transferred to /sdcard/Download/quartz-lora/
+on the S26 over the local network. Hashes verified on phone.
+The ARM64 quartz executable was cross-compiled on the PC and SHA-256
+verified on phone; native code runs as Android shell uid=2000, not the
+Java Forge APK. Model tokenizer verified token ' positive' => ID 6785.
+
+Run:
+  /data/local/tmp/quartz-lora/quartz train-head \
+    /sdcard/Download/quartz-lora/qwen05.gguf \
+    /sdcard/Download/quartz-lora/real-qwen-sentiment.jsonl \
+    /sdcard/Download/quartz-lora/adapter-qwen25-r4-stage1.safetensors \
+    --steps 80 --rank 4 --lr 0.015 --max-tokens 16
+
+The output-head LoRA trains on real frozen Qwen hidden states/logits but
+is not an attention/transformer Q/V LoRA. Refer to src/train/README.md
+for limitations. Phone results must be recorded before calling Stage 1
+accepted; successful compilation alone is not sufficient.
+
+## 3. Actual S26 outcome — verified
+
+The full shell output is archived in results/ (two raw logs).
+
+- REAL GGUF training (rank 4, 80 steps, 10 train/4 held-out):
+  train loss 0.423226 -> <0.000001 (rounded output)
+  held-out loss 0.695651 -> <0.000001 (rounded output)
+  14 real-model forward passes took 94,552 ms;
+  80 adapter steps were approximately 4,220 ms;
+  full native training process 102,728 ms;
+  battery 86% -> 85%; Android thermal status 0.
+- The frozen Qwen GGUF SHA-256 matched before and after.
+  Adapter save/reload numerical parity passed.
+- Portable safetensors output size 2,445,728 bytes (2.33 MiB);
+  SHA-256 8a76650f2c55374f529f277566b837c03dcd96984563c045708b2e6c3cf14bf0.
+- Independent second native process, no training: six previously
+  unobserved held-out prompts, base CE 1.079906 -> <0.000001
+  (rounded adapter display). Each of six individually improved.
+  Eval took 51,703 ms, thermal status 0.
+- Tested phone: SM-S948B (Snapdragon SM8850, Android 17).
+- Android binary 1 SHA-256:
+  caa2bc2884aa053ac59c36b5d8c0de70c3765ff3f95c646c9927c5775497379a
+- Android binary 2 (new independent eval command) SHA-256:
+  b8e2c3ed31d1eebc839ad985eefe0687e0d39c8440393beb9b886156ea6db180
+
+The model, trained adapter and binaries are on the S26. The exact
+safetensors adapter was also uploaded back over the private LAN and
+SHA-256 verified under output/ on the PC (gitignored, not published).
+The temporary transfer server was shut down after verification.
+
+**Interpretation:** this is an important implementation milestone
+for real-model on-device output-head adaptation. The tiny train and
+held-out sets are restricted to two sentiment labels. Lower loss on
+six fresh examples DOES NOT imply broad transfer, long-sequence SFT,
+or attention/Q/V LoRA capability. No full transformer backward,
+checkpoint/resume, or production lifecycle guarantee is claimed.

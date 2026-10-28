@@ -34,14 +34,26 @@ impl LoraLinear {
             let unit = ((state >> 40) as f32) / ((1u32 << 24) as f32);
             *value = (unit - 0.5) * 0.04;
         }
-        Self { input, output, rank, alpha, a, b: vec![0.0; output * rank] }
+        Self {
+            input,
+            output,
+            rank,
+            alpha,
+            a,
+            b: vec![0.0; output * rank],
+        }
     }
 
     pub fn zeros_like_grads(&self) -> LoraGrads {
-        LoraGrads { a: vec![0.0; self.a.len()], b: vec![0.0; self.b.len()] }
+        LoraGrads {
+            a: vec![0.0; self.a.len()],
+            b: vec![0.0; self.b.len()],
+        }
     }
 
-    pub fn scale(&self) -> f32 { self.alpha / self.rank as f32 }
+    pub fn scale(&self) -> f32 {
+        self.alpha / self.rank as f32
+    }
 
     /// Add LoRA's contribution into an existing frozen-base output vector.
     pub fn forward_add(&self, x: &[f32], output: &mut [f32]) {
@@ -49,7 +61,9 @@ impl LoraLinear {
         assert_eq!(output.len(), self.output);
         let mut ax = vec![0.0; self.rank];
         for r in 0..self.rank {
-            for i in 0..self.input { ax[r] += self.a[r * self.input + i] * x[i]; }
+            for i in 0..self.input {
+                ax[r] += self.a[r * self.input + i] * x[i];
+            }
         }
         let s = self.scale();
         for o in 0..self.output {
@@ -62,9 +76,7 @@ impl LoraLinear {
     /// Accumulate adapter gradients and add adapter-only dX into the supplied
     /// buffer. Callers must separately compute and add frozen W^T * dY.
     /// This is deliberately NOT a complete transformer block backward.
-    pub fn backward_add(
-        &self, x: &[f32], dy: &[f32], dx: &mut [f32], grads: &mut LoraGrads,
-    ) {
+    pub fn backward_add(&self, x: &[f32], dy: &[f32], dx: &mut [f32], grads: &mut LoraGrads) {
         assert_eq!(x.len(), self.input);
         assert_eq!(dy.len(), self.output);
         assert_eq!(dx.len(), self.input);
@@ -74,7 +86,9 @@ impl LoraLinear {
         let mut ax = vec![0.0; self.rank];
         let mut bt_dy = vec![0.0; self.rank];
         for r in 0..self.rank {
-            for i in 0..self.input { ax[r] += self.a[r * self.input + i] * x[i]; }
+            for i in 0..self.input {
+                ax[r] += self.a[r * self.input + i] * x[i];
+            }
         }
         for o in 0..self.output {
             for r in 0..self.rank {
@@ -122,25 +136,43 @@ mod tests {
         model.backward_add(&x, &dy, &mut dx, &mut grads);
         let eps = 1e-3;
         for i in 0..model.a.len() {
-            model.a[i] += eps; let hi = scalar(&model, &x, &dy);
-            model.a[i] -= 2. * eps; let lo = scalar(&model, &x, &dy);
+            model.a[i] += eps;
+            let hi = scalar(&model, &x, &dy);
+            model.a[i] -= 2. * eps;
+            let lo = scalar(&model, &x, &dy);
             model.a[i] += eps;
             let numeric = (hi - lo) / (2. * eps);
-            assert!((grads.a[i] - numeric).abs() < 3e-4, "dA[{i}]: {} vs {numeric}", grads.a[i]);
+            assert!(
+                (grads.a[i] - numeric).abs() < 3e-4,
+                "dA[{i}]: {} vs {numeric}",
+                grads.a[i]
+            );
         }
         for i in 0..model.b.len() {
-            model.b[i] += eps; let hi = scalar(&model, &x, &dy);
-            model.b[i] -= 2. * eps; let lo = scalar(&model, &x, &dy);
+            model.b[i] += eps;
+            let hi = scalar(&model, &x, &dy);
+            model.b[i] -= 2. * eps;
+            let lo = scalar(&model, &x, &dy);
             model.b[i] += eps;
             let numeric = (hi - lo) / (2. * eps);
-            assert!((grads.b[i] - numeric).abs() < 3e-4, "dB[{i}]: {} vs {numeric}", grads.b[i]);
+            assert!(
+                (grads.b[i] - numeric).abs() < 3e-4,
+                "dB[{i}]: {} vs {numeric}",
+                grads.b[i]
+            );
         }
         for i in 0..x.len() {
-            x[i] += eps; let hi = scalar(&model, &x, &dy);
-            x[i] -= 2. * eps; let lo = scalar(&model, &x, &dy);
+            x[i] += eps;
+            let hi = scalar(&model, &x, &dy);
+            x[i] -= 2. * eps;
+            let lo = scalar(&model, &x, &dy);
             x[i] += eps;
             let numeric = (hi - lo) / (2. * eps);
-            assert!((dx[i] - numeric).abs() < 3e-4, "dX[{i}]: {} vs {numeric}", dx[i]);
+            assert!(
+                (dx[i] - numeric).abs() < 3e-4,
+                "dX[{i}]: {} vs {numeric}",
+                dx[i]
+            );
         }
     }
 

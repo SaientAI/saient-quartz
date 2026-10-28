@@ -1,0 +1,4 @@
+transfer/
+*.gguf
+*.safetensors
+*.part

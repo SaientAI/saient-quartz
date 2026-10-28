@@ -1,0 +1,14 @@
+{"prompt":"Review: excellent\nSentiment:","target":" positive","split":"train"}
+{"prompt":"Review: superb\nSentiment:","target":" positive","split":"train"}
+{"prompt":"Review: delightful\nSentiment:","target":" positive","split":"train"}
+{"prompt":"Review: impressive\nSentiment:","target":" positive","split":"train"}
+{"prompt":"Review: enjoyable\nSentiment:","target":" positive","split":"train"}
+{"prompt":"Review: awful\nSentiment:","target":" negative","split":"train"}
+{"prompt":"Review: terrible\nSentiment:","target":" negative","split":"train"}
+{"prompt":"Review: horrible\nSentiment:","target":" negative","split":"train"}
+{"prompt":"Review: disappointing\nSentiment:","target":" negative","split":"train"}
+{"prompt":"Review: boring\nSentiment:","target":" negative","split":"train"}
+{"prompt":"Review: brilliant\nSentiment:","target":" positive","split":"heldout"}
+{"prompt":"Review: wonderful\nSentiment:","target":" positive","split":"heldout"}
+{"prompt":"Review: dreadful\nSentiment:","target":" negative","split":"heldout"}
+{"prompt":"Review: unpleasant\nSentiment:","target":" negative","split":"heldout"}

@@ -26,7 +26,6 @@ mod server;
 mod t5_tokenizer;
 mod tensor;
 mod tokenizer;
-#[cfg(test)]
 mod train;
 mod umt5;
 #[cfg(feature = "vulkan")]
@@ -1817,6 +1816,22 @@ fn main() {
     use std::io::Write;
 
     let args: Vec<String> = std::env::args().collect();
+
+    if args.get(1).map(String::as_str) == Some("eval-head") {
+        if let Err(err) = train::head::evaluate(&args) {
+            eprintln!("EVAL_HEAD_ERROR: {err:#}");
+            std::process::exit(2);
+        }
+        return;
+    }
+
+    if args.get(1).map(String::as_str) == Some("train-head") {
+        if let Err(err) = train::head::run(&args) {
+            eprintln!("TRAIN_HEAD_ERROR: {err:#}");
+            std::process::exit(2);
+        }
+        return;
+    }
 
     #[cfg(feature = "vulkan")]
     if args.iter().any(|argument| argument == "--vulkan") {

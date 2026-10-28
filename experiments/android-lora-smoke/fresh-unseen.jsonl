@@ -1,0 +1,6 @@
+{"prompt":"Review: spectacular\nSentiment:","target":" positive","split":"heldout"}
+{"prompt":"Review: amazing\nSentiment:","target":" positive","split":"heldout"}
+{"prompt":"Review: pathetic\nSentiment:","target":" negative","split":"heldout"}
+{"prompt":"Review: unbearable\nSentiment:","target":" negative","split":"heldout"}
+{"prompt":"Opinion: I loved the film\nSentiment:","target":" positive","split":"heldout"}
+{"prompt":"Opinion: I hated the film\nSentiment:","target":" negative","split":"heldout"}
