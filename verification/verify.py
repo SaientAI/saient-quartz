@@ -23,8 +23,8 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL = Path("/home/tiny/projects/saient/desktop/data/llm-runtime/qwen05.gguf")
-DEFAULT_ADAPTER = ROOT / "experiments/android-lora-smoke/output/adapter-qwen25-qv16-23-r2-step4-s26.safetensors"
+DEFAULT_MODEL = Path(os.environ.get("QUARTZ_GGUF", str(ROOT / "models/qwen05.gguf")))
+DEFAULT_ADAPTER = ROOT / "verification/sample/adapter-qwen25-qv16-23-r2-step4-s26.safetensors"
 DEFAULT_TRAIN = ROOT / "experiments/android-lora-smoke/multi-3-samples.jsonl"
 DEFAULT_FRESH = ROOT / "verification/fixtures/holdout_fresh.jsonl"
 DEFAULT_CHALLENGE = ROOT / "verification/fixtures/challenge_negation.jsonl"

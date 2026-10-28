@@ -7,9 +7,13 @@ concrete, reproducible claims rather than awarding a vague "AI learned"
 badge.
 
 The default adapter is the **four-step Samsung S26** checkpoint made on
-2026-10-28, and the base GGUF and trained adapter have pinned SHA-256s.
-Neither base GGUF nor checkpoint is written or replaced by the audit
-or evaluation commands.
+2026-10-28, published as a small, synthetic-sentiment-trained sample
+in verification/sample/. The base GGUF and trained adapter have pinned
+SHA-256s. The 380 MB original model is NOT included; supply the
+byte-identical frozen GGUF with --model /path/to/qwen05.gguf or set
+QUARTZ_GGUF=/path/to/qwen05.gguf. Neither base GGUF nor checkpoint
+is written or replaced by the audit/evaluation commands.
+See verification/sample/README.md for its origins and limitations.
 
 ## Entry points
 

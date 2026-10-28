@@ -31,6 +31,36 @@ This project was previously developed under the name **tinyq4**. All crate,
 binary, and environment-variable names now use `quartz` / `QUARTZ_*`; the
 git history and any external references to `tinyq4` predate the rename.
 
+## Experimental native LoRA training on Android (October 2026)
+
+**Yes, Quartz has trained a real GGUF-backed Q/V LoRA on a phone.**
+On a Samsung S26 (Android 17, ARM64), our isolated Rust CPU trainer
+updated **45,056 LoRA parameters across eight connected transformer
+blocks (layers 16–23)** of frozen, quantized Qwen2.5-0.5B Instruct.
+It performed actual cross-layer, cross-token reverse-mode gradients,
+not merely inference or a synthetic linear-layer demonstration.
+
+- **Verified training:** 4 steps in 98.5 seconds, original model
+  unchanged, adapter saved as 182,936-byte safetensors file.
+- **Independent verification:** six fresh sentiment prompts, 5/6
+  with reduced cross-entropy; PC and S26 mean losses agree to
+  approximately 0.000005.
+- **Adversarial test result: PASS_WITH_WARNINGS.** The negation
+  challenge and some correct-vs-incorrect label margins got worse.
+- **No novelty hyperbole:** on-device LLM fine-tuning has published
+  prior art. Quartz contributes this documented Rust/GGUF
+  implementation, measured native Android run, and falsifiable test
+  harness. This is not full-parameter training or production SFT.
+
+**[Read the technical report, reproduction commands and prior work](docs/ON_DEVICE_LORA.md)** |
+[Explore the verification harness](verification/README.md) |
+[Inspect the example trained adapter](verification/sample/) |
+[Read the device and gradient logs](experiments/android-lora-smoke/results/)
+
+The code and small, synthetic-task-trained LoRA adapter are included.
+The exact frozen 0.5B Qwen GGUF base weights are **not** shipped and
+must be supplied separately under their Apache-2.0 licence.
+
 ## What's in the box
 
 Quartz ships as a single binary (`quartz`) with two capabilities:
@@ -173,13 +203,13 @@ substantial piece of work.
 
 ## Status / provenance note
 
-This repo has uncommitted local changes beyond the rename performed for
-open-sourcing (a chat-template fix, KV-cache sizing fix, NEON Q4_K dot
-product, and the SD1.5/SDXL modules `sd15.rs`/`sdxl*.rs`/`tensor.rs`/
-`safetensors.rs`/`vulkan.rs` are untracked as of this writing). Review
-and commit those separately before or as part of publishing — this
-README describes the working tree as it stands, not necessarily the
-last pushed commit.
+Quartz contains experimental runtime implementations as well as the
+inference paths used by Saient. In particular, the October 2026
+GGUF-backed LoRA CLI is **research code**, not yet a phone app feature.
+Its integration, training safety and broader reproducibility are tracked
+separately under src/train/ and verification/. The included
+device logs report bounded experiments and do not imply production
+readiness.
 
 ## License
 
