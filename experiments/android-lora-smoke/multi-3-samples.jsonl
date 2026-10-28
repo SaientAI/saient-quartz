@@ -1,0 +1,3 @@
+{"prompt":"Review: magnificent\nSentiment:","target":" positive","split":"train"}
+{"prompt":"Review: terrible\nSentiment:","target":" negative","split":"train"}
+{"prompt":"Review: beautiful\nSentiment:","target":" positive","split":"heldout"}

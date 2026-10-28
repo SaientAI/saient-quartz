@@ -62,3 +62,21 @@ the actual S26, with an independent 6-example evaluation and an
 end-to-end numerical gradient check on real frozen GGUF weights.
 See QV_STAGE1B.md and experiments/android-lora-smoke/results/
 for source, limits, exact performance logs and model hashes.
+
+
+## Stage 2: connected multi-block Q/V LoRA
+
+Code: multi_ops.rs, multi_qv.rs, multi_backward.rs, multi_io.rs,
+multi_cli.rs. Unlike the last-block-only trainer, this backpropagates
+through every trainable layer and every relevant earlier causal token.
+It uses true GGUF frozen W^T gradients and a single common loss.
+Supports last 1..8 Q/V LoRA blocks, short single-target training.
+See MULTI_QV_STAGE2.md for mathematical scope, checks and limitations.
+
+For the Samsung S26 eight-block demonstration:
+  quartz train-qv-suffix BASE.gguf TRAIN.jsonl OUT.safetensors     --layers 8 --steps 1 --rank 2 --lr 0.01
+  quartz eval-qv-suffix BASE.gguf UNSEEN.jsonl OUT.safetensors     --layers 8
+
+This does not fine-tune the original quantized model weights or
+support full-sequence training, persisted optimizer-state resume,
+production adapter-aware inference or GPU training yet.

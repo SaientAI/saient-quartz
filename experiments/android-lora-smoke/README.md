@@ -94,3 +94,14 @@ Total training 87.355s, Android thermal 0 at both checkpoints,
 Base GGUF unchanged. See the raw training/eval logs and
 2026-10-28-qv-last-technical-report.md under results/.
 The production inference CLI does not yet accept these Q/V adapters.
+
+
+## 5. Multi-block Q/V training on the Samsung
+
+The verified eight-block suffix runs across real Qwen2.5-0.5B
+transformer layers 16..23 with rank-2 Q and V LoRA in EACH block.
+Full reverse-mode gradients propagate through the eight interconnected
+blocks and earlier causal-token key/value dependencies. Original
+GGUF base remains immutable. Original inference parity and actual
+Q/V parameter updates pass. See the new source modules in src/train/
+and evidence logs in results/2026-10-28-multi8*.

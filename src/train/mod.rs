@@ -3,6 +3,11 @@
 pub mod head;
 pub mod lora;
 pub mod loss;
+pub mod multi_backward;
+pub mod multi_cli;
+pub mod multi_io;
+pub mod multi_ops;
+pub mod multi_qv;
 pub mod ops;
 pub mod qv;
 pub mod qv_cli;

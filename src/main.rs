@@ -1825,6 +1825,19 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
 
+    if args.get(1).map(String::as_str) == Some("train-qv-suffix") {
+        if let Err(e) = train::multi_cli::train(&args) {
+            eprintln!("MULTI_TRAIN_ERROR: {e:#}"); std::process::exit(2);
+        }
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("eval-qv-suffix") {
+        if let Err(e) = train::multi_cli::eval(&args) {
+            eprintln!("MULTI_EVAL_ERROR: {e:#}"); std::process::exit(2);
+        }
+        return;
+    }
+
     if args.get(1).map(String::as_str) == Some("train-qv-last") {
         if let Err(e)=train::qv_cli::train(&args) {
             eprintln!("QV_TRAIN_ERROR: {e:#}");std::process::exit(2);

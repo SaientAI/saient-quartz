@@ -1,0 +1,34 @@
+# Samsung S26 four-step LoRA update through eight Qwen2.5 internal transformer blocks
+# Device SM-S948B, 2026-10-28
+# Forge request quartz-eight-layer-four-step-s26-learning-20261028-01
+
+S26_FOUR_STEP_PRECHECK
+Thermal Status: 0
+  level: 53
+Failed to write while dumping service battery: Broken pipe
+MULTI8_FOUR_STEP_RUN_START
+MULTI_MODEL: arch=qwen2 layers=24 adapted=8 first=16 rank=2 params=45056 hidden=896 vocab=151936 frozen_sha256=6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+MULTI_CACHE: 1/3 tokens=7 split=train elapsed_ms=5478
+MULTI_CACHE: 2/3 tokens=7 split=train elapsed_ms=9687
+MULTI_CACHE: 3/3 tokens=7 split=heldout elapsed_ms=13946
+MULTI_PARITY: PASS relative_max=0.000000000 elapsed_ms=23024
+MULTI_INITIAL: train=1.0487998 heldout=0.6603754
+MULTI_STEP: step=1 before_train=1.0487998 train=0.4235311 heldout=0.2987503 elapsed_ms=44894
+MULTI_STEP: step=2 before_train=0.4235311 train=0.0516241 heldout=0.1719357 elapsed_ms=59054
+MULTI_STEP: step=3 before_train=0.0516241 train=1.0714211 heldout=0.0026584 elapsed_ms=73674
+MULTI_STEP: step=4 before_train=1.0714211 train=0.0111069 heldout=0.0062530 elapsed_ms=87937
+MULTI_ADAPTER: layer=16 q_B_norm=1.06997204 v_B_norm=0.38802153
+MULTI_ADAPTER: layer=17 q_B_norm=1.06550622 v_B_norm=0.40161210
+MULTI_ADAPTER: layer=18 q_B_norm=1.03772497 v_B_norm=0.37646142
+MULTI_ADAPTER: layer=19 q_B_norm=1.04612505 v_B_norm=0.40514109
+MULTI_ADAPTER: layer=20 q_B_norm=1.09560096 v_B_norm=0.40996826
+MULTI_ADAPTER: layer=21 q_B_norm=1.10883749 v_B_norm=0.40801910
+MULTI_ADAPTER: layer=22 q_B_norm=0.98811364 v_B_norm=0.42572549
+MULTI_ADAPTER: layer=23 q_B_norm=1.04022217 v_B_norm=0.39873791
+MULTI_RESULT: PASS adapted_layers=8 base_unchanged=true checkpoint_reload=true train_loss=1.0487998->0.0111069 heldout_loss=0.6603754->0.0062530 total_ms=98539 adapter=/sdcard/Download/quartz-lora/adapter-qwen25-qv16-23-r2-step4-s26.safetensors
+S26_FOUR_STEP_POSTCHECK
+Thermal Status: 0
+  level: 53
+Failed to write while dumping service battery: Broken pipe
+adfb838b23efefadf9423df0d3b6574920b378173c6ef026a31b5ec4a56c710d  /sdcard/Download/quartz-lora/adapter-qwen25-qv16-23-r2-step4-s26.safetensors
+-rw-rw---- 1 u0_a331 media_rw 179K 2026-10-28 18:47 /sdcard/Download/quartz-lora/adapter-qwen25-qv16-23-r2-step4-s26.safetensors

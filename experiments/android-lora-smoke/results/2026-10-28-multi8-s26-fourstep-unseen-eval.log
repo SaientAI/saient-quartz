@@ -1,0 +1,11 @@
+# Separate native Samsung process evaluating four-step 8-block Q/V adapter
+# Forge request quartz-multi8-step4-unseen-s26-evaluation-20261028-01
+
+S26_FOUR_STEP_NEW_PROCESS_EVAL
+MULTI_CACHE: 1/2 tokens=7 split=heldout elapsed_ms=5541
+MULTI_CACHE: 2/2 tokens=7 split=heldout elapsed_ms=9034
+MULTI_EVAL_SAMPLE: 1 base=1.1973617 adapted=0.0175075 elapsed_ms=13050
+MULTI_EVAL_SAMPLE: 2 base=1.0095555 adapted=0.0208908 elapsed_ms=16763
+MULTI_EVAL_RESULT: IMPROVED unseen=2 layers=8 base=1.1034586 adapted=0.0191992 total_ms=17889 frozen=true
+EVAL_END_THERMAL
+Thermal Status: 0
