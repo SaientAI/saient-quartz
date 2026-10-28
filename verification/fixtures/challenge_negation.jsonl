@@ -1,0 +1,6 @@
+{"prompt":"Review: not good\nSentiment:","target":" negative","split":"heldout"}
+{"prompt":"Review: not terrible\nSentiment:","target":" positive","split":"heldout"}
+{"prompt":"Review: good at first, but ultimately awful\nSentiment:","target":" negative","split":"heldout"}
+{"prompt":"Review: bad at first, but ultimately wonderful\nSentiment:","target":" positive","split":"heldout"}
+{"prompt":"Opinion: I do not recommend it\nSentiment:","target":" negative","split":"heldout"}
+{"prompt":"Opinion: I definitely recommend it\nSentiment:","target":" positive","split":"heldout"}

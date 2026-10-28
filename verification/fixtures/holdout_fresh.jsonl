@@ -1,0 +1,6 @@
+{"prompt":"Review: sensational\nSentiment:","target":" positive","split":"heldout"}
+{"prompt":"Review: inspiring\nSentiment:","target":" positive","split":"heldout"}
+{"prompt":"Opinion: I thoroughly enjoyed it\nSentiment:","target":" positive","split":"heldout"}
+{"prompt":"Review: frustrating\nSentiment:","target":" negative","split":"heldout"}
+{"prompt":"Review: miserable\nSentiment:","target":" negative","split":"heldout"}
+{"prompt":"Opinion: I strongly disliked it\nSentiment:","target":" negative","split":"heldout"}
