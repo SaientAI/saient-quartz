@@ -51,3 +51,14 @@ but is not the Stage 1–3 long-sequence streaming CE design.
 
 No merged GGUF writer, full SFT, durable optimiser checkpoints or
 background training service is claimed in this milestone.
+
+
+## Stage 1B: real last-layer Q/V LoRA
+
+Implemented in qv.rs, qv_cli.rs, qv_io.rs, qv_gradient.rs and ops.rs.
+A frozen-prefix Qwen2.5-0.5B forward and backward through the full
+last dense block updates both Q and V LoRA matrices. Validated on
+the actual S26, with an independent 6-example evaluation and an
+end-to-end numerical gradient check on real frozen GGUF weights.
+See QV_STAGE1B.md and experiments/android-lora-smoke/results/
+for source, limits, exact performance logs and model hashes.

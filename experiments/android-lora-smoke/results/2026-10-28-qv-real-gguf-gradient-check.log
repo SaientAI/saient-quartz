@@ -1,0 +1,22 @@
+# Desktop real GGUF finite-difference check, no approximated f32 model
+# Nonzero Q/V A/B; one frozen Qwen2.5 0.5B sample
+# Forge host job: 0e72b17d40e64c2c9a44d737c988aabf
+
+QV_LAST: model=/home/tiny/projects/saient/desktop/data/llm-runtime/qwen05.gguf data=experiments/android-lora-smoke/real-qwen-last-qv.jsonl rank=2 steps=1 lr=0.01
+QV_MODEL: arch=qwen2 layer=23 layers=24 embed=896 q=896 kv=128 vocab=151936 hash=6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+QV_CACHE: 1/6 split=train tokens=7 elapsed_ms=7021
+QV_CACHE: 2/6 split=train tokens=7 elapsed_ms=11638
+QV_CACHE: 3/6 split=train tokens=7 elapsed_ms=16472
+QV_CACHE: 4/6 split=train tokens=7 elapsed_ms=21062
+QV_CACHE: 5/6 split=heldout tokens=7 elapsed_ms=25879
+QV_CACHE: 6/6 split=heldout tokens=7 elapsed_ms=30497
+QV_FROZEN_PARITY: PASS relative_max_logit_error=0.000000000 elapsed_ms=36489
+QV_GRADCHECK: group=q.A index=502 analytic=-4.50476980 numeric=-4.48281765 abs_err=0.02195215 rel_err=0.002442
+QV_GRADCHECK: group=q.B index=1400 analytic=3.68963361 numeric=3.65677691 abs_err=0.03285670 rel_err=0.004472
+QV_GRADCHECK: group=v.A index=1487 analytic=0.89475381 numeric=0.89485645 abs_err=0.00010264 rel_err=0.000057
+QV_GRADCHECK: group=v.B index=118 analytic=-0.48939282 numeric=-0.48921108 abs_err=0.00018173 rel_err=0.000186
+QV_GRADCHECK: PASS real-model four adapter tensors; nonzero A and B
+QV_INITIAL: train=0.9410058 heldout=0.3764773
+QV_STEP: step=1 train=0.8646344 heldout=0.3510118 pre_update_train=0.9410058 elapsed_ms=51694
+QV_RESULT: PASS base_unchanged=true adapter_roundtrip=true q_B_norm=0.4233009 v_B_norm=0.1599991 train_loss=0.9410058->0.8646344 heldout_loss=0.3764773->0.3510118 elapsed_ms=58267 adapter=experiments/android-lora-smoke/output/qv-last-host-gradientchecked.safetensors base_sha256=6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+QV_END_TO_END_GRADIENT_TEST_DONE

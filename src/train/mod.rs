@@ -3,3 +3,8 @@
 pub mod head;
 pub mod lora;
 pub mod loss;
+pub mod ops;
+pub mod qv;
+pub mod qv_cli;
+pub mod qv_gradient;
+pub mod qv_io;

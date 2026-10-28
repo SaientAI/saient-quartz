@@ -79,3 +79,18 @@ held-out sets are restricted to two sentiment labels. Lower loss on
 six fresh examples DOES NOT imply broad transfer, long-sequence SFT,
 or attention/Q/V LoRA capability. No full transformer backward,
 checkpoint/resume, or production lifecycle guarantee is claimed.
+
+
+## 4. Q/V last-block S26 training (separate from head-only experiment)
+
+The native ARM64 Quartz CPU binary trained Q/V adapters on layer 23 of
+the real Qwen2.5-0.5B GGUF for eight steps (rank 2, alpha 4).
+Training CE 0.9410000 -> 0.0264473; two-example heldout CE
+0.3764815 -> 0.0534430. Independent reload in a new phone
+process on six fresh examples: 1.0799055 -> 0.0712443.
+Total training 87.355s, Android thermal 0 at both checkpoints,
+57% battery indicated at both checkpoints. Saved Q/V adapter:
+  Download/quartz-lora/adapter-qwen25-qv23-r2-s26.safetensors
+Base GGUF unchanged. See the raw training/eval logs and
+2026-10-28-qv-last-technical-report.md under results/.
+The production inference CLI does not yet accept these Q/V adapters.

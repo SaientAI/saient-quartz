@@ -1,0 +1,31 @@
+# Saient Quartz Q/V last-layer S26 verified native training, 2026-10-28
+# Forge request: quartz-qv-s26-genuine-last-layer-training-20261028-01
+# Device: SM-S948B, Android 17, Snapdragon SM8850
+
+QV_PHONE_PRECHECK
+model=SM-S948B soc=SM8850
+Thermal Status: 0
+  level: 57
+Failed to write while dumping service battery: Broken pipe
+MemAvailable:    3371808 kB
+QV_NATIVE_TRAINING_START
+QV_LAST: model=/sdcard/Download/quartz-lora/qwen05.gguf data=/sdcard/Download/quartz-lora/real-qwen-last-qv.jsonl rank=2 steps=8 lr=0.01
+QV_MODEL: arch=qwen2 layer=23 layers=24 embed=896 q=896 kv=128 vocab=151936 hash=6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+QV_CACHE: 1/6 split=train tokens=7 elapsed_ms=8004
+QV_CACHE: 2/6 split=train tokens=7 elapsed_ms=14908
+QV_CACHE: 3/6 split=train tokens=7 elapsed_ms=21916
+QV_CACHE: 4/6 split=train tokens=7 elapsed_ms=29014
+QV_CACHE: 5/6 split=heldout tokens=7 elapsed_ms=36591
+QV_CACHE: 6/6 split=heldout tokens=7 elapsed_ms=43855
+QV_FROZEN_PARITY: PASS relative_max_logit_error=0.000000000 elapsed_ms=52146
+QV_INITIAL: train=0.9410000 heldout=0.3764815
+QV_STEP: step=1 train=0.8646328 heldout=0.3510118 pre_update_train=0.9410000 elapsed_ms=59513
+QV_STEP: step=5 train=0.0343486 heldout=0.0567462 pre_update_train=0.0541901 elapsed_ms=72593
+QV_STEP: step=8 train=0.0264473 heldout=0.0534430 pre_update_train=0.0279621 elapsed_ms=83004
+QV_RESULT: PASS base_unchanged=true adapter_roundtrip=true q_B_norm=1.7755568 v_B_norm=0.7285355 train_loss=0.9410000->0.0264473 heldout_loss=0.3764815->0.0534430 elapsed_ms=87355 adapter=/sdcard/Download/quartz-lora/adapter-qwen25-qv23-r2-s26.safetensors base_sha256=6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+QV_PHONE_POSTCHECK
+Thermal Status: 0
+  level: 57
+Failed to write while dumping service battery: Broken pipe
+-rw-rw---- 1 u0_a331 media_rw 23K 2026-10-28 18:09 /sdcard/Download/quartz-lora/adapter-qwen25-qv23-r2-s26.safetensors
+86392168326c1b4c271fa1b72a729671084e1c5fe225a0e206e733078f28a4c8  /sdcard/Download/quartz-lora/adapter-qwen25-qv23-r2-s26.safetensors

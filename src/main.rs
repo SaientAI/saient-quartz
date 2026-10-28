@@ -1043,13 +1043,14 @@ fn moe_ffn(
 
 /// Embed `token` and run all transformer layers, populating the KV cache.
 /// Returns the final hidden state before final_norm and lm_head.
-fn embed_and_layers(
+fn embed_and_layers_up_to(
     token: usize,
     pos: usize,
     cfg: &Config,
     w: &Weights,
     kv: &mut Vec<(Vec<f32>, Vec<f32>)>,
     gpu: &GpuState,
+    through: usize,
 ) -> Vec<f32> {
     let d = cfg.embed_dim;
     let gguf = &*w._gguf;
@@ -1066,7 +1067,7 @@ fn embed_and_layers(
     let embed_slice = &embed_data[token * embed_row_bytes..(token + 1) * embed_row_bytes];
     let mut x = dequant::dequant(embed_slice, w.embed.ggml_type, d);
 
-    for l in 0..cfg.n_layers {
+    for l in 0..through {
         let res = x.clone();
         let n1 = rms_norm(&x, &w.attn_norm[l], cfg.norm_eps);
         let mut a = attention(
@@ -1103,6 +1104,13 @@ fn embed_and_layers(
         x = res.iter().zip(&f).map(|(r, fv)| r + fv).collect();
     }
     x
+}
+
+fn embed_and_layers(
+    token: usize, pos: usize, cfg: &Config, w: &Weights,
+    kv: &mut Vec<(Vec<f32>, Vec<f32>)>, gpu: &GpuState,
+) -> Vec<f32> {
+    embed_and_layers_up_to(token,pos,cfg,w,kv,gpu,cfg.n_layers)
 }
 
 fn forward(
@@ -1816,6 +1824,19 @@ fn main() {
     use std::io::Write;
 
     let args: Vec<String> = std::env::args().collect();
+
+    if args.get(1).map(String::as_str) == Some("train-qv-last") {
+        if let Err(e)=train::qv_cli::train(&args) {
+            eprintln!("QV_TRAIN_ERROR: {e:#}");std::process::exit(2);
+        }
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("eval-qv-last") {
+        if let Err(e)=train::qv_cli::eval(&args) {
+            eprintln!("QV_EVAL_ERROR: {e:#}");std::process::exit(2);
+        }
+        return;
+    }
 
     if args.get(1).map(String::as_str) == Some("eval-head") {
         if let Err(err) = train::head::evaluate(&args) {
