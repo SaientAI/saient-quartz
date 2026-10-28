@@ -26,6 +26,8 @@ mod server;
 mod t5_tokenizer;
 mod tensor;
 mod tokenizer;
+#[cfg(test)]
+mod train;
 mod umt5;
 #[cfg(feature = "vulkan")]
 mod vulkan;
