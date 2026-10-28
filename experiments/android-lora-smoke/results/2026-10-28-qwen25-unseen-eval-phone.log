@@ -1,0 +1,14 @@
+# Original 2026-10-28 S26 output from separate-process saved-head-adapter evaluation
+# Forge request ID: quartz-independent-s26-6unseen-eval-20261028-01
+
+INDEPENDENT_HELDOUT_EVALUATION
+EVAL_HEAD: arch=qwen2 layers=24 examples=6 rank=4 adapter=/sdcard/Download/quartz-lora/adapter-qwen25-r4-stage1.safetensors base_sha256=6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+EVAL_SAMPLE: 1 base=1.197362 adapter=0.000000 tokens=7 elapsed_ms=7325
+EVAL_SAMPLE: 2 base=0.886264 adapter=0.000000 tokens=7 elapsed_ms=14618
+EVAL_SAMPLE: 3 base=0.257195 adapter=0.000000 tokens=7 elapsed_ms=21939
+EVAL_SAMPLE: 4 base=1.060323 adapter=0.000000 tokens=7 elapsed_ms=28818
+EVAL_SAMPLE: 5 base=1.157718 adapter=0.000000 tokens=11 elapsed_ms=40206
+EVAL_SAMPLE: 6 base=1.920572 adapter=0.000000 tokens=11 elapsed_ms=51703
+EVAL_RESULT: IMPROVED unseen=6 base_loss=1.079906 adapter_loss=0.000000 elapsed_ms=51703 base_unchanged=true
+EVAL_DEVICE
+Thermal Status: 0

@@ -1,0 +1,12 @@
+# Native phone second-process evaluation of 8-layer Q/V adapter
+# Forge: quartz-multi8-independent-s26-reload-eval-20261028-01
+
+S26_EIGHT_LAYER_INDEPENDENT_EVAL_START
+/sdcard/Download/quartz-lora/multi-unseen-2.jsonl: OK
+MULTI_CACHE: 1/2 tokens=7 split=heldout elapsed_ms=5452
+MULTI_CACHE: 2/2 tokens=7 split=heldout elapsed_ms=9580
+MULTI_EVAL_SAMPLE: 1 base=1.1973617 adapted=0.3933674 elapsed_ms=14582
+MULTI_EVAL_SAMPLE: 2 base=1.0095555 adapted=0.3780647 elapsed_ms=19400
+MULTI_EVAL_RESULT: IMPROVED unseen=2 layers=8 base=1.1034586 adapted=0.3857160 total_ms=20607 frozen=true
+S26_EIGHT_LAYER_EVAL_THERMAL
+Thermal Status: 0

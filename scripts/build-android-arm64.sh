@@ -26,6 +26,10 @@ export CC_aarch64_linux_android="$linker"
 export AR_aarch64_linux_android="$archiver"
 export ANDROID_NDK_HOME="$ndk"
 
-features="${QUARTZ_ANDROID_FEATURES:-vulkan}"
-cargo build --release --target aarch64-linux-android --features "$features" "$@"
+features="${QUARTZ_ANDROID_FEATURES-vulkan}"
+if [[ -n "$features" ]]; then
+  cargo build --release --target aarch64-linux-android --features "$features" "$@"
+else
+  cargo build --release --target aarch64-linux-android "$@"
+fi
 echo "Built target/aarch64-linux-android/release/quartz"

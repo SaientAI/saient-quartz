@@ -1,0 +1,24 @@
+# Real Qwen frozen GGUF two-layer finite differences across layer 22/23
+# Forge job d5c109d43636471eaf944cdf16b2ff52
+
+MULTI_RELEASE_BUILT
+MULTI_MODEL: arch=qwen2 layers=24 adapted=2 first=22 rank=2 params=11264 hidden=896 vocab=151936 frozen_sha256=6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+MULTI_CACHE: 1/3 tokens=7 split=train elapsed_ms=6803
+MULTI_CACHE: 2/3 tokens=7 split=train elapsed_ms=11359
+MULTI_CACHE: 3/3 tokens=7 split=heldout elapsed_ms=15832
+MULTI_PARITY: PASS relative_max=0.000000000 elapsed_ms=22051
+MULTI_GRADCHECK: layer=22 group=Q.A index=502 analytic=-0.10820442 numeric=-0.10810693 rel_err=0.0004507 abs_err=0.0000975
+MULTI_GRADCHECK: layer=22 group=Q.B index=378 analytic=-0.29420784 numeric=-0.29463571 rel_err=0.0007266 abs_err=0.0004279
+MULTI_GRADCHECK: layer=22 group=V.A index=208 analytic=0.52734083 numeric=0.52734220 rel_err=0.0000013 abs_err=0.0000014
+MULTI_GRADCHECK: layer=22 group=V.B index=43 analytic=-0.14097065 numeric=-0.14128089 rel_err=0.0010992 abs_err=0.0003102
+MULTI_GRADCHECK: layer=23 group=Q.A index=502 analytic=-0.48773715 numeric=-0.48829913 rel_err=0.0005758 abs_err=0.0005620
+MULTI_GRADCHECK: layer=23 group=Q.B index=891 analytic=-0.19393009 numeric=-0.19385616 rel_err=0.0001906 abs_err=0.0000739
+MULTI_GRADCHECK: layer=23 group=V.A index=56 analytic=0.31418934 numeric=0.31417212 rel_err=0.0000274 abs_err=0.0000172
+MULTI_GRADCHECK: layer=23 group=V.B index=119 analytic=0.59573799 numeric=0.59555572 rel_err=0.0001530 abs_err=0.0001823
+MULTI_GRADCHECK: PASS first and last adapted layers
+MULTI_INITIAL: train=1.0488070 heldout=0.6603671
+MULTI_STEP: step=1 before_train=1.0488071 train=0.9286849 heldout=0.5884012 elapsed_ms=46098
+MULTI_ADAPTER: layer=22 q_B_norm=0.42325103 v_B_norm=0.15999956
+MULTI_ADAPTER: layer=23 q_B_norm=0.42328432 v_B_norm=0.15999942
+MULTI_RESULT: PASS adapted_layers=2 base_unchanged=true checkpoint_reload=true train_loss=1.0488070->0.9286849 heldout_loss=0.6603671->0.5884012 total_ms=51915 adapter=experiments/android-lora-smoke/output/multi2-host-gradchecked.safetensors
+MULTI2_HOST_REAL_MODEL_ACCEPTANCE_COMPLETE

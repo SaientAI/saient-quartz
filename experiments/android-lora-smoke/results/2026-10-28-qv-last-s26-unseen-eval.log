@@ -1,0 +1,21 @@
+# Saient Quartz S26 independent Q/V last-layer adapter evaluation, 2026-10-28
+# New independent native process; six fresh prompts
+# Forge request: quartz-qv-independent-s26-unseen-eval-20261028-01
+
+QV_INDEPENDENT_S26_EVAL_START
+d97f767c8b9fd27f267f5aaf576b9de766a1a4c9657743f1470020fdbc935115  /sdcard/Download/quartz-lora/fresh-unseen.jsonl
+QV_CACHE: 1/6 split=heldout tokens=7 elapsed_ms=8174
+QV_CACHE: 2/6 split=heldout tokens=7 elapsed_ms=15242
+QV_CACHE: 3/6 split=heldout tokens=7 elapsed_ms=22301
+QV_CACHE: 4/6 split=heldout tokens=7 elapsed_ms=29181
+QV_CACHE: 5/6 split=heldout tokens=11 elapsed_ms=40043
+QV_CACHE: 6/6 split=heldout tokens=11 elapsed_ms=51124
+QV_EVAL_SAMPLE: 1 base=1.1973617 adapted=0.0621483 elapsed_ms=51953
+QV_EVAL_SAMPLE: 2 base=0.8862635 adapted=0.0159238 elapsed_ms=52724
+QV_EVAL_SAMPLE: 3 base=0.2571954 adapted=0.0252410 elapsed_ms=53496
+QV_EVAL_SAMPLE: 4 base=1.0603228 adapted=0.0262961 elapsed_ms=54266
+QV_EVAL_SAMPLE: 5 base=1.1577177 adapted=0.1511758 elapsed_ms=55034
+QV_EVAL_SAMPLE: 6 base=1.9205719 adapted=0.1466809 elapsed_ms=55792
+QV_EVAL_RESULT: IMPROVED unseen=6 base_loss=1.0799055 adapted_loss=0.0712443 elapsed_ms=56979 base_unchanged=true
+QV_INDEPENDENT_S26_EVAL_DEVICE
+Thermal Status: 0

@@ -1,0 +1,36 @@
+name: Quartz LoRA correctness (no model weights)
+
+on:
+  push:
+    branches:
+      - master
+      - "feat/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Rust + Python reference tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: "2"
+      RAYON_NUM_THREADS: "2"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked
+      - name: Harness self-tests and training reference math
+        run: bash verification/ci-local.sh
+      - name: Full Quartz regression tests
+        run: cargo test --bin quartz --locked -- --test-threads=2
+
+# No phone adapter, Qwen base GGUF, cloud GPU or secrets are needed in CI.
+# Native Samsung parity and frozen-model numerical audits require the
+# separately pinned real GGUF + adapter and are opt-in local runs.

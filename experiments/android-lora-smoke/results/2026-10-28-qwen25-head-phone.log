@@ -1,0 +1,44 @@
+# Full original S26 shell output — Qwen2.5-0.5B head-only LoRA, 28 Oct 2026
+# Forge request ID: quartz-native-qwen25-head-training-s26-20261028-01
+# Command executed on connected SM-S948B, Android 17, Android shell UID 2000
+
+PRE_RUN_DEVICE
+  level: 86
+Failed to write while dumping service battery: Broken pipe
+Thermal Status: 0
+MemAvailable:    3684860 kB
+TRAINER_BEGIN
+TRAIN_HEAD: opening GGUF /sdcard/Download/quartz-lora/qwen05.gguf
+GGUF_REAL_MODEL: arch=qwen2 layers=24 hidden=896 vocab=151936 training=head-only
+BASE_SHA256=6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+CACHE: 1/14 split=train tokens=7 elapsed_ms=6657
+CACHE: 2/14 split=train tokens=7 elapsed_ms=13397
+CACHE: 3/14 split=train tokens=7 elapsed_ms=20309
+CACHE: 4/14 split=train tokens=7 elapsed_ms=26399
+CACHE: 5/14 split=train tokens=7 elapsed_ms=33144
+CACHE: 6/14 split=train tokens=7 elapsed_ms=39784
+CACHE: 7/14 split=train tokens=7 elapsed_ms=46916
+CACHE: 8/14 split=train tokens=7 elapsed_ms=53848
+CACHE: 9/14 split=train tokens=7 elapsed_ms=59094
+CACHE: 10/14 split=train tokens=7 elapsed_ms=64985
+CACHE: 11/14 split=heldout tokens=7 elapsed_ms=72509
+CACHE: 12/14 split=heldout tokens=7 elapsed_ms=79668
+CACHE: 13/14 split=heldout tokens=7 elapsed_ms=86957
+CACHE: 14/14 split=heldout tokens=7 elapsed_ms=94552
+INITIAL: train=0.423226 heldout=0.695651 steps=80 lr=0.015
+STEP: 1 train=0.212644 heldout=0.370659 elapsed_ms=94683
+STEP: 10 train=0.000001 heldout=0.000000 elapsed_ms=95138
+STEP: 20 train=0.000000 heldout=0.000000 elapsed_ms=95658
+STEP: 30 train=0.000000 heldout=0.000000 elapsed_ms=96175
+STEP: 40 train=0.000000 heldout=0.000000 elapsed_ms=96703
+STEP: 50 train=0.000000 heldout=0.000000 elapsed_ms=97217
+STEP: 60 train=0.000000 heldout=0.000000 elapsed_ms=97731
+STEP: 70 train=0.000000 heldout=0.000000 elapsed_ms=98250
+STEP: 80 train=0.000000 heldout=0.000000 elapsed_ms=98772
+RESULT: PASS base_unchanged=true saved_reload_parity=true train_loss=0.423226->0.000000 heldout_loss=0.695651->0.000000 elapsed_ms=102728 adapter=/sdcard/Download/quartz-lora/adapter-qwen25-r4-stage1.safetensors base_sha256=6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+POST_RUN_DEVICE
+  level: 85
+Failed to write while dumping service battery: Broken pipe
+Thermal Status: 0
+-rw-rw---- 1 u0_a331 media_rw 2.3M 2026-10-28 12:54 /sdcard/Download/quartz-lora/adapter-qwen25-r4-stage1.safetensors
+8a76650f2c55374f529f277566b837c03dcd96984563c045708b2e6c3cf14bf0  /sdcard/Download/quartz-lora/adapter-qwen25-r4-stage1.safetensors

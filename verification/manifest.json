@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "name": "Quartz S26 eight-layer Q/V frozen-model verification fixture v1",
+  "model_sha256": "6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653",
+  "adapter_sha256": "adfb838b23efefadf9423df0d3b6574920b378173c6ef026a31b5ec4a56c710d",
+  "expected_layers": 8,
+  "fixtures": {
+    "train": "e4b62ece27b255edb3e100e752f9dba48741b988d95acb8e95da511d99d809b4",
+    "fresh": "289724c68c514311966143efe6c244070dd52ee08cb9a746c6182fe87ebd041d",
+    "challenge": "198f8d23e8d08b4242d081e9b4600661a6c91e6443a28ec149ff44dde4d7188e",
+    "unrelated": "c1cc2eeda99335ec32cee2e6f1bb9fbb1909ca7b40272d40bede9fea25501cc1"
+  },
+  "limits": {
+    "min_fresh": 6,
+    "max_dataset_rows": 6,
+    "max_prompt_tokens": 16
+  },
+  "interpretation": "Frozen controlled task tests; dataset authored after adapter training, not a broad preregistered generalisation benchmark"
+}
